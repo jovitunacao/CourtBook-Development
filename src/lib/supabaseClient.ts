@@ -659,13 +659,16 @@ export interface PublicBookingInput {
 export interface PublicBookingResult {
   success: boolean;
   data?: any;
+  raw?: any;
   error?: string;
   isConflict?: boolean;
   isRateLimited?: boolean;
   isCaptchaRequired?: boolean;
   isNetworkError?: boolean;
+  isTimeout?: boolean;
   retryAfter?: number;
   idempotentReplayed?: boolean;
+  httpStatus?: number;
 }
 
 export async function submitPublicBookingViaFunction(
@@ -702,14 +705,27 @@ export async function submitPublicBookingViaFunction(
     headers['x-turnstile-token'] = input.captcha_token;
   }
 
+  const controller = new AbortController();
+  const timeoutMs = 20000; // 20-second timeout guard
+  const timeoutTimer = setTimeout(() => {
+    controller.abort();
+  }, timeoutMs);
+
   try {
     const response = await fetch(endpointUrl, {
       method: 'POST',
       headers,
       body: JSON.stringify(payload),
+      signal: controller.signal,
     });
+    clearTimeout(timeoutTimer);
 
-    const result = await response.json().catch(() => null);
+    let result: any = null;
+    try {
+      result = await response.json();
+    } catch {
+      result = null;
+    }
 
     if (!response.ok) {
       const isConflict =
@@ -730,19 +746,44 @@ export async function submitPublicBookingViaFunction(
         isCaptchaRequired,
         retryAfter: result?.retry_after,
         error: result?.error || `Booking failed with status ${response.status}`,
+        httpStatus: response.status,
       };
     }
 
+    // Success response handling (HTTP 200 or HTTP 201):
+    // Support all envelope shapes: result.reservation, result.data, or top-level result
+    const reservationData =
+      result?.reservation ||
+      result?.data ||
+      (result && (result.reference_code || result.reservation_id) ? result : null) ||
+      result ||
+      {};
+
     return {
       success: true,
-      data: result?.data,
-      idempotentReplayed: Boolean(result?.idempotent_replayed),
+      data: reservationData,
+      raw: result,
+      idempotentReplayed: Boolean(
+        result?.idempotent_replayed ||
+        reservationData?.idempotent_replayed ||
+        response.status === 200
+      ),
+      httpStatus: response.status,
     };
   } catch (err: any) {
+    clearTimeout(timeoutTimer);
+    const isTimeout =
+      err?.name === 'AbortError' ||
+      err?.message?.toLowerCase().includes('timeout') ||
+      err?.message?.toLowerCase().includes('aborted');
+
     return {
       success: false,
       isNetworkError: true,
-      error: err?.message || 'Network error connecting to booking service.',
+      isTimeout,
+      error: isTimeout
+        ? 'Network request timed out waiting for booking response.'
+        : err?.message || 'Network error connecting to booking service.',
     };
   }
 }

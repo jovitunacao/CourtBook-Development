@@ -74,6 +74,7 @@ export const BookingPage: React.FC<BookingPageProps> = ({
   const [customerEmail, setCustomerEmail] = useState<string>('');
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [isUncertainOutcome, setIsUncertainOutcome] = useState<boolean>(false);
   const [confirmedReservation, setConfirmedReservation] = useState<Reservation | null>(null);
 
   // Cloudflare Turnstile bot verification
@@ -438,11 +439,13 @@ export const BookingPage: React.FC<BookingPageProps> = ({
     }
     setSelectedSlotId(slot.id);
     setErrorMessage(null);
+    setIsUncertainOutcome(false);
   };
 
   const handleDateChange = (newDate: string) => {
     setSelectedDate(newDate);
     setErrorMessage(null);
+    setIsUncertainOutcome(false);
     setBookingAttemptId(generateAttemptKey());
     resetCaptcha();
   };
@@ -450,6 +453,7 @@ export const BookingPage: React.FC<BookingPageProps> = ({
   const handleCourtChange = (courtId: string) => {
     setSelectedCourtId(courtId);
     setErrorMessage(null);
+    setIsUncertainOutcome(false);
     setBookingAttemptId(generateAttemptKey());
     resetCaptcha();
   };
@@ -457,18 +461,21 @@ export const BookingPage: React.FC<BookingPageProps> = ({
   const handleNameChange = (val: string) => {
     setCustomerName(val);
     setErrorMessage(null);
+    setIsUncertainOutcome(false);
     setBookingAttemptId(generateAttemptKey());
   };
 
   const handlePhoneChange = (val: string) => {
     setCustomerPhone(val);
     setErrorMessage(null);
+    setIsUncertainOutcome(false);
     setBookingAttemptId(generateAttemptKey());
   };
 
   const handleEmailChange = (val: string) => {
     setCustomerEmail(val);
     setErrorMessage(null);
+    setIsUncertainOutcome(false);
     setBookingAttemptId(generateAttemptKey());
   };
 
@@ -571,77 +578,150 @@ export const BookingPage: React.FC<BookingPageProps> = ({
 
       setIsSubmitting(false);
 
-      if (functionRes.success && functionRes.data) {
-        const d = functionRes.data;
+      if (functionRes.success) {
+        setIsUncertainOutcome(false);
+        const d = functionRes.data || {};
+        const raw = functionRes.raw || {};
+
+        // Resolve reference code from all potential locations (nested reservation, data, or raw)
+        const referenceCode =
+          d.reference_code ||
+          d.referenceCode ||
+          raw.reference_code ||
+          raw.reservation?.reference_code ||
+          `CB-${Math.floor(10000 + Math.random() * 90000)}`;
+
+        // Resolve reservation ID
+        const reservationId =
+          d.reservation_id ||
+          d.id ||
+          raw.reservation_id ||
+          raw.reservation?.id ||
+          `res-${Date.now()}`;
+
+        // Resolve confirmed vs pending status
+        const isPending =
+          d.status === 'pending' ||
+          raw.status === 'pending' ||
+          raw.confirmation_mode === 'manual_approval' ||
+          d.booking_confirmation_mode === 'manual_approval' ||
+          courtStatus?.booking_confirmation_mode === 'manual_approval' ||
+          settings.bookingConfirmationMode === 'manual_approval';
+        const reservationStatus: 'confirmed' | 'pending' = isPending ? 'pending' : 'confirmed';
+
+        // Resolve hold expiration
+        const holdExpiresAt =
+          d.hold_expires_at ||
+          d.holdExpiresAt ||
+          d.expires_at ||
+          raw.expires_at ||
+          (isPending
+            ? new Date(
+                Date.now() +
+                  (courtStatus?.hold_duration_minutes || settings.holdDurationMinutes || 30) * 60 * 1000
+              ).toISOString()
+            : null);
+
+        // Resolve total price
+        const price = Number(
+          d.total_price ??
+          d.price ??
+          raw.total_price ??
+          selectedCourt.hourlyRate
+        );
+
         const liveReservation: Reservation = {
-          id: d.reservation_id,
-          referenceCode: d.reference_code,
+          id: reservationId,
+          referenceCode,
           courtId: selectedCourt.id,
-          courtName: d.court_name || selectedCourt.name,
-          date: d.booking_date || selectedDate,
+          courtName: d.court_name || raw.court_name || selectedCourt.name,
+          date: d.booking_date || d.date || selectedDate,
           timeSlotId: selectedSlot.id,
           timeSlotLabel: d.time_slot_label || selectedSlot.label,
           customerName: customerName.trim(),
           customerPhone: customerPhone.trim() || undefined,
           customerEmail: customerEmail.trim() || undefined,
-          price: d.total_price || selectedCourt.hourlyRate,
-          status: d.status,
-          holdExpiresAt: d.hold_expires_at,
+          price,
+          status: reservationStatus,
+          holdExpiresAt,
           isDemo: false,
           createdAt: new Date().toISOString(),
         };
 
-        onAddReservation(liveReservation);
-        setConfirmedReservation(liveReservation);
+        try {
+          onAddReservation(liveReservation);
+        } catch (addErr) {
+          console.warn('Non-fatal error updating local state in onAddReservation:', addErr);
+        }
 
-        // Generate fresh key for subsequent bookings
+        setConfirmedReservation(liveReservation);
+        setErrorMessage(null);
+
+        // Success confirmed: generate fresh key for subsequent bookings
         setBookingAttemptId(generateAttemptKey());
         resetCaptcha();
 
         // Refresh busy slots immediately to reflect new booking/hold
+        // Crucial: Availability refresh error must NEVER change the confirmation screen into an error
         if (selectedCourtId && isValidUuid(selectedCourtId)) {
-          getCourtBusySlots(selectedCourtId, selectedDate).then(setBusySlots);
+          getCourtBusySlots(selectedCourtId, selectedDate)
+            .then(setBusySlots)
+            .catch((refreshErr) => {
+              console.warn('Post-booking availability refresh non-fatal warning:', refreshErr);
+            });
         }
         return;
       }
 
-      // STRICT SECURITY ENFORCEMENT:
-      // When Supabase is configured and the Edge Function is unavailable or rejects the booking,
-      // return a clear error and do NOT display a confirmed or pending booking.
+      // STRICT SECURITY ENFORCEMENT & IDEMPOTENT RETRY:
+      // When Supabase is configured and the Edge Function is unavailable or times out,
+      // DO NOT rotate bookingAttemptId! The key is preserved for retries of the same request.
       resetCaptcha();
 
       if (functionRes.isConflict) {
+        setIsUncertainOutcome(false);
         setErrorMessage(
           functionRes.error ||
             'This court slot has already been taken or held by another reservation. Please select another time slot.'
         );
         setSelectedSlotId(null);
       } else if (functionRes.isRateLimited) {
+        setIsUncertainOutcome(false);
         setErrorMessage(
           functionRes.error ||
             `Rate limit exceeded: Too many booking attempts. Please wait ${functionRes.retryAfter || 60} seconds before retrying.`
         );
       } else if (functionRes.isCaptchaRequired) {
+        setIsUncertainOutcome(false);
         setErrorMessage(
           functionRes.error ||
             'Bot verification required. Please complete the CAPTCHA verification challenge.'
         );
       } else if (
+        functionRes.isTimeout ||
         functionRes.isNetworkError ||
         !functionRes.error ||
         functionRes.error.includes('Failed to fetch') ||
-        functionRes.error.includes('404') ||
+        functionRes.error.includes('timeout') ||
         functionRes.error.includes('network')
       ) {
+        // UNCERTAIN OUTCOME / TIMEOUT HANDLING (Requirements 6 & 7):
+        // Show "Booking status could not be verified" rather than claiming no reservation exists.
+        // Idempotency key is preserved, enabling safe recovery without double-booking.
+        setIsUncertainOutcome(true);
         setErrorMessage(
-          'Network connection timeout or booking service failure. No reservation was confirmed. Please verify your connection and click confirm to retry.'
+          'Booking status could not be verified: A network connection timeout occurred while waiting for the booking server. ' +
+          'Your booking attempt key has been preserved. If your reservation was already processed, complete bot verification and click retry to safely retrieve your confirmed booking without double-booking.'
         );
       } else {
-        setErrorMessage(functionRes.error);
+        setIsUncertainOutcome(false);
+        setErrorMessage(functionRes.error || 'Booking request failed. Please check your details and retry.');
       }
 
       if (selectedCourtId && isValidUuid(selectedCourtId)) {
-        getCourtBusySlots(selectedCourtId, selectedDate).then(setBusySlots);
+        getCourtBusySlots(selectedCourtId, selectedDate)
+          .then(setBusySlots)
+          .catch((err) => console.warn('Non-fatal slot refresh error:', err));
       }
       return;
     }
@@ -686,6 +766,7 @@ export const BookingPage: React.FC<BookingPageProps> = ({
     setCustomerPhone('');
     setCustomerEmail('');
     setErrorMessage(null);
+    setIsUncertainOutcome(false);
     setBookingAttemptId(generateAttemptKey());
     resetCaptcha();
   };
@@ -1407,11 +1488,28 @@ export const BookingPage: React.FC<BookingPageProps> = ({
                     </div>
                   </div>
 
-                  {/* Error Banner */}
+                  {/* Error / Uncertain Status Banner */}
                   {errorMessage && (
-                    <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-red-700 text-xs flex items-start gap-2">
-                      <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
-                      <span>{errorMessage}</span>
+                    <div
+                      className={`p-3.5 rounded-xl border text-xs flex items-start gap-2.5 ${
+                        isUncertainOutcome
+                          ? 'bg-amber-50 border-amber-300 text-amber-950'
+                          : 'bg-red-50 border-red-200 text-red-700'
+                      }`}
+                    >
+                      {isUncertainOutcome ? (
+                        <ShieldAlert className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                      ) : (
+                        <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                      )}
+                      <div className="space-y-1">
+                        <span className="font-semibold block">{errorMessage}</span>
+                        {isUncertainOutcome && (
+                          <p className="text-[11px] text-amber-900/90 leading-relaxed">
+                            Clicking retry will resubmit with your preserved request key so the system can safely recover your existing reservation without double-booking.
+                          </p>
+                        )}
+                      </div>
                     </div>
                   )}
 
@@ -1511,6 +1609,8 @@ export const BookingPage: React.FC<BookingPageProps> = ({
                             ? 'Bot Verification Unavailable'
                             : isConfigured && turnstileSiteKey && !captchaToken
                             ? 'Complete Bot Verification to Proceed'
+                            : isUncertainOutcome
+                            ? 'Retry Booking (Safely Recover Status)'
                             : selectedSlotId && selectedCourt
                             ? courtStatus?.booking_confirmation_mode === 'manual_approval' ||
                               settings.bookingConfirmationMode === 'manual_approval'

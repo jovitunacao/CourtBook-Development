@@ -13,6 +13,7 @@ import { runPublicAvailabilitySuite } from './suites/08_public_availability.test
 import { runBookingConfirmationSuite } from './suites/09_booking_confirmation.test';
 import { runEdgeSecurityAndAbuseSuite } from './suites/10_edge_security_and_abuse.test';
 import { runUuidMappingSuite } from './suites/11_facility_and_court_uuid_mapping.test';
+import { runBookingResponseAndRecoverySuite } from './suites/12_booking_response_and_recovery.test';
 
 async function main() {
   printTestHeader();
@@ -67,6 +68,7 @@ async function main() {
     { name: '9. Booking Confirmation Mode, Approvals & Hold Security', runner: runBookingConfirmationSuite },
     { name: '10. Edge Security, Abuse Defense & Idempotency', runner: runEdgeSecurityAndAbuseSuite },
     { name: '11. Facility & Court UUID Mapping & Validation', runner: runUuidMappingSuite },
+    { name: '12. Booking Response Envelope & Idempotency Recovery', runner: runBookingResponseAndRecoverySuite },
   ];
 
   for (const suite of suites) {

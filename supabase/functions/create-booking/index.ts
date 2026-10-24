@@ -603,13 +603,31 @@ serve(async (req: Request) => {
     // If a brand new reservation was created, return HTTP 201 Created
     const httpStatus = data.idempotent_replayed ? 200 : 201;
 
+    // Handle both payload formats (nested reservation object or direct RPC return fields)
+    const reservationObj = data.reservation || {
+      reservation_id: data.reservation_id,
+      reference_code: data.reference_code,
+      status: data.status,
+      booking_confirmation_mode: data.booking_confirmation_mode || data.confirmation_mode,
+      hold_expires_at: data.hold_expires_at || data.expires_at,
+      court_name: data.court_name,
+      facility_name: data.facility_name,
+      booking_date: data.booking_date,
+      time_slot_label: data.time_slot_label,
+      total_price: data.total_price,
+      currency: data.currency,
+      is_demo: false,
+    };
+
     return new Response(
       JSON.stringify({
         success: true,
-        reservation: data.reservation,
+        reservation: reservationObj,
+        data: reservationObj,
+        ...data,
         payment_required: Boolean(data.payment_required),
-        confirmation_mode: data.confirmation_mode,
-        expires_at: data.expires_at,
+        confirmation_mode: data.confirmation_mode || data.booking_confirmation_mode,
+        expires_at: data.expires_at || data.hold_expires_at,
         idempotent_replayed: Boolean(data.idempotent_replayed),
       }),
       { status: httpStatus, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
