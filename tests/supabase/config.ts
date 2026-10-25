@@ -54,9 +54,7 @@ export function getEnvironmentConfig(): TestEnvironmentConfig {
     userBEmail: process.env.TEST_USER_B_EMAIL || '',
     userBPassword: process.env.TEST_USER_B_PASSWORD || '',
     testProject: process.env.SUPABASE_TEST_PROJECT || 'BookSuite-Dev',
-    confirmTestEnv:
-      process.env.CONFIRM_TEST_ENV === 'true' ||
-      process.env.ALLOW_STATE_CHANGING_TESTS === 'true',
+    confirmTestEnv: process.env.CONFIRM_TEST_ENV === 'true',
   };
 }
 
