@@ -1326,7 +1326,7 @@ export async function runMultiTenantIsolationSuite(): Promise<TestResult[]> {
         // Verify post-attempt immutability via authorized client
         const { data: afterFac } = await ctxB.client
           .from('facilities')
-          .select('booking_confirmation_mode, pending_hold_duration_minutes')
+          .select('booking_confirmation_mode, hold_duration_minutes')
           .eq('id', disposableFacilityFixture.id)
           .single();
 
@@ -1402,7 +1402,7 @@ export async function runMultiTenantIsolationSuite(): Promise<TestResult[]> {
       if (error && isCrossTenantAuthorizationRejection(error)) {
         const { data: afterFac } = await ctxA.client
           .from('facilities')
-          .select('booking_confirmation_mode, pending_hold_duration_minutes')
+          .select('booking_confirmation_mode, hold_duration_minutes')
           .eq('id', disposableFacilityFixture.id)
           .single();
 

@@ -9,6 +9,7 @@ dotenv.config();
 export interface TestEnvironmentConfig {
   supabaseUrl: string;
   supabaseAnonKey: string;
+  serviceRoleKey: string;
   userAEmail: string;
   userAPassword: string;
   userBEmail: string;
@@ -49,6 +50,7 @@ export function getEnvironmentConfig(): TestEnvironmentConfig {
       process.env.VITE_SUPABASE_ANON_KEY ||
       process.env.VITE_SUPABASE_PUBLISHABLE_KEY ||
       '',
+    serviceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY || '',
     userAEmail: process.env.TEST_USER_A_EMAIL || '',
     userAPassword: process.env.TEST_USER_A_PASSWORD || '',
     userBEmail: process.env.TEST_USER_B_EMAIL || '',
@@ -122,4 +124,27 @@ export async function createAuthenticatedClient(
     client,
     userId: data.user.id,
   };
+}
+
+// Create an administrative service-role client for trusted fixture provisioning & cleanup
+export function createAdminClient(customServiceKey?: string): SupabaseClient {
+  const { supabaseUrl, serviceRoleKey } = getEnvironmentConfig();
+  const key = customServiceKey || serviceRoleKey;
+
+  if (!supabaseUrl) {
+    throw new Error('Supabase URL must be configured in environment.');
+  }
+  if (!key) {
+    throw new Error(
+      'SUPABASE_SERVICE_ROLE_KEY is required to create a trusted administrator client for fixture lifecycle.'
+    );
+  }
+
+  return createClient(supabaseUrl, key, {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+      detectSessionInUrl: false,
+    },
+  });
 }
