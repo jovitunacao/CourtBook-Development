@@ -8,7 +8,10 @@ import { TestResult } from '../types';
 import { loadUserContext, UserContext, isIntendedSecurityRejection } from '../helpers';
 import {
   DisposableCluster,
-  generateTestRunId,
+  generateTestRunUuid,
+  generateRefToken,
+  generateReservationRef,
+  validateDatabaseConstraints,
   provisionDisposableCluster,
   teardownDisposableCluster,
   assertExactRunOwnership,
@@ -32,7 +35,10 @@ import {
  * Safety Governance:
  * - CONFIRM_TEST_ENV=false by default (guarded/blocked).
  * - Requires trusted service-role access for provisioning & RLS-unbiased cleanup verification.
- * - Exact-run ownership checks (runId) strictly protect existing entities.
+ * - Exact-run ownership checks (runId UUID + 8-char refToken) strictly protect existing entities.
+ * - Cleanup targets ONLY exact recorded UUIDs, never broad names or prefixes.
+ * - Full database constraint compliance: reference_code (5-20 chars), currency (1-5 chars),
+ *   slugs (2-60 chars, lowercase-hyphen), hourly_rate (> 0), duration_minutes (30-480).
  * - Catch blocks fail on unexpected exceptions; no PASS without independent database verification.
  * - Fails safely if required RPCs are missing or unavailable.
  */
@@ -87,113 +93,168 @@ export async function runCrossTenantWriteIsolationSuite(): Promise<TestResult[]>
   // ==========================================================================
   const tGov = Date.now();
   try {
-    const testMockRunId = 'wtest001abc';
-    // Validate that assertExactRunOwnership correctly accepts valid mock cluster
+    const testMockRunUuid = generateTestRunUuid();
+    const testMockRefToken = generateRefToken(testMockRunUuid);
+
+    // Verify UUID v4 format
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuidRegex.test(testMockRunUuid)) {
+      throw new Error(`Generated runId [${testMockRunUuid}] is not a valid UUID.`);
+    }
+
+    // Verify 8-char compact refToken format
+    if (testMockRefToken.length !== 8 || !/^[a-z0-9]{8}$/.test(testMockRefToken)) {
+      throw new Error(`Generated refToken [${testMockRefToken}] is not 8 lowercase alphanumeric characters.`);
+    }
+
+    // Verify reference codes satisfy CHECK (char_length(reference_code) BETWEEN 5 AND 20)
+    const pendingRef = generateReservationRef('pending', testMockRefToken);
+    const confirmedRef = generateReservationRef('confirmed', testMockRefToken);
+
+    if (pendingRef.length < 5 || pendingRef.length > 20 || !pendingRef.startsWith('TD-')) {
+      throw new Error(`Pending reference [${pendingRef}] length ${pendingRef.length} violates constraint [5, 20].`);
+    }
+    if (confirmedRef.length < 5 || confirmedRef.length > 20 || !confirmedRef.startsWith('TD-')) {
+      throw new Error(`Confirmed reference [${confirmedRef}] length ${confirmedRef.length} violates constraint [5, 20].`);
+    }
+
+    // Assemble compliant mock cluster
     const validMockCluster: DisposableCluster = {
-      runId: testMockRunId,
-      orgA: { id: '00000000-0000-0000-0000-000000000001', slug: `disp-org-a-${testMockRunId}`, name: 'Mock A' },
-      orgB: { id: '00000000-0000-0000-0000-000000000002', slug: `disp-org-b-${testMockRunId}`, name: 'Mock B' },
+      runId: testMockRunUuid,
+      refToken: testMockRefToken,
+      orgA: {
+        id: '00000000-0000-0000-0000-000000000001',
+        slug: `disp-oa-${testMockRefToken}`,
+        name: `Mock Org A ${testMockRefToken}`,
+        billing_email: `disp-org-a-${testMockRefToken}@example.com`,
+      },
+      orgB: {
+        id: '00000000-0000-0000-0000-000000000002',
+        slug: `disp-ob-${testMockRefToken}`,
+        name: `Mock Org B ${testMockRefToken}`,
+        billing_email: `disp-org-b-${testMockRefToken}@example.com`,
+      },
       facA: {
         id: '00000000-0000-0000-0000-000000000003',
         organization_id: '00000000-0000-0000-0000-000000000001',
-        slug: `disp-fac-a-${testMockRunId}`,
-        name: 'Fac A',
-        default_hourly_rate: 350,
+        slug: `disp-fa-${testMockRefToken}`,
+        name: `Facility A ${testMockRefToken}`,
+        currency: '₱',
+        default_hourly_rate: 350.0,
         booking_confirmation_mode: 'manual_approval',
         hold_duration_minutes: 30,
       },
       facB: {
         id: '00000000-0000-0000-0000-000000000004',
         organization_id: '00000000-0000-0000-0000-000000000002',
-        slug: `disp-fac-b-${testMockRunId}`,
-        name: 'Fac B',
-        default_hourly_rate: 250,
+        slug: `disp-fb-${testMockRefToken}`,
+        name: `Facility B ${testMockRefToken}`,
+        currency: '₱',
+        default_hourly_rate: 250.0,
         booking_confirmation_mode: 'manual_approval',
         hold_duration_minutes: 30,
       },
       courtA: {
         id: '00000000-0000-0000-0000-000000000005',
         facility_id: '00000000-0000-0000-0000-000000000003',
-        name: `Court A ${testMockRunId}`,
+        name: `Court A ${testMockRefToken}`,
         sport_type: 'Pickleball',
-        hourly_rate: 350,
+        hourly_rate: 350.0,
       },
       courtB: {
         id: '00000000-0000-0000-0000-000000000006',
         facility_id: '00000000-0000-0000-0000-000000000004',
-        name: `Court B ${testMockRunId}`,
+        name: `Court B ${testMockRefToken}`,
         sport_type: 'Badminton',
-        hourly_rate: 250,
+        hourly_rate: 250.0,
       },
       pendingResB: {
         id: '00000000-0000-0000-0000-000000000007',
-        reference_code: `TD-${testMockRunId}-P`,
+        reference_code: pendingRef,
         facility_id: '00000000-0000-0000-0000-000000000004',
         court_id: '00000000-0000-0000-0000-000000000006',
         status: 'pending',
-        price: 250,
+        price: 250.0,
+        currency: '₱',
+        duration_minutes: 60,
+        booking_date: '2028-06-15',
+        start_time: '2028-06-15T10:00:00Z',
+        end_time: '2028-06-15T11:00:00Z',
+        time_slot_label: '10:00 AM – 11:00 AM',
+        hold_expires_at: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
       },
       confirmedResB: {
         id: '00000000-0000-0000-0000-000000000008',
-        reference_code: `TD-${testMockRunId}-C`,
+        reference_code: confirmedRef,
         facility_id: '00000000-0000-0000-0000-000000000004',
         court_id: '00000000-0000-0000-0000-000000000006',
         status: 'confirmed',
-        price: 250,
+        price: 250.0,
+        currency: '₱',
+        duration_minutes: 60,
+        booking_date: '2028-06-15',
+        start_time: '2028-06-15T14:00:00Z',
+        end_time: '2028-06-15T15:00:00Z',
+        time_slot_label: '02:00 PM – 03:00 PM',
       },
     };
 
-    assertExactRunOwnership(validMockCluster, testMockRunId);
+    // 1. Assert ownership and constraint validation passes on valid cluster
+    assertExactRunOwnership(validMockCluster, testMockRunUuid);
+    const validResult = validateDatabaseConstraints(validMockCluster);
+    if (!validResult.isValid) {
+      throw new Error(`Valid mock cluster failed validation unexpectedly: ${validResult.errors.join('; ')}`);
+    }
 
-    // Validate that protected seed slug raises safety violation
+    // 2. Assert court hourly rate <= 0 is caught
+    const rateZeroResult = validateDatabaseConstraints({
+      ...validMockCluster,
+      courtA: { ...validMockCluster.courtA, hourly_rate: 0 },
+    });
+    if (rateZeroResult.isValid) throw new Error('Failed to catch court hourly_rate <= 0 constraint violation.');
+
+    // 3. Assert currency length > 5 is caught
+    const currencyLongResult = validateDatabaseConstraints({
+      ...validMockCluster,
+      facA: { ...validMockCluster.facA, currency: 'LONG_CURRENCY' },
+    });
+    if (currencyLongResult.isValid) throw new Error('Failed to catch currency length > 5 constraint violation.');
+
+    // 4. Assert reservation duration < 30 is caught
+    const durationShortResult = validateDatabaseConstraints({
+      ...validMockCluster,
+      pendingResB: { ...validMockCluster.pendingResB!, duration_minutes: 15 },
+    });
+    if (durationShortResult.isValid) throw new Error('Failed to catch duration_minutes < 30 constraint violation.');
+
+    // 5. Assert pending reservation missing hold_expires_at is caught
+    const pendingNoHoldResult = validateDatabaseConstraints({
+      ...validMockCluster,
+      pendingResB: { ...validMockCluster.pendingResB!, hold_expires_at: null },
+    });
+    if (pendingNoHoldResult.isValid) throw new Error('Failed to catch missing hold_expires_at constraint violation.');
+
+    // 6. Assert protected seed slug is caught
     let protectedSlugCaught = false;
     try {
       assertExactRunOwnership(
         { ...validMockCluster, facA: { ...validMockCluster.facA, slug: 'courtbook-pickleball-test' } },
-        testMockRunId
+        testMockRunUuid
       );
     } catch {
       protectedSlugCaught = true;
     }
+    if (!protectedSlugCaught) throw new Error('Failed to catch protected seed slug violation.');
 
-    // Validate that reference code length constraint is enforced
-    let invalidRefCaught = false;
-    try {
-      assertExactRunOwnership(
-        {
-          ...validMockCluster,
-          pendingResB: {
-            ...validMockCluster.pendingResB!,
-            reference_code: `TD-${testMockRunId}-P-TOOLONGTOBEVALID25`,
-          },
-        },
-        testMockRunId
-      );
-    } catch {
-      invalidRefCaught = true;
-    }
-
-    if (protectedSlugCaught && invalidRefCaught) {
-      results.push({
-        id: 'write-iso-governance-guard',
-        category,
-        name: 'Governance Prerequisite: Isolated Fixture Strategy & Invariant Validation',
-        status: 'PASS',
-        operationType: 'READ_ONLY',
-        durationMs: Date.now() - tGov,
-        details: 'Offline verification verified: Exact-run ownership, reference_code database length constraints (5-20 chars), and protected seed slug isolation invariants pass.',
-      });
-    } else {
-      results.push({
-        id: 'write-iso-governance-guard',
-        category,
-        name: 'Governance Prerequisite: Isolated Fixture Strategy & Invariant Validation',
-        status: 'FAIL',
-        operationType: 'READ_ONLY',
-        durationMs: Date.now() - tGov,
-        error: 'Safety invariant assertions failed during offline validation check.',
-      });
-    }
+    results.push({
+      id: 'write-iso-governance-guard',
+      category,
+      name: 'Governance Prerequisite: Isolated Fixture Strategy & Invariant Validation',
+      status: 'PASS',
+      operationType: 'READ_ONLY',
+      durationMs: Date.now() - tGov,
+      details: 'Offline verification verified: UUID runId, 13-char reference codes (within 5-20), currency (1-5), court hourly rate (>0), duration (30-480 min), hold_expires_at, and protected seed isolation pass.',
+    });
   } catch (err: any) {
     results.push({
       id: 'write-iso-governance-guard',
@@ -282,7 +343,7 @@ export async function runCrossTenantWriteIsolationSuite(): Promise<TestResult[]>
   // ==========================================================================
   // Provision Isolated Disposable Cluster
   // ==========================================================================
-  const runId = generateTestRunId();
+  const runId = generateTestRunUuid();
   let cluster: DisposableCluster | null = null;
 
   try {
@@ -312,7 +373,7 @@ export async function runCrossTenantWriteIsolationSuite(): Promise<TestResult[]>
 
       const { data, error } = await ctxA.client.rpc('approve_booking_request_as_staff', {
         p_reservation_id: targetId,
-        p_notes: `Unauthorized approval attempt by User A [${runId}]`,
+        p_notes: `Unauthorized approval attempt by User A [${cluster.refToken}]`,
       });
 
       if (isRpcUnavailableError(error)) {
@@ -377,7 +438,7 @@ export async function runCrossTenantWriteIsolationSuite(): Promise<TestResult[]>
 
       const { data, error } = await ctxA.client.rpc('decline_booking_request_as_staff', {
         p_reservation_id: targetId,
-        p_reason: `Unauthorized decline attempt by User A [${runId}]`,
+        p_reason: `Unauthorized decline attempt by User A [${cluster.refToken}]`,
       });
 
       if (isRpcUnavailableError(error)) {
@@ -441,7 +502,7 @@ export async function runCrossTenantWriteIsolationSuite(): Promise<TestResult[]>
 
       const { data, error } = await ctxA.client.rpc('cancel_reservation_as_staff', {
         p_reservation_id: targetId,
-        p_reason: `Unauthorized cancel attempt by User A [${runId}]`,
+        p_reason: `Unauthorized cancel attempt by User A [${cluster.refToken}]`,
       });
 
       if (isRpcUnavailableError(error)) {

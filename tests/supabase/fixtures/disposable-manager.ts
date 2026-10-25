@@ -1,21 +1,34 @@
 import { SupabaseClient } from '@supabase/supabase-js';
+import crypto from 'crypto';
 import { EXISTING_FIXTURES } from '../config';
 
 /**
  * Disposable Fixture Manager for Cross-Tenant WRITE Authorization Testing
  *
- * Implements strict security governance:
- * 1. Complete test-run ID embedding in all entity slugs, names, and reservation reference codes.
- * 2. Strict adherence to real database constraints (reference_code length BETWEEN 5 AND 20).
- * 3. Exact-run ownership validation guarding existing facilities, live reservations, and seeds.
- * 4. Trusted server-side admin client (service-role) for provisioning, RLS-unbiased cleanup verification, and rollback.
- * 5. Dependency-ordered deletion with zero-swallow error handling and verified zero-residue check.
+ * Implements strict security governance and real database constraint verification:
+ * 1. Unique test-run UUID (crypto.randomUUID()) for internal ownership tracking.
+ * 2. Compact reference token (8-char) derived from UUID so reservation reference codes
+ *    (e.g., 'TD-xxxxxxxx-P', 13 chars) strictly satisfy the database limit (5–20 chars).
+ * 3. Does NOT require full 36-char textual UUID inside reservation reference codes.
+ * 4. Cleanup targets ONLY exact database UUIDs recorded during the current run;
+ *    never uses broad name or prefix matching.
+ * 5. Complete constraint validation:
+ *    - reservations.reference_code: 5–20 characters.
+ *    - facilities.currency & reservations.currency: 1–5 characters.
+ *    - organizations.slug & facilities.slug: lowercase alphanumeric with hyphens, 2–60 characters.
+ *    - Pending reservations require hold_expires_at.
+ *    - Reservation duration must be 30–480 minutes.
+ *    - Court hourly_rate must be greater than zero (> 0).
+ * 6. Partial-provisioning failures trigger verified cleanup of every created record.
+ * 7. Positive confirmation that every disposable record was removed (zero residue).
+ * 8. Strict authentication context verification for create_organization_with_owner(p_name, p_slug, p_billing_email, p_is_demo).
  */
 
 export interface DisposableOrganization {
   id: string;
   slug: string;
   name: string;
+  billing_email: string;
 }
 
 export interface DisposableFacility {
@@ -23,6 +36,7 @@ export interface DisposableFacility {
   organization_id: string;
   slug: string;
   name: string;
+  currency: string;
   default_hourly_rate: number;
   booking_confirmation_mode: 'instant' | 'manual_approval';
   hold_duration_minutes: number;
@@ -41,18 +55,28 @@ export interface DisposableReservation {
   reference_code: string;
   facility_id: string;
   court_id: string;
-  status: 'pending' | 'confirmed' | 'cancelled' | 'declined';
+  status: 'pending' | 'confirmed' | 'cancelled' | 'declined' | 'completed' | 'no_show' | 'expired';
   price: number;
+  currency: string;
+  duration_minutes: number;
+  booking_date: string;
+  start_time: string;
+  end_time: string;
+  time_slot_label: string;
+  hold_expires_at?: string | null;
 }
 
 export interface DisposableCluster {
-  runId: string;
+  runId: string; // Full unique test-run UUID
+  refToken: string; // 8-character compact token for slugs & reference codes
   orgA: DisposableOrganization;
   orgB: DisposableOrganization;
   facA: DisposableFacility;
   facB: DisposableFacility;
   courtA: DisposableCourt;
   courtB: DisposableCourt;
+  memberAId?: string;
+  memberBId?: string;
   pendingResB?: DisposableReservation;
   confirmedResB?: DisposableReservation;
 }
@@ -70,19 +94,113 @@ export interface CleanupReport {
 }
 
 /**
- * Generates an 11-character unique test run identifier:
- * 'w' (1 char) + base36 timestamp (6 chars) + base36 random (4 chars).
- * Embedded in reference_code 'TD-${runId}-P' (16 chars), perfectly within database constraint [5, 20].
+ * Generates a full standard UUID v4 for unique test-run tracking.
  */
-export function generateTestRunId(): string {
-  const ts = Date.now().toString(36).slice(-6);
-  const rand = Math.random().toString(36).slice(-4);
-  return `w${ts}${rand}`;
+export function generateTestRunUuid(): string {
+  return crypto.randomUUID();
 }
 
 /**
- * Validates that all cluster entities belong exclusively to the exact test-run ID
- * and that no protected seeds or live customer records can ever be touched.
+ * Derives an 8-character compact alphanumeric token from a UUID.
+ * Used for slugs and reference codes to stay well within database string limits.
+ */
+export function generateRefToken(uuid: string): string {
+  return uuid.replace(/[^a-zA-Z0-9]/g, '').toLowerCase().substring(0, 8);
+}
+
+/**
+ * Generates a reservation reference code satisfying CHECK (char_length(reference_code) BETWEEN 5 AND 20).
+ * e.g., 'TD-' (3) + refToken (8) + '-P' (2) = 13 characters.
+ */
+export function generateReservationRef(type: 'pending' | 'confirmed', refToken: string): string {
+  const suffix = type === 'pending' ? 'P' : 'C';
+  return `TD-${refToken}-${suffix}`;
+}
+
+/**
+ * Validates all cluster entities against real database schema constraints:
+ * - reservations.reference_code: 5–20 characters.
+ * - facilities.currency & reservations.currency: 1–5 characters.
+ * - organizations.slug & facilities.slug: lowercase alphanumeric with hyphens, 2–60 characters.
+ * - Pending reservations require hold_expires_at.
+ * - Reservation duration: 30–480 minutes.
+ * - Court hourly_rate: must be greater than zero (> 0).
+ */
+export function validateDatabaseConstraints(cluster: DisposableCluster): { isValid: boolean; errors: string[] } {
+  const errors: string[] = [];
+  const slugRegex = /^[a-z0-9]+(-[a-z0-9]+)*$/;
+
+  // 1. Organizations validation
+  for (const org of [cluster.orgA, cluster.orgB]) {
+    if (!org.slug || !slugRegex.test(org.slug) || org.slug.length < 2 || org.slug.length > 60) {
+      errors.push(`Organization slug [${org.slug}] violates constraint: lowercase alphanumeric with hyphens (2–60 chars).`);
+    }
+    if (!org.name || org.name.trim().length < 2 || org.name.trim().length > 120) {
+      errors.push(`Organization name [${org.name}] violates constraint (2–120 chars).`);
+    }
+  }
+
+  // 2. Facilities validation
+  for (const fac of [cluster.facA, cluster.facB]) {
+    if (!fac.slug || !slugRegex.test(fac.slug) || fac.slug.length < 2 || fac.slug.length > 60) {
+      errors.push(`Facility slug [${fac.slug}] violates constraint: lowercase alphanumeric with hyphens (2–60 chars).`);
+    }
+    if (!fac.name || fac.name.trim().length < 2 || fac.name.trim().length > 100) {
+      errors.push(`Facility name [${fac.name}] violates constraint (2–100 chars).`);
+    }
+    if (!fac.currency || fac.currency.length < 1 || fac.currency.length > 5) {
+      errors.push(`Facility currency [${fac.currency}] violates constraint (1–5 chars).`);
+    }
+    if (fac.default_hourly_rate < 0) {
+      errors.push(`Facility default_hourly_rate [${fac.default_hourly_rate}] must be >= 0.`);
+    }
+    if (fac.hold_duration_minutes < 5 || fac.hold_duration_minutes > 1440) {
+      errors.push(`Facility hold_duration_minutes [${fac.hold_duration_minutes}] must be between 5 and 1440.`);
+    }
+  }
+
+  // 3. Courts validation
+  for (const court of [cluster.courtA, cluster.courtB]) {
+    if (court.hourly_rate <= 0) {
+      errors.push(`Court [${court.name}] hourly_rate [${court.hourly_rate}] must be greater than zero.`);
+    }
+    if (!court.name || court.name.trim().length < 1 || court.name.trim().length > 100) {
+      errors.push(`Court name [${court.name}] violates constraint (1–100 chars).`);
+    }
+    if (!court.sport_type || court.sport_type.trim().length < 2 || court.sport_type.trim().length > 50) {
+      errors.push(`Court sport_type [${court.sport_type}] violates constraint (2–50 chars).`);
+    }
+  }
+
+  // 4. Reservations validation
+  const reservationsToCheck = [cluster.pendingResB, cluster.confirmedResB].filter(Boolean) as DisposableReservation[];
+  for (const res of reservationsToCheck) {
+    if (!res.reference_code || res.reference_code.length < 5 || res.reference_code.length > 20) {
+      errors.push(`Reservation reference_code [${res.reference_code}] violates constraint: length (${res.reference_code?.length}) must be between 5 and 20 chars.`);
+    }
+    if (!res.currency || res.currency.length < 1 || res.currency.length > 5) {
+      errors.push(`Reservation currency [${res.currency}] violates constraint: length (${res.currency?.length}) must be 1–5 chars.`);
+    }
+    if (res.duration_minutes < 30 || res.duration_minutes > 480) {
+      errors.push(`Reservation duration_minutes [${res.duration_minutes}] must be between 30 and 480.`);
+    }
+    if (res.status === 'pending' && !res.hold_expires_at) {
+      errors.push(`Pending reservation [${res.reference_code}] violates constraint: hold_expires_at is required for pending holds.`);
+    }
+    if (res.price < 0) {
+      errors.push(`Reservation price [${res.price}] must be >= 0.`);
+    }
+  }
+
+  return {
+    isValid: errors.length === 0,
+    errors,
+  };
+}
+
+/**
+ * Validates that all cluster entities belong exclusively to the exact test-run identifier
+ * and that no protected seed facilities or live customer records can ever be targeted.
  */
 export function assertExactRunOwnership(cluster: DisposableCluster, runId: string): void {
   if (!cluster.runId || cluster.runId !== runId) {
@@ -102,21 +220,21 @@ export function assertExactRunOwnership(cluster: DisposableCluster, runId: strin
   for (const slug of [cluster.orgA.slug, cluster.orgB.slug, cluster.facA.slug, cluster.facB.slug]) {
     if (protectedSlugs.includes(slug)) {
       throw new Error(
-        `CRITICAL SAFETY VIOLATION: Disposable cluster contains protected seed slug [${slug}]! Only dedicated disposable fixtures tagged with [${runId}] may be targeted.`
+        `CRITICAL SAFETY VIOLATION: Disposable cluster contains protected seed slug [${slug}]! Only dedicated disposable fixtures tagged with [${cluster.refToken}] may be targeted.`
       );
     }
-    if (!slug.includes(runId)) {
+    if (!slug.includes(cluster.refToken)) {
       throw new Error(
-        `CRITICAL SAFETY VIOLATION: Slug [${slug}] does not contain complete test-run identifier [${runId}]. Aborting.`
+        `CRITICAL SAFETY VIOLATION: Slug [${slug}] does not contain run reference token [${cluster.refToken}]. Aborting.`
       );
     }
   }
 
   if (cluster.pendingResB) {
     const ref = cluster.pendingResB.reference_code;
-    if (!ref.startsWith('TD-') || !ref.includes(runId)) {
+    if (!ref.startsWith('TD-') || !ref.includes(cluster.refToken)) {
       throw new Error(
-        `CRITICAL SAFETY VIOLATION: Pending reservation reference [${ref}] does not contain complete test-run identifier [${runId}] or prefix TD-. Real customer records are protected.`
+        `CRITICAL SAFETY VIOLATION: Pending reservation reference [${ref}] does not contain run reference token [${cluster.refToken}] or prefix TD-. Real customer records are protected.`
       );
     }
     if (ref.length < 5 || ref.length > 20) {
@@ -128,9 +246,9 @@ export function assertExactRunOwnership(cluster: DisposableCluster, runId: strin
 
   if (cluster.confirmedResB) {
     const ref = cluster.confirmedResB.reference_code;
-    if (!ref.startsWith('TD-') || !ref.includes(runId)) {
+    if (!ref.startsWith('TD-') || !ref.includes(cluster.refToken)) {
       throw new Error(
-        `CRITICAL SAFETY VIOLATION: Confirmed reservation reference [${ref}] does not contain complete test-run identifier [${runId}] or prefix TD-. Real customer records are protected.`
+        `CRITICAL SAFETY VIOLATION: Confirmed reservation reference [${ref}] does not contain run reference token [${cluster.refToken}] or prefix TD-. Real customer records are protected.`
       );
     }
     if (ref.length < 5 || ref.length > 20) {
@@ -139,12 +257,19 @@ export function assertExactRunOwnership(cluster: DisposableCluster, runId: strin
       );
     }
   }
+
+  const constraintResult = validateDatabaseConstraints(cluster);
+  if (!constraintResult.isValid) {
+    throw new Error(
+      `CRITICAL SAFETY VIOLATION: Disposable cluster failed database constraint validation: ${constraintResult.errors.join('; ')}`
+    );
+  }
 }
 
 /**
  * Rollback helper for partially provisioned clusters.
- * Cleans up reservations, courts, facilities, organization memberships, and organizations.
- * NEVER silently swallows errors; collects and throws all cleanup failures.
+ * Targets ONLY exact recorded UUIDs.
+ * Positively confirms deletion and throws an explicit error if any record remains.
  */
 export async function rollbackPartialCluster(
   partial: {
@@ -154,15 +279,16 @@ export async function rollbackPartialCluster(
     facBId?: string;
     courtAId?: string;
     courtBId?: string;
-    resIds?: string[];
+    resIds: string[];
+    memberIds: string[];
     runId: string;
   },
   adminClient: SupabaseClient
 ): Promise<void> {
   const rollbackErrors: string[] = [];
 
-  // 1. Delete any created reservations
-  if (partial.resIds && partial.resIds.length > 0) {
+  // 1. Delete exact recorded reservation UUIDs
+  if (partial.resIds.length > 0) {
     try {
       const { error } = await adminClient.from('reservations').delete().in('id', partial.resIds);
       if (error) rollbackErrors.push(`Failed to delete reservations in rollback: ${error.message}`);
@@ -171,7 +297,7 @@ export async function rollbackPartialCluster(
     }
   }
 
-  // 2. Delete courts
+  // 2. Delete exact recorded court UUIDs
   const courtIds = [partial.courtAId, partial.courtBId].filter(Boolean) as string[];
   if (courtIds.length > 0) {
     try {
@@ -182,7 +308,7 @@ export async function rollbackPartialCluster(
     }
   }
 
-  // 3. Delete facilities
+  // 3. Delete exact recorded facility UUIDs
   const facIds = [partial.facAId, partial.facBId].filter(Boolean) as string[];
   if (facIds.length > 0) {
     try {
@@ -193,23 +319,44 @@ export async function rollbackPartialCluster(
     }
   }
 
-  // 4. Delete organization memberships
+  // 4. Delete exact recorded membership and organization UUIDs
   const orgIds = [partial.orgAId, partial.orgBId].filter(Boolean) as string[];
-  if (orgIds.length > 0) {
+  if (orgIds.length > 0 || partial.memberIds.length > 0) {
     try {
-      const { error } = await adminClient.from('organization_members').delete().in('organization_id', orgIds);
-      if (error) rollbackErrors.push(`Failed to delete organization members in rollback: ${error.message}`);
-    } catch (err: any) {
-      rollbackErrors.push(`Exception deleting organization members in rollback: ${err?.message || String(err)}`);
-    }
-
-    // 5. Delete organizations
-    try {
-      const { error } = await adminClient.from('organizations').delete().in('id', orgIds);
-      if (error) rollbackErrors.push(`Failed to delete organizations in rollback: ${error.message}`);
+      if (partial.memberIds.length > 0) {
+        await adminClient.from('organization_members').delete().in('id', partial.memberIds);
+      }
+      if (orgIds.length > 0) {
+        await adminClient.from('organization_members').delete().in('organization_id', orgIds);
+        const { error } = await adminClient.from('organizations').delete().in('id', orgIds);
+        if (error) rollbackErrors.push(`Failed to delete organizations in rollback: ${error.message}`);
+      }
     } catch (err: any) {
       rollbackErrors.push(`Exception deleting organizations in rollback: ${err?.message || String(err)}`);
     }
+  }
+
+  // 5. Positive verification that every created record was actually removed
+  const remainingResiduals: string[] = [];
+  if (partial.resIds.length > 0) {
+    const { data: remRes } = await adminClient.from('reservations').select('id').in('id', partial.resIds);
+    if (remRes && remRes.length > 0) remRes.forEach((r) => remainingResiduals.push(`reservation:${r.id}`));
+  }
+  if (courtIds.length > 0) {
+    const { data: remCourts } = await adminClient.from('courts').select('id').in('id', courtIds);
+    if (remCourts && remCourts.length > 0) remCourts.forEach((c) => remainingResiduals.push(`court:${c.id}`));
+  }
+  if (facIds.length > 0) {
+    const { data: remFacs } = await adminClient.from('facilities').select('id').in('id', facIds);
+    if (remFacs && remFacs.length > 0) remFacs.forEach((f) => remainingResiduals.push(`facility:${f.id}`));
+  }
+  if (orgIds.length > 0) {
+    const { data: remOrgs } = await adminClient.from('organizations').select('id').in('id', orgIds);
+    if (remOrgs && remOrgs.length > 0) remOrgs.forEach((o) => remainingResiduals.push(`org:${o.id}`));
+  }
+
+  if (remainingResiduals.length > 0) {
+    rollbackErrors.push(`Positive verification failed! Residual records remain after rollback: ${remainingResiduals.join(', ')}`);
   }
 
   if (rollbackErrors.length > 0) {
@@ -226,8 +373,10 @@ export async function rollbackPartialCluster(
  * - 2 disposable courts (Court A and Court B)
  * - Required pending & confirmed reservations for Facility B
  *
- * Requires a trusted server-side admin client (serviceRoleKey).
- * If any creation or reservation insert fails, aborts immediately and rolls back.
+ * Requirements:
+ * - Requires verified authentication context on clientA and clientB for create_organization_with_owner.
+ * - Requires trusted server-side admin client (service-role) for reservation seeding and exact-UUID teardown.
+ * - If any creation or reservation insert fails, aborts immediately and performs verified rollback.
  */
 export async function provisionDisposableCluster(
   runId: string,
@@ -239,10 +388,22 @@ export async function provisionDisposableCluster(
     throw new Error('Trusted adminClient (service-role) is required for disposable fixture provisioning.');
   }
 
-  const orgASlug = `disp-org-a-${runId}`;
-  const orgBSlug = `disp-org-b-${runId}`;
-  const facASlug = `disp-fac-a-${runId}`;
-  const facBSlug = `disp-fac-b-${runId}`;
+  // 1. Verify caller authentication context and auth.uid() before invoking RPC
+  const { data: userAData, error: userAErr } = await clientA.auth.getUser();
+  if (userAErr || !userAData?.user?.id) {
+    throw new Error(`Client A has invalid authentication context: ${userAErr?.message || 'auth.uid() is null'}`);
+  }
+
+  const { data: userBData, error: userBErr } = await clientB.auth.getUser();
+  if (userBErr || !userBData?.user?.id) {
+    throw new Error(`Client B has invalid authentication context: ${userBErr?.message || 'auth.uid() is null'}`);
+  }
+
+  const refToken = generateRefToken(runId);
+  const orgASlug = `disp-oa-${refToken}`;
+  const orgBSlug = `disp-ob-${refToken}`;
+  const facASlug = `disp-fa-${refToken}`;
+  const facBSlug = `disp-fb-${refToken}`;
 
   let orgAId: string | undefined;
   let orgBId: string | undefined;
@@ -251,15 +412,16 @@ export async function provisionDisposableCluster(
   let courtAId: string | undefined;
   let courtBId: string | undefined;
   const resIds: string[] = [];
+  const memberIds: string[] = [];
   let pendingResB: DisposableReservation | undefined;
   let confirmedResB: DisposableReservation | undefined;
 
   try {
-    // 1. Create Disposable Org A via User A
+    // 2. User A creates Disposable Org A via create_organization_with_owner(p_name, p_slug, p_billing_email, p_is_demo)
     const { data: orgAResult, error: orgAErr } = await clientA.rpc('create_organization_with_owner', {
-      p_name: `Disposable Org A ${runId}`,
+      p_name: `Disposable Org A ${refToken}`,
       p_slug: orgASlug,
-      p_billing_email: `disp-org-a-${runId}@example.com`,
+      p_billing_email: `disp-org-a-${refToken}@example.com`,
       p_is_demo: true,
     });
     if (orgAErr || !orgAResult) {
@@ -267,11 +429,20 @@ export async function provisionDisposableCluster(
     }
     orgAId = orgAResult;
 
-    // 2. Create Disposable Org B via User B
+    // Record created membership ID for Org A
+    const { data: memberAData } = await adminClient
+      .from('organization_members')
+      .select('id')
+      .eq('organization_id', orgAId)
+      .eq('user_id', userAData.user.id)
+      .single();
+    if (memberAData?.id) memberIds.push(memberAData.id);
+
+    // 3. User B creates Disposable Org B via create_organization_with_owner(p_name, p_slug, p_billing_email, p_is_demo)
     const { data: orgBResult, error: orgBErr } = await clientB.rpc('create_organization_with_owner', {
-      p_name: `Disposable Org B ${runId}`,
+      p_name: `Disposable Org B ${refToken}`,
       p_slug: orgBSlug,
-      p_billing_email: `disp-org-b-${runId}@example.com`,
+      p_billing_email: `disp-org-b-${refToken}@example.com`,
       p_is_demo: true,
     });
     if (orgBErr || !orgBResult) {
@@ -279,12 +450,21 @@ export async function provisionDisposableCluster(
     }
     orgBId = orgBResult;
 
-    // 3. User A creates Disposable Facility A
+    // Record created membership ID for Org B
+    const { data: memberBData } = await adminClient
+      .from('organization_members')
+      .select('id')
+      .eq('organization_id', orgBId)
+      .eq('user_id', userBData.user.id)
+      .single();
+    if (memberBData?.id) memberIds.push(memberBData.id);
+
+    // 4. User A creates Disposable Facility A
     const { data: facAData, error: facAErr } = await clientA
       .from('facilities')
       .insert({
         organization_id: orgAId,
-        name: `Facility A ${runId}`,
+        name: `Facility A ${refToken}`,
         slug: facASlug,
         address: '123 Disposable Way, Zone A',
         timezone: 'Asia/Manila',
@@ -295,19 +475,19 @@ export async function provisionDisposableCluster(
         is_active: true,
         is_demo: true,
       })
-      .select('id, organization_id, slug, name, default_hourly_rate, booking_confirmation_mode, hold_duration_minutes')
+      .select('id, organization_id, slug, name, currency, default_hourly_rate, booking_confirmation_mode, hold_duration_minutes')
       .single();
     if (facAErr || !facAData) {
       throw new Error(`Failed to create disposable Facility A: ${facAErr?.message}`);
     }
     facAId = facAData.id;
 
-    // 4. User B creates Disposable Facility B
+    // 5. User B creates Disposable Facility B
     const { data: facBData, error: facBErr } = await clientB
       .from('facilities')
       .insert({
         organization_id: orgBId,
-        name: `Facility B ${runId}`,
+        name: `Facility B ${refToken}`,
         slug: facBSlug,
         address: '456 Disposable Way, Zone B',
         timezone: 'Asia/Manila',
@@ -318,19 +498,19 @@ export async function provisionDisposableCluster(
         is_active: true,
         is_demo: true,
       })
-      .select('id, organization_id, slug, name, default_hourly_rate, booking_confirmation_mode, hold_duration_minutes')
+      .select('id, organization_id, slug, name, currency, default_hourly_rate, booking_confirmation_mode, hold_duration_minutes')
       .single();
     if (facBErr || !facBData) {
       throw new Error(`Failed to create disposable Facility B: ${facBErr?.message}`);
     }
     facBId = facBData.id;
 
-    // 5. User A creates Disposable Court A
+    // 6. User A creates Disposable Court A (hourly_rate > 0)
     const { data: courtAData, error: courtAErr } = await clientA
       .from('courts')
       .insert({
         facility_id: facAId,
-        name: `Court A ${runId}`,
+        name: `Court A ${refToken}`,
         sport_type: 'Pickleball',
         hourly_rate: 350.0,
         is_enabled: true,
@@ -343,12 +523,12 @@ export async function provisionDisposableCluster(
     }
     courtAId = courtAData.id;
 
-    // 6. User B creates Disposable Court B
+    // 7. User B creates Disposable Court B (hourly_rate > 0)
     const { data: courtBData, error: courtBErr } = await clientB
       .from('courts')
       .insert({
         facility_id: facBId,
-        name: `Court B ${runId}`,
+        name: `Court B ${refToken}`,
         sport_type: 'Badminton',
         hourly_rate: 250.0,
         is_enabled: true,
@@ -361,17 +541,18 @@ export async function provisionDisposableCluster(
     }
     courtBId = courtBData.id;
 
-    // 7. Provision Required Pending Reservation on Facility B
-    // reference_code is exactly 16 chars: 'TD-' (3) + runId (11) + '-P' (2), within CHECK (5-20)
-    const refPending = `TD-${runId}-P`;
+    // 8. Provision Required Pending Reservation on Facility B
+    // Reference code: 'TD-' (3) + refToken (8) + '-P' (2) = 13 chars, within [5, 20]
+    const refPending = generateReservationRef('pending', refToken);
+    const holdExpiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
     const { data: resP, error: errP } = await adminClient
       .from('reservations')
       .insert({
         facility_id: facBId,
         court_id: courtBId,
         reference_code: refPending,
-        customer_name: `Disposable Customer P ${runId}`,
-        customer_email: `disp-cust-p-${runId}@example.com`,
+        customer_name: `Disposable Customer P ${refToken}`,
+        customer_email: `disp-cust-p-${refToken}@example.com`,
         customer_phone: '+639170000001',
         booking_date: '2028-06-15',
         start_time: '2028-06-15T10:00:00Z',
@@ -381,10 +562,10 @@ export async function provisionDisposableCluster(
         status: 'pending',
         price: 250.0,
         currency: '₱',
-        hold_expires_at: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+        hold_expires_at: holdExpiresAt,
         is_demo: true,
       })
-      .select('id, reference_code, facility_id, court_id, status, price')
+      .select('id, reference_code, facility_id, court_id, status, price, currency, duration_minutes, booking_date, start_time, end_time, time_slot_label, hold_expires_at')
       .single();
 
     if (errP || !resP) {
@@ -393,18 +574,18 @@ export async function provisionDisposableCluster(
     pendingResB = resP as DisposableReservation;
     resIds.push(resP.id);
 
-    // 8. Provision Required Confirmed Reservation on Facility B
-    // Non-overlapping timeslot: 14:00-15:00 vs 10:00-11:00
-    // reference_code is exactly 16 chars: 'TD-' (3) + runId (11) + '-C' (2), within CHECK (5-20)
-    const refConfirmed = `TD-${runId}-C`;
+    // 9. Provision Required Confirmed Reservation on Facility B
+    // Reference code: 'TD-' (3) + refToken (8) + '-C' (2) = 13 chars, within [5, 20]
+    // Non-overlapping time slot: 14:00-15:00 vs 10:00-11:00
+    const refConfirmed = generateReservationRef('confirmed', refToken);
     const { data: resC, error: errC } = await adminClient
       .from('reservations')
       .insert({
         facility_id: facBId,
         court_id: courtBId,
         reference_code: refConfirmed,
-        customer_name: `Disposable Customer C ${runId}`,
-        customer_email: `disp-cust-c-${runId}@example.com`,
+        customer_name: `Disposable Customer C ${refToken}`,
+        customer_email: `disp-cust-c-${refToken}@example.com`,
         customer_phone: '+639170000002',
         booking_date: '2028-06-15',
         start_time: '2028-06-15T14:00:00Z',
@@ -416,7 +597,7 @@ export async function provisionDisposableCluster(
         currency: '₱',
         is_demo: true,
       })
-      .select('id, reference_code, facility_id, court_id, status, price')
+      .select('id, reference_code, facility_id, court_id, status, price, currency, duration_minutes, booking_date, start_time, end_time, time_slot_label')
       .single();
 
     if (errC || !resC) {
@@ -431,12 +612,15 @@ export async function provisionDisposableCluster(
 
     const cluster: DisposableCluster = {
       runId,
-      orgA: { id: orgAId, slug: orgASlug, name: `Disposable Org A ${runId}` },
-      orgB: { id: orgBId, slug: orgBSlug, name: `Disposable Org B ${runId}` },
+      refToken,
+      orgA: { id: orgAId, slug: orgASlug, name: `Disposable Org A ${refToken}`, billing_email: `disp-org-a-${refToken}@example.com` },
+      orgB: { id: orgBId, slug: orgBSlug, name: `Disposable Org B ${refToken}`, billing_email: `disp-org-b-${refToken}@example.com` },
       facA: facAData as DisposableFacility,
       facB: facBData as DisposableFacility,
       courtA: courtAData as DisposableCourt,
       courtB: courtBData as DisposableCourt,
+      memberAId: memberIds[0],
+      memberBId: memberIds[1],
       pendingResB,
       confirmedResB,
     };
@@ -444,9 +628,9 @@ export async function provisionDisposableCluster(
     assertExactRunOwnership(cluster, runId);
     return cluster;
   } catch (err: any) {
-    // Abort provisioning immediately and clean up all partially created entities
+    // Abort provisioning immediately and trigger verified cleanup of all partially created records
     await rollbackPartialCluster(
-      { orgAId, orgBId, facAId, facBId, courtAId, courtBId, resIds, runId },
+      { orgAId, orgBId, facAId, facBId, courtAId, courtBId, resIds, memberIds, runId },
       adminClient
     );
     throw err;
@@ -456,15 +640,18 @@ export async function provisionDisposableCluster(
 /**
  * Reliable Teardown & Verified Cleanup
  *
- * Enforces strict dependency order:
- * 1. Reservations (exact IDs matching runId)
- * 2. Courts (exact IDs matching runId)
- * 3. Facilities (exact IDs matching runId)
- * 4. Organization Memberships (exact org IDs matching runId)
- * 5. Organizations (exact IDs matching runId)
+ * Targets ONLY exact database UUIDs recorded during the current run.
+ * Never uses broad reference prefixes or names.
  *
- * Uses trusted server-side admin client to bypass RLS, guaranteeing complete visibility
- * of all created records during verification.
+ * Enforces strict dependency order:
+ * 1. Reservations (exact recorded UUIDs)
+ * 2. Courts (exact recorded UUIDs)
+ * 3. Facilities (exact recorded UUIDs)
+ * 4. Organization Memberships (exact recorded UUIDs and org IDs)
+ * 5. Organizations (exact recorded UUIDs)
+ *
+ * Queries the database using adminClient (bypassing RLS) to positively confirm
+ * that every disposable record was completely removed.
  */
 export async function teardownDisposableCluster(
   cluster: DisposableCluster,
@@ -497,7 +684,7 @@ export async function teardownDisposableCluster(
     return report;
   }
 
-  // 1. Delete Reservations
+  // 1. Delete Reservations by EXACT recorded UUIDs
   const resIdsToDelete: string[] = [];
   if (cluster.pendingResB?.id) resIdsToDelete.push(cluster.pendingResB.id);
   if (cluster.confirmedResB?.id) resIdsToDelete.push(cluster.confirmedResB.id);
@@ -518,7 +705,7 @@ export async function teardownDisposableCluster(
       report.errors.push(`Exception deleting reservations: ${err?.message || String(err)}`);
     }
 
-    // Verify reservations are gone via adminClient (bypassing RLS)
+    // Positive confirmation: Verify reservations are gone via adminClient
     const { data: remRes, error: errRemRes } = await adminClient
       .from('reservations')
       .select('id, reference_code')
@@ -532,7 +719,7 @@ export async function teardownDisposableCluster(
     }
   }
 
-  // 2. Delete Courts
+  // 2. Delete Courts by EXACT recorded UUIDs
   const courtIds = [cluster.courtA.id, cluster.courtB.id];
   try {
     const { count, error } = await adminClient
@@ -549,7 +736,7 @@ export async function teardownDisposableCluster(
     report.errors.push(`Exception deleting courts: ${err?.message || String(err)}`);
   }
 
-  // Verify courts are gone via adminClient
+  // Positive confirmation: Verify courts are gone
   const { data: remCourts, error: errRemCourts } = await adminClient
     .from('courts')
     .select('id')
@@ -562,7 +749,7 @@ export async function teardownDisposableCluster(
     remCourts.forEach((c) => report.remainingRecords.push(`court:${c.id}`));
   }
 
-  // 3. Delete Facilities
+  // 3. Delete Facilities by EXACT recorded UUIDs
   const facIds = [cluster.facA.id, cluster.facB.id];
   try {
     const { count, error } = await adminClient
@@ -579,7 +766,7 @@ export async function teardownDisposableCluster(
     report.errors.push(`Exception deleting facilities: ${err?.message || String(err)}`);
   }
 
-  // Verify facilities are gone via adminClient
+  // Positive confirmation: Verify facilities are gone
   const { data: remFacs, error: errRemFacs } = await adminClient
     .from('facilities')
     .select('id')
@@ -592,9 +779,18 @@ export async function teardownDisposableCluster(
     remFacs.forEach((f) => report.remainingRecords.push(`facility:${f.id}`));
   }
 
-  // 4. Delete Organization Memberships
+  // 4. Delete Organization Memberships by EXACT recorded UUIDs and Org IDs
   const orgIds = [cluster.orgA.id, cluster.orgB.id];
+  const memberIds = [cluster.memberAId, cluster.memberBId].filter(Boolean) as string[];
+
   try {
+    if (memberIds.length > 0) {
+      const { count } = await adminClient
+        .from('organization_members')
+        .delete({ count: 'exact' })
+        .in('id', memberIds);
+      report.deletedMembers += count ?? 0;
+    }
     const { count, error } = await adminClient
       .from('organization_members')
       .delete({ count: 'exact' })
@@ -609,7 +805,7 @@ export async function teardownDisposableCluster(
     report.errors.push(`Exception deleting organization members: ${err?.message || String(err)}`);
   }
 
-  // Verify memberships are gone via adminClient
+  // Positive confirmation: Verify memberships are gone
   const { data: remMembers, error: errRemMembers } = await adminClient
     .from('organization_members')
     .select('id')
@@ -622,7 +818,7 @@ export async function teardownDisposableCluster(
     remMembers.forEach((m) => report.remainingRecords.push(`member:${m.id}`));
   }
 
-  // 5. Delete Organizations
+  // 5. Delete Organizations by EXACT recorded UUIDs
   try {
     const { count, error } = await adminClient
       .from('organizations')
@@ -638,7 +834,7 @@ export async function teardownDisposableCluster(
     report.errors.push(`Exception deleting organizations: ${err?.message || String(err)}`);
   }
 
-  // Verify organizations are gone via adminClient
+  // Positive confirmation: Verify organizations are gone
   const { data: remOrgs, error: errRemOrgs } = await adminClient
     .from('organizations')
     .select('id')
@@ -656,29 +852,4 @@ export async function teardownDisposableCluster(
   }
 
   return report;
-}
-
-/**
- * Asserts state immutability between before and after snapshots.
- */
-export function assertStateUnchanged(
-  entityName: string,
-  before: Record<string, any>,
-  after: Record<string, any>,
-  fieldsToCheck: string[]
-): { isUnchanged: boolean; differences: string[] } {
-  const differences: string[] = [];
-
-  for (const field of fieldsToCheck) {
-    if (before[field] !== after[field]) {
-      differences.push(
-        `${field} changed from [${JSON.stringify(before[field])}] to [${JSON.stringify(after[field])}]`
-      );
-    }
-  }
-
-  return {
-    isUnchanged: differences.length === 0,
-    differences,
-  };
 }
