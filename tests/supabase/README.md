@@ -41,6 +41,11 @@ The testing harness targets the existing fixtures in your Supabase project witho
 | **06** | `Staff Rescheduling` | **STATE-CHANGING (GUARDED)** | Verifies rejection of cross-facility moves, operating hours bounds, and past dates; tests rescheduling with verified restoration. |
 | **07** | `Maintenance Blocks` | **STATE-CHANGING (GUARDED)** | Verifies cross-tenant block rejection; verifies exclusion constraint prevents overlapping blocks; cleans up disposable blocks. |
 | **08** | `Public Availability` | **READ-ONLY** | Calls `check_court_booking_status` and `get_court_busy_slots`; verifies anti-ambiguity exceptions for disabled/nonexistent courts. |
+| **09** | `Booking Confirmation` | **STATE-CHANGING (GUARDED)** | Verifies instant vs manual approval modes, hold durations, and stale hold expiration cleanup boundaries. |
+| **10** | `Edge & Abuse Defense` | **STATE-CHANGING (GUARDED)** | Verifies rate limiting, Turnstile token verification, and atomic database idempotency replay contracts. |
+| **11** | `UUID & Facility Mapping` | **READ-ONLY** | Verifies facility and court UUID resolution, preventing cross-business court mismatch. |
+| **12** | `Booking Response Envelope` | **READ-ONLY** | Verifies flat PostgreSQL RPC return parsing, field alias resolution, and timezone-accurate slot calculations. |
+| **13** | `Multi-Tenant Isolation` | **READ-ONLY & GUARDED** | Comprehensive Phase 2 verification: validates User A & B read/write tenant boundaries, RPC permission barriers, settings isolation, membership security, and anonymous client privacy. |
 
 ---
 

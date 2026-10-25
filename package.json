@@ -8,6 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "test:supabase": "tsx tests/supabase/run-all.ts",
+    "test:isolation": "tsx tests/supabase/run-isolation.ts",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit"
   },
