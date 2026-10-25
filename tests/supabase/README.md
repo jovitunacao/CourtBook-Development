@@ -46,6 +46,7 @@ The testing harness targets the existing fixtures in your Supabase project witho
 | **11** | `UUID & Facility Mapping` | **READ-ONLY** | Verifies facility and court UUID resolution, preventing cross-business court mismatch. |
 | **12** | `Booking Response Envelope` | **READ-ONLY** | Verifies flat PostgreSQL RPC return parsing, field alias resolution, and timezone-accurate slot calculations. |
 | **13** | `Multi-Tenant Isolation` | **READ-ONLY & GUARDED** | Comprehensive Phase 2 verification: validates User A & B read/write tenant boundaries, RPC permission barriers, settings isolation, membership security, and anonymous client privacy. |
+| **14** | `Cross-Tenant WRITE Isolation` | **STATE-CHANGING (GUARDED)** | Isolated write-authorization test suite using dedicated disposable fixtures (tagged TD-W-% / test-disposable-%); verifies approve, decline, cancel, reschedule, settings, and membership mutations are strictly denied for cross-tenant actors. |
 
 ---
 

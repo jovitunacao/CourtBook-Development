@@ -15,6 +15,7 @@ import { runEdgeSecurityAndAbuseSuite } from './suites/10_edge_security_and_abus
 import { runUuidMappingSuite } from './suites/11_facility_and_court_uuid_mapping.test';
 import { runBookingResponseAndRecoverySuite } from './suites/12_booking_response_and_recovery.test';
 import { runMultiTenantIsolationSuite } from './suites/13_multi_tenant_isolation.test';
+import { runCrossTenantWriteIsolationSuite } from './suites/14_cross_tenant_write_isolation.test';
 
 async function main() {
   printTestHeader();
@@ -71,6 +72,7 @@ async function main() {
     { name: '11. Facility & Court UUID Mapping & Validation', runner: runUuidMappingSuite },
     { name: '12. Booking Response Envelope & Idempotency Recovery', runner: runBookingResponseAndRecoverySuite },
     { name: '13. Multi-Tenant Security & Tenant Isolation', runner: runMultiTenantIsolationSuite },
+    { name: '14. Cross-Tenant WRITE Authorization & State Mutation', runner: runCrossTenantWriteIsolationSuite },
   ];
 
   for (const suite of suites) {

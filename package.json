@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "test:supabase": "tsx tests/supabase/run-all.ts",
     "test:isolation": "tsx tests/supabase/run-isolation.ts",
+    "test:write-isolation": "tsx tests/supabase/run-write-isolation.ts",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit"
   },
