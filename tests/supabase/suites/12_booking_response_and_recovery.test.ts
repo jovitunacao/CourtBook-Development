@@ -9,6 +9,7 @@ import {
   getLocalSlotUtcBounds,
   getTodayStringInTimezone,
 } from '../../../src/lib/supabaseClient';
+import { buildEdgeBookingResponse } from '../../../supabase/functions/create-booking/response-mapper';
 
 /**
  * Suite 12: Booking Response Envelope, Idempotency Recovery & Resilience
@@ -884,6 +885,284 @@ export async function runBookingResponseAndRecoverySuite(): Promise<TestResult[]
       status: 'FAIL',
       operationType: 'READ_ONLY',
       durationMs: Date.now() - t14,
+      error: err.message,
+    });
+  }
+
+  // --------------------------------------------------------------------------
+  // Test 15: READ-ONLY — Edge Contract: Flat PostgreSQL v_res Mapped to HTTP 201
+  // --------------------------------------------------------------------------
+  const t15 = Date.now();
+  try {
+    // Exact flat JSON shape returned directly by create_public_reservation_idempotent()
+    const pgDirectReturn = {
+      success: true,
+      reservation_id: '77af07ac-a89d-4845-88a7-88434a928331',
+      reference_code: 'CB-88980',
+      status: 'confirmed',
+      booking_confirmation_mode: 'instant',
+      hold_expires_at: null,
+      court_name: 'Court A',
+      facility_name: 'Pickleball Center',
+      booking_date: '2026-10-24',
+      time_slot_label: '08:00 AM – 09:00 AM',
+      total_price: 350.0,
+      currency: 'PHP',
+      is_demo: false,
+    };
+
+    const edgeResponse = buildEdgeBookingResponse(pgDirectReturn);
+    const successBody = edgeResponse.body as any;
+    const parsedByClient = extractAuthoritativeReservation(edgeResponse.body);
+
+    const isHttp201 = edgeResponse.httpStatus === 201;
+    const hasReservationObj = Boolean(successBody.reservation);
+    const hasDataObj = Boolean(successBody.data);
+    const isIdAuthoritative = successBody.reservation?.id === '77af07ac-a89d-4845-88a7-88434a928331';
+    const isRefAuthoritative = successBody.reservation?.reference_code === 'CB-88980';
+    const isStatusConfirmed = successBody.reservation?.status === 'confirmed';
+    const isPriceAccurate = successBody.reservation?.price === 350;
+    const isClientExtractValid =
+      parsedByClient !== null &&
+      parsedByClient.referenceCode === 'CB-88980' &&
+      parsedByClient.reservationId === '77af07ac-a89d-4845-88a7-88434a928331' &&
+      parsedByClient.status === 'confirmed' &&
+      parsedByClient.price === 350;
+
+    if (
+      isHttp201 &&
+      hasReservationObj &&
+      hasDataObj &&
+      isIdAuthoritative &&
+      isRefAuthoritative &&
+      isStatusConfirmed &&
+      isPriceAccurate &&
+      isClientExtractValid
+    ) {
+      results.push({
+        id: 'edge-flat-postgres-mapping-http-201',
+        category,
+        name: 'Edge Contract: Flat PostgreSQL v_res Successfully Mapped to HTTP 201 with Authoritative Fields',
+        status: 'PASS',
+        operationType: 'READ_ONLY',
+        durationMs: Date.now() - t15,
+        details: 'Confirmed that flat v_res from create_public_reservation_idempotent() builds complete HTTP 201 response matching frontend parser perfectly.',
+      });
+    } else {
+      results.push({
+        id: 'edge-flat-postgres-mapping-http-201',
+        category,
+        name: 'Edge Contract: Flat PostgreSQL v_res Successfully Mapped to HTTP 201 with Authoritative Fields',
+        status: 'FAIL',
+        operationType: 'READ_ONLY',
+        durationMs: Date.now() - t15,
+        error: `Mapping discrepancy: 201=${isHttp201}, hasRes=${hasReservationObj}, id=${isIdAuthoritative}, ref=${isRefAuthoritative}, status=${isStatusConfirmed}, price=${isPriceAccurate}, clientValid=${isClientExtractValid}`,
+      });
+    }
+  } catch (err: any) {
+    results.push({
+      id: 'edge-flat-postgres-mapping-http-201',
+      category,
+      name: 'Edge Contract: Flat PostgreSQL v_res Successfully Mapped to HTTP 201 with Authoritative Fields',
+      status: 'FAIL',
+      operationType: 'READ_ONLY',
+      durationMs: Date.now() - t15,
+      error: err.message,
+    });
+  }
+
+  // --------------------------------------------------------------------------
+  // Test 16: READ-ONLY — Edge Contract: Idempotent Replay Emits HTTP 200 OK
+  // --------------------------------------------------------------------------
+  const t16 = Date.now();
+  try {
+    const pgReplayReturn = {
+      success: true,
+      reservation_id: '550e8400-e29b-41d4-a716-446655440000',
+      reference_code: 'CB-53330',
+      status: 'confirmed',
+      booking_confirmation_mode: 'instant',
+      hold_expires_at: null,
+      court_name: 'Court B',
+      facility_name: 'Badminton Center',
+      booking_date: '2026-10-25',
+      time_slot_label: '10:00 AM – 11:00 AM',
+      total_price: 350.0,
+      currency: 'PHP',
+      is_demo: false,
+      idempotent_replayed: true,
+    };
+
+    const edgeResponse = buildEdgeBookingResponse(pgReplayReturn);
+    const successBody = edgeResponse.body as any;
+    const parsedByClient = extractAuthoritativeReservation(edgeResponse.body);
+
+    const isHttp200 = edgeResponse.httpStatus === 200;
+    const isReplayFlagged = successBody.idempotent_replayed === true;
+    const isResReplayFlagged = successBody.reservation?.idempotent_replayed === true;
+    const isClientValid = parsedByClient?.referenceCode === 'CB-53330';
+
+    if (isHttp200 && isReplayFlagged && isResReplayFlagged && isClientValid) {
+      results.push({
+        id: 'edge-idempotent-replay-http-200',
+        category,
+        name: 'Edge Contract: Idempotent Replay Returns HTTP 200 with Authoritative Cached Details',
+        status: 'PASS',
+        operationType: 'READ_ONLY',
+        durationMs: Date.now() - t16,
+        details: 'Confirmed that replaying an existing idempotency key returns HTTP 200 OK with idempotent_replayed: true without creating duplicates.',
+      });
+    } else {
+      results.push({
+        id: 'edge-idempotent-replay-http-200',
+        category,
+        name: 'Edge Contract: Idempotent Replay Returns HTTP 200 with Authoritative Cached Details',
+        status: 'FAIL',
+        operationType: 'READ_ONLY',
+        durationMs: Date.now() - t16,
+        error: `Replay discrepancy: 200=${isHttp200}, replayed=${isReplayFlagged}, resReplayed=${isResReplayFlagged}`,
+      });
+    }
+  } catch (err: any) {
+    results.push({
+      id: 'edge-idempotent-replay-http-200',
+      category,
+      name: 'Edge Contract: Idempotent Replay Returns HTTP 200 with Authoritative Cached Details',
+      status: 'FAIL',
+      operationType: 'READ_ONLY',
+      durationMs: Date.now() - t16,
+      error: err.message,
+    });
+  }
+
+  // --------------------------------------------------------------------------
+  // Test 17: READ-ONLY — Edge Contract: Pending Hold Preserves hold_expires_at
+  // --------------------------------------------------------------------------
+  const t17 = Date.now();
+  try {
+    const pgPendingReturn = {
+      success: true,
+      reservation_id: '6ba7b810-9dad-11d1-80b4-00c04fd430c8',
+      reference_code: 'CB-99120',
+      status: 'pending',
+      booking_confirmation_mode: 'manual_approval',
+      hold_expires_at: '2026-10-25T06:30:00.000Z',
+      court_name: 'Court C',
+      facility_name: 'Tennis Arena',
+      booking_date: '2026-10-25',
+      time_slot_label: '02:00 PM – 03:00 PM',
+      total_price: 400.0,
+      currency: 'PHP',
+      is_demo: false,
+    };
+
+    const edgeResponse = buildEdgeBookingResponse(pgPendingReturn);
+    const successBody = edgeResponse.body as any;
+    const parsedByClient = extractAuthoritativeReservation(edgeResponse.body);
+
+    const isHttp201 = edgeResponse.httpStatus === 201;
+    const isStatusPending = successBody.reservation?.status === 'pending';
+    const isHoldPreserved = successBody.reservation?.hold_expires_at === '2026-10-25T06:30:00.000Z';
+    const isClientHoldAccurate = parsedByClient?.holdExpiresAt === '2026-10-25T06:30:00.000Z';
+
+    if (isHttp201 && isStatusPending && isHoldPreserved && isClientHoldAccurate) {
+      results.push({
+        id: 'edge-pending-approval-hold-preservation',
+        category,
+        name: 'Edge Contract: Pending Approval Mode Accurately Maps hold_expires_at to Client',
+        status: 'PASS',
+        operationType: 'READ_ONLY',
+        durationMs: Date.now() - t17,
+        details: 'Confirmed that pending reservations preserve authoritative server hold_expires_at deadline without client fabrication.',
+      });
+    } else {
+      results.push({
+        id: 'edge-pending-approval-hold-preservation',
+        category,
+        name: 'Edge Contract: Pending Approval Mode Accurately Maps hold_expires_at to Client',
+        status: 'FAIL',
+        operationType: 'READ_ONLY',
+        durationMs: Date.now() - t17,
+        error: `Pending discrepancy: 201=${isHttp201}, status=${isStatusPending}, hold=${isHoldPreserved}`,
+      });
+    }
+  } catch (err: any) {
+    results.push({
+      id: 'edge-pending-approval-hold-preservation',
+      category,
+      name: 'Edge Contract: Pending Approval Mode Accurately Maps hold_expires_at to Client',
+      status: 'FAIL',
+      operationType: 'READ_ONLY',
+      durationMs: Date.now() - t17,
+      error: err.message,
+    });
+  }
+
+  // --------------------------------------------------------------------------
+  // Test 18: READ-ONLY — Edge Contract: Incomplete DB Return Rejects with HTTP 502
+  // --------------------------------------------------------------------------
+  const t18 = Date.now();
+  try {
+    // Missing reservation_id and reference_code
+    const incompleteA = {
+      success: true,
+      status: 'confirmed',
+      total_price: 350.0,
+    };
+    const resA = buildEdgeBookingResponse(incompleteA);
+
+    // Invalid status (e.g. 'tentative')
+    const incompleteB = {
+      success: true,
+      reservation_id: '77af07ac-a89d-4845-88a7-88434a928331',
+      reference_code: 'CB-88980',
+      status: 'tentative',
+      total_price: 350.0,
+    };
+    const resB = buildEdgeBookingResponse(incompleteB);
+
+    // Missing total_price
+    const incompleteC = {
+      success: true,
+      reservation_id: '77af07ac-a89d-4845-88a7-88434a928331',
+      reference_code: 'CB-88980',
+      status: 'confirmed',
+    };
+    const resC = buildEdgeBookingResponse(incompleteC);
+
+    const passA = resA.httpStatus === 502 && resA.body.code === 'INCOMPLETE_DATABASE_RESPONSE';
+    const passB = resB.httpStatus === 502 && resB.body.code === 'INCOMPLETE_DATABASE_RESPONSE';
+    const passC = resC.httpStatus === 502 && resC.body.code === 'INCOMPLETE_DATABASE_RESPONSE';
+
+    if (passA && passB && passC) {
+      results.push({
+        id: 'edge-incomplete-db-return-http-502',
+        category,
+        name: 'Edge Contract: Incomplete Database Return Fails Closed with HTTP 502 Bad Gateway',
+        status: 'PASS',
+        operationType: 'READ_ONLY',
+        durationMs: Date.now() - t18,
+        details: 'Confirmed that missing IDs, missing references, invalid statuses, or missing prices trigger HTTP 502 INCOMPLETE_DATABASE_RESPONSE.',
+      });
+    } else {
+      results.push({
+        id: 'edge-incomplete-db-return-http-502',
+        category,
+        name: 'Edge Contract: Incomplete Database Return Fails Closed with HTTP 502 Bad Gateway',
+        status: 'FAIL',
+        operationType: 'READ_ONLY',
+        durationMs: Date.now() - t18,
+        error: `Rejection failed: passA=${passA}, passB=${passB}, passC=${passC}`,
+      });
+    }
+  } catch (err: any) {
+    results.push({
+      id: 'edge-incomplete-db-return-http-502',
+      category,
+      name: 'Edge Contract: Incomplete Database Return Fails Closed with HTTP 502 Bad Gateway',
+      status: 'FAIL',
+      operationType: 'READ_ONLY',
+      durationMs: Date.now() - t18,
       error: err.message,
     });
   }

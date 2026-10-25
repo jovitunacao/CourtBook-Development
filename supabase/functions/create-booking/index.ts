@@ -598,37 +598,150 @@ serve(async (req: Request) => {
       );
     }
 
-    // Success response:
-    // If idempotent_replayed is true, return HTTP 200 (idempotent replay of previously confirmed reservation)
-    // If a brand new reservation was created, return HTTP 201 Created
-    const httpStatus = data.idempotent_replayed ? 200 : 201;
+    // 12. Authoritative Database Response Mapping & Field Validation
+    // The PostgreSQL function create_public_reservation_idempotent() returns v_res directly:
+    // a flat JSONB object with top-level fields:
+    //   success, reservation_id, reference_code, status, total_price, currency,
+    //   hold_expires_at, booking_confirmation_mode, court_name, facility_name,
+    //   booking_date, time_slot_label, is_demo, idempotent_replayed
+    //
+    // Handle both flat database RPC return shape and any nested data.reservation envelope.
+    const source =
+      data.reservation && typeof data.reservation === 'object'
+        ? data.reservation
+        : data;
 
-    // Handle both payload formats (nested reservation object or direct RPC return fields)
-    const reservationObj = data.reservation || {
-      reservation_id: data.reservation_id,
-      reference_code: data.reference_code,
-      status: data.status,
-      booking_confirmation_mode: data.booking_confirmation_mode || data.confirmation_mode,
-      hold_expires_at: data.hold_expires_at || data.expires_at,
-      court_name: data.court_name,
-      facility_name: data.facility_name,
-      booking_date: data.booking_date,
-      time_slot_label: data.time_slot_label,
-      total_price: data.total_price,
-      currency: data.currency,
+    // 1. Authoritative Reservation ID
+    const rawId = source.reservation_id ?? source.id ?? data.reservation_id ?? data.id;
+    const reservationId = typeof rawId === 'string' ? rawId.trim() : '';
+
+    // 2. Authoritative Reference Code
+    const rawRef =
+      source.reference_code ??
+      source.booking_reference ??
+      data.reference_code ??
+      data.booking_reference;
+    const referenceCode = typeof rawRef === 'string' ? rawRef.trim() : '';
+
+    // 3. Authoritative Status ('confirmed' | 'pending')
+    const rawStatus = typeof (source.status ?? data.status) === 'string'
+      ? String(source.status ?? data.status).toLowerCase().trim()
+      : '';
+
+    // 4. Authoritative Total Price
+    const rawPrice = source.total_price ?? source.price ?? data.total_price ?? data.price;
+    let totalPrice: number | null = null;
+    if (typeof rawPrice === 'number' && !isNaN(rawPrice)) {
+      totalPrice = rawPrice;
+    } else if (typeof rawPrice === 'string' && rawPrice.trim().length > 0) {
+      const cleaned = rawPrice.replace(/[^0-9.-]/g, '').trim();
+      const parsed = Number(cleaned);
+      if (!isNaN(parsed) && cleaned.length > 0) {
+        totalPrice = parsed;
+      }
+    }
+
+    const isValidId = UUID_REGEX.test(reservationId);
+    const isValidRef = referenceCode.length > 0;
+    const isValidStatus = rawStatus === 'confirmed' || rawStatus === 'pending';
+    const isValidPrice = totalPrice !== null && totalPrice >= 0;
+
+    // Validation Barrier: Fail closed if database returned an incomplete or invalid record
+    if (!isValidId || !isValidRef || !isValidStatus || !isValidPrice) {
+      return new Response(
+        JSON.stringify({
+          success: false,
+          error: 'The booking service returned an incomplete or invalid reservation record.',
+          code: 'INCOMPLETE_DATABASE_RESPONSE',
+          details: {
+            has_valid_id: isValidId,
+            has_valid_ref: isValidRef,
+            has_valid_status: isValidStatus,
+            has_valid_price: isValidPrice,
+          },
+        }),
+        { status: 502, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
+    const authoritativeStatus: 'confirmed' | 'pending' = rawStatus as 'confirmed' | 'pending';
+    const isIdempotentReplay = Boolean(data.idempotent_replayed || source.idempotent_replayed);
+    const httpStatus = isIdempotentReplay ? 200 : 201;
+
+    // Hold Expiration: Preserved strictly for pending reservations; never invented for confirmed bookings
+    const rawHold =
+      source.hold_expires_at ??
+      source.expires_at ??
+      data.hold_expires_at ??
+      data.expires_at;
+    const holdExpiresAt =
+      authoritativeStatus === 'pending' && typeof rawHold === 'string' && rawHold.trim().length > 0
+        ? rawHold.trim()
+        : null;
+
+    const confirmationMode = String(
+      source.booking_confirmation_mode ??
+      source.confirmation_mode ??
+      data.booking_confirmation_mode ??
+      data.confirmation_mode ??
+      (authoritativeStatus === 'pending' ? 'manual_approval' : 'instant')
+    ).trim();
+
+    const courtName = String(source.court_name ?? data.court_name ?? '').trim();
+    const facilityName = String(source.facility_name ?? data.facility_name ?? '').trim();
+    const resolvedBookingDate = String(
+      source.booking_date ?? data.booking_date ?? booking_date ?? ''
+    ).trim();
+    const timeSlotLabel = String(source.time_slot_label ?? data.time_slot_label ?? '').trim();
+    const currency = String(source.currency ?? data.currency ?? 'PHP').trim();
+
+    // Explicit authoritative reservation object matching client expectations
+    const reservationObj = {
+      id: reservationId,
+      reservation_id: reservationId,
+      reference_code: referenceCode,
+      booking_reference: referenceCode,
+      status: authoritativeStatus,
+      price: totalPrice,
+      total_price: totalPrice,
+      currency,
+      booking_date: resolvedBookingDate,
+      time_slot_label: timeSlotLabel,
+      court_name: courtName,
+      facility_name: facilityName,
+      hold_expires_at: holdExpiresAt,
+      expires_at: holdExpiresAt,
+      booking_confirmation_mode: confirmationMode,
+      confirmation_mode: confirmationMode,
+      idempotent_replayed: isIdempotentReplay,
       is_demo: false,
     };
 
+    // Return authoritative success envelope matching supabaseClient.ts and BookingPage.tsx
     return new Response(
       JSON.stringify({
         success: true,
         reservation: reservationObj,
         data: reservationObj,
-        ...data,
-        payment_required: Boolean(data.payment_required),
-        confirmation_mode: data.confirmation_mode || data.booking_confirmation_mode,
-        expires_at: data.expires_at || data.hold_expires_at,
-        idempotent_replayed: Boolean(data.idempotent_replayed),
+        reservation_id: reservationId,
+        id: reservationId,
+        reference_code: referenceCode,
+        booking_reference: referenceCode,
+        status: authoritativeStatus,
+        price: totalPrice,
+        total_price: totalPrice,
+        currency,
+        hold_expires_at: holdExpiresAt,
+        expires_at: holdExpiresAt,
+        booking_confirmation_mode: confirmationMode,
+        confirmation_mode: confirmationMode,
+        court_name: courtName,
+        facility_name: facilityName,
+        booking_date: resolvedBookingDate,
+        time_slot_label: timeSlotLabel,
+        idempotent_replayed: isIdempotentReplay,
+        payment_required: false,
+        is_demo: false,
       }),
       { status: httpStatus, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
