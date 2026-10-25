@@ -15,17 +15,55 @@ import { loadUserContext, UserContext, isIntendedSecurityRejection } from '../he
  * - User A: Pickleball Test Facility (Org: courtbook-test-pickleball-a)
  * - User B: Badminton Test Facility (Org: courtbook-test-badminton-b)
  *
- * Covers all 9 mandatory requirements:
- * 1. User A can read their own organization's reservations.
- * 2. User B can read their own organization's reservations.
- * 3. User A cannot read User B's private reservations.
- * 4. User B cannot read User A's private reservations.
- * 5. User A cannot approve, decline, cancel, or reschedule User B's reservations.
- * 6. User B cannot approve, decline, cancel, or reschedule User A's reservations.
- * 7. Neither user can modify the other organization's facility settings.
- * 8. Neither user can access or modify the other's organization memberships.
- * 9. Anonymous customers cannot read private reservation or owner information.
+ * Security & Anti-False-Positive Governance:
+ * 1. Positive controls verify each owner has valid access to their own records.
+ * 2. Every state-changing RPC or write operation is classified as STATE_CHANGING.
+ * 3. State-changing tests are completely guarded when CONFIRM_TEST_ENV=false (default).
+ * 4. Never use existing customer or previously created reservations as targets for write tests.
+ * 5. State-changing cross-tenant tests require dedicated disposable reservations (tagged TD-% or TEST-DISPOSABLE-%).
+ *    If such fixtures are missing, tests are safely marked BLOCKED rather than using fake UUIDs or customer bookings.
+ * 6. Never treat "Reservation not found", missing functions, or network errors as authorization passes.
+ * 7. When executed, verify records remain 100% unchanged after rejected operations.
+ * 8. Never log passwords, access tokens, or sensitive API keys.
  */
+
+/**
+ * Rigorously checks that an error returned by Supabase / PostgreSQL represents a true
+ * authorization denial (RLS 42501 or PL/pgSQL P0001 access-denied exception) against
+ * an existing record, rather than:
+ * - "Reservation not found" (false positive from non-existent UUID or wrong fixture)
+ * - Network timeouts or connection resets
+ * - Missing function or syntax errors
+ * - Unauthenticated / JWT expiration errors
+ */
+function isCrossTenantAuthorizationRejection(error: any): boolean {
+  if (!error) return false;
+  if (!isIntendedSecurityRejection(error)) return false;
+
+  const msg = String(error.message || error.details || '').toLowerCase();
+  const code = String(error.code || '').toLowerCase();
+
+  // Explicitly reject false-positive signals:
+  // "Reservation not found" means the record wasn't found or was an arbitrary UUID, NOT that authorization blocked an existing record!
+  if (msg.includes('not found') || msg.includes('does not exist') || msg.includes('no rows')) {
+    return false;
+  }
+
+  // Must be an explicit authorization or RLS barrier
+  const isSecurityCode = code === '42501' || code === 'p0001';
+  const hasAuthKeywords =
+    msg.includes('access denied') ||
+    msg.includes('permission denied') ||
+    msg.includes('only facility owners') ||
+    msg.includes('only facility staff') ||
+    msg.includes('not authorized') ||
+    msg.includes('not permitted') ||
+    msg.includes('row-level security') ||
+    msg.includes('violates row-level security policy');
+
+  return isSecurityCode || hasAuthKeywords;
+}
+
 export async function runMultiTenantIsolationSuite(): Promise<TestResult[]> {
   const results: TestResult[] = [];
   const config = getEnvironmentConfig();
@@ -80,9 +118,177 @@ export async function runMultiTenantIsolationSuite(): Promise<TestResult[]> {
     return results;
   }
 
-  // --------------------------------------------------------------------------
+  // ==========================================================================
+  // Section 0: Positive Controls (Proving Authorized Access Works as Expected)
+  // ==========================================================================
+
+  // Positive Control 1: User A reads own organization, facility, and court inventory
+  const tCtrlA = Date.now();
+  try {
+    const { data: courtsA, error: errCourtsA } = await ctxA.client
+      .from('courts')
+      .select('id, name, sport_type')
+      .eq('facility_id', ctxA.facility.id);
+
+    if (errCourtsA) {
+      results.push({
+        id: 'tenant-control-user-a-access-own-org',
+        category,
+        name: 'Positive Control: User A Accesses Own Organization and Facility Inventory',
+        status: 'FAIL',
+        operationType: 'READ_ONLY',
+        durationMs: Date.now() - tCtrlA,
+        error: `User A failed to read own courts: ${errCourtsA.message}`,
+      });
+    } else {
+      results.push({
+        id: 'tenant-control-user-a-access-own-org',
+        category,
+        name: 'Positive Control: User A Accesses Own Organization and Facility Inventory',
+        status: 'PASS',
+        operationType: 'READ_ONLY',
+        durationMs: Date.now() - tCtrlA,
+        details: `Positive control passed: User A successfully accessed Facility A (${ctxA.facility.name}) and ${courtsA?.length || 0} court(s).`,
+      });
+    }
+  } catch (err: any) {
+    results.push({
+      id: 'tenant-control-user-a-access-own-org',
+      category,
+      name: 'Positive Control: User A Accesses Own Organization and Facility Inventory',
+      status: 'FAIL',
+      operationType: 'READ_ONLY',
+      durationMs: Date.now() - tCtrlA,
+      error: err.message,
+    });
+  }
+
+  // Positive Control 2: User B reads own organization, facility, and court inventory
+  const tCtrlB = Date.now();
+  try {
+    const { data: courtsB, error: errCourtsB } = await ctxB.client
+      .from('courts')
+      .select('id, name, sport_type')
+      .eq('facility_id', ctxB.facility.id);
+
+    if (errCourtsB) {
+      results.push({
+        id: 'tenant-control-user-b-access-own-org',
+        category,
+        name: 'Positive Control: User B Accesses Own Organization and Facility Inventory',
+        status: 'FAIL',
+        operationType: 'READ_ONLY',
+        durationMs: Date.now() - tCtrlB,
+        error: `User B failed to read own courts: ${errCourtsB.message}`,
+      });
+    } else {
+      results.push({
+        id: 'tenant-control-user-b-access-own-org',
+        category,
+        name: 'Positive Control: User B Accesses Own Organization and Facility Inventory',
+        status: 'PASS',
+        operationType: 'READ_ONLY',
+        durationMs: Date.now() - tCtrlB,
+        details: `Positive control passed: User B successfully accessed Facility B (${ctxB.facility.name}) and ${courtsB?.length || 0} court(s).`,
+      });
+    }
+  } catch (err: any) {
+    results.push({
+      id: 'tenant-control-user-b-access-own-org',
+      category,
+      name: 'Positive Control: User B Accesses Own Organization and Facility Inventory',
+      status: 'FAIL',
+      operationType: 'READ_ONLY',
+      durationMs: Date.now() - tCtrlB,
+      error: err.message,
+    });
+  }
+
+  // Positive Control 3: User A reads own team members in Organization A
+  const tCtrlMbrA = Date.now();
+  try {
+    const { data: membersA, error: errMembersA } = await ctxA.client
+      .from('organization_members')
+      .select('id, user_id, role')
+      .eq('organization_id', ctxA.orgId);
+
+    if (errMembersA || !membersA || membersA.length === 0) {
+      results.push({
+        id: 'tenant-control-user-a-access-own-members',
+        category,
+        name: 'Positive Control: User A Accesses Own Organization Memberships',
+        status: 'FAIL',
+        operationType: 'READ_ONLY',
+        durationMs: Date.now() - tCtrlMbrA,
+        error: errMembersA ? errMembersA.message : 'No members found for User A organization.',
+      });
+    } else {
+      results.push({
+        id: 'tenant-control-user-a-access-own-members',
+        category,
+        name: 'Positive Control: User A Accesses Own Organization Memberships',
+        status: 'PASS',
+        operationType: 'READ_ONLY',
+        durationMs: Date.now() - tCtrlMbrA,
+        details: `Positive control passed: User A read ${membersA.length} member record(s) for Org A.`,
+      });
+    }
+  } catch (err: any) {
+    results.push({
+      id: 'tenant-control-user-a-access-own-members',
+      category,
+      name: 'Positive Control: User A Accesses Own Organization Memberships',
+      status: 'FAIL',
+      operationType: 'READ_ONLY',
+      durationMs: Date.now() - tCtrlMbrA,
+      error: err.message,
+    });
+  }
+
+  // Positive Control 4: User B reads own team members in Organization B
+  const tCtrlMbrB = Date.now();
+  try {
+    const { data: membersB, error: errMembersB } = await ctxB.client
+      .from('organization_members')
+      .select('id, user_id, role')
+      .eq('organization_id', ctxB.orgId);
+
+    if (errMembersB || !membersB || membersB.length === 0) {
+      results.push({
+        id: 'tenant-control-user-b-access-own-members',
+        category,
+        name: 'Positive Control: User B Accesses Own Organization Memberships',
+        status: 'FAIL',
+        operationType: 'READ_ONLY',
+        durationMs: Date.now() - tCtrlMbrB,
+        error: errMembersB ? errMembersB.message : 'No members found for User B organization.',
+      });
+    } else {
+      results.push({
+        id: 'tenant-control-user-b-access-own-members',
+        category,
+        name: 'Positive Control: User B Accesses Own Organization Memberships',
+        status: 'PASS',
+        operationType: 'READ_ONLY',
+        durationMs: Date.now() - tCtrlMbrB,
+        details: `Positive control passed: User B read ${membersB.length} member record(s) for Org B.`,
+      });
+    }
+  } catch (err: any) {
+    results.push({
+      id: 'tenant-control-user-b-access-own-members',
+      category,
+      name: 'Positive Control: User B Accesses Own Organization Memberships',
+      status: 'FAIL',
+      operationType: 'READ_ONLY',
+      durationMs: Date.now() - tCtrlMbrB,
+      error: err.message,
+    });
+  }
+
+  // ==========================================================================
   // Requirement 1: User A can read their own organization's reservations [READ-ONLY]
-  // --------------------------------------------------------------------------
+  // ==========================================================================
   const t1 = Date.now();
   try {
     const { data, error } = await ctxA.client
@@ -124,9 +330,9 @@ export async function runMultiTenantIsolationSuite(): Promise<TestResult[]> {
     });
   }
 
-  // --------------------------------------------------------------------------
+  // ==========================================================================
   // Requirement 2: User B can read their own organization's reservations [READ-ONLY]
-  // --------------------------------------------------------------------------
+  // ==========================================================================
   const t2 = Date.now();
   try {
     const { data, error } = await ctxB.client
@@ -168,9 +374,9 @@ export async function runMultiTenantIsolationSuite(): Promise<TestResult[]> {
     });
   }
 
-  // --------------------------------------------------------------------------
+  // ==========================================================================
   // Requirement 3: User A cannot read User B's private reservations [READ-ONLY]
-  // --------------------------------------------------------------------------
+  // ==========================================================================
   const t3 = Date.now();
   try {
     const { data, error } = await ctxA.client
@@ -222,9 +428,9 @@ export async function runMultiTenantIsolationSuite(): Promise<TestResult[]> {
     });
   }
 
-  // --------------------------------------------------------------------------
+  // ==========================================================================
   // Requirement 4: User B cannot read User A's private reservations [READ-ONLY]
-  // --------------------------------------------------------------------------
+  // ==========================================================================
   const t4 = Date.now();
   try {
     const { data, error } = await ctxB.client
@@ -276,222 +482,368 @@ export async function runMultiTenantIsolationSuite(): Promise<TestResult[]> {
     });
   }
 
-  // --------------------------------------------------------------------------
+  // ==========================================================================
   // Requirement 5: User A cannot approve, decline, cancel, or reschedule User B's reservations
-  // --------------------------------------------------------------------------
-  // 5a. User A cannot approve User B's reservation [READ-ONLY / PERMISSION BARRIER]
-  const t5a = Date.now();
-  try {
-    // Arbitrary/non-owned UUID representing a target in Organization B
-    const arbitraryResId = '00000000-0000-0000-0000-00000000000b';
-    const { data, error } = await ctxA.client.rpc('approve_booking_request_as_staff', {
-      p_reservation_id: arbitraryResId,
-      p_notes: 'Unauthorized approval attempt by User A',
-    });
+  // All operations are classified as STATE_CHANGING.
+  // Requires explicit test confirmation (CONFIRM_TEST_ENV=true) and dedicated disposable reservation.
+  // ==========================================================================
 
-    if (error && (isIntendedSecurityRejection(error) || error.message.includes('not found') || error.message.includes('Access denied'))) {
-      results.push({
-        id: 'tenant-user-a-cannot-approve-user-b-reservation',
-        category,
-        name: 'Cross-Tenant RPC Barrier: User A Cannot Approve User B Reservations',
-        status: 'PASS',
-        operationType: 'READ_ONLY',
-        durationMs: Date.now() - t5a,
-        details: `Unauthorized approval correctly blocked by procedure: ${error.message}`,
-      });
-    } else {
-      results.push({
-        id: 'tenant-user-a-cannot-approve-user-b-reservation',
-        category,
-        name: 'Cross-Tenant RPC Barrier: User A Cannot Approve User B Reservations',
-        status: 'FAIL',
-        operationType: 'READ_ONLY',
-        durationMs: Date.now() - t5a,
-        error: `Unexpected response: ${JSON.stringify(data)}`,
-      });
-    }
-  } catch (err: any) {
+  // 5a. User A cannot approve User B's reservation [STATE-CHANGING / GUARDED]
+  const t5a = Date.now();
+  if (!isStateChangingAllowed()) {
     results.push({
       id: 'tenant-user-a-cannot-approve-user-b-reservation',
       category,
       name: 'Cross-Tenant RPC Barrier: User A Cannot Approve User B Reservations',
-      status: 'PASS',
-      operationType: 'READ_ONLY',
-      durationMs: Date.now() - t5a,
-      details: `Execution blocked as intended: ${err.message}`,
+      status: 'BLOCKED',
+      operationType: 'STATE_CHANGING',
+      durationMs: 0,
+      details: 'State-changing test guarded: Set CONFIRM_TEST_ENV=true in .env.test to allow execution.',
     });
-  }
-
-  // 5b. User A cannot decline User B's reservation [READ-ONLY / PERMISSION BARRIER]
-  const t5b = Date.now();
-  try {
-    const arbitraryResId = '00000000-0000-0000-0000-00000000000b';
-    const { data, error } = await ctxA.client.rpc('decline_booking_request_as_staff', {
-      p_reservation_id: arbitraryResId,
-      p_reason: 'Unauthorized decline attempt by User A',
+  } else if (!ctxB.disposableReservation) {
+    results.push({
+      id: 'tenant-user-a-cannot-approve-user-b-reservation',
+      category,
+      name: 'Cross-Tenant RPC Barrier: User A Cannot Approve User B Reservations',
+      status: 'BLOCKED',
+      operationType: 'STATE_CHANGING',
+      durationMs: 0,
+      details: 'No dedicated disposable test reservation (tagged TD-% or TEST-DISPOSABLE-%) exists in Facility B. Real customer records are protected and will never be targeted.',
     });
+  } else {
+    try {
+      const targetResId = ctxB.disposableReservation.id;
+      const initialStatus = ctxB.disposableReservation.status;
 
-    if (error && (isIntendedSecurityRejection(error) || error.message.includes('not found') || error.message.includes('Access denied'))) {
-      results.push({
-        id: 'tenant-user-a-cannot-decline-user-b-reservation',
-        category,
-        name: 'Cross-Tenant RPC Barrier: User A Cannot Decline User B Reservations',
-        status: 'PASS',
-        operationType: 'READ_ONLY',
-        durationMs: Date.now() - t5b,
-        details: `Unauthorized decline correctly blocked by procedure: ${error.message}`,
+      const { data, error } = await ctxA.client.rpc('approve_booking_request_as_staff', {
+        p_reservation_id: targetResId,
+        p_notes: 'Unauthorized approval attempt by User A',
       });
-    } else {
+
+      if (error && isCrossTenantAuthorizationRejection(error)) {
+        // Confirm record remains unchanged
+        const { data: currentRes } = await ctxB.client
+          .from('reservations')
+          .select('status')
+          .eq('id', targetResId)
+          .single();
+
+        const isUnchanged = currentRes?.status === initialStatus;
+
+        results.push({
+          id: 'tenant-user-a-cannot-approve-user-b-reservation',
+          category,
+          name: 'Cross-Tenant RPC Barrier: User A Cannot Approve User B Reservations',
+          status: isUnchanged ? 'PASS' : 'FAIL',
+          operationType: 'STATE_CHANGING',
+          durationMs: Date.now() - t5a,
+          details: `Unauthorized approval correctly rejected by database authorization check: "${error.message}". Record status unchanged.`,
+        });
+      } else {
+        results.push({
+          id: 'tenant-user-a-cannot-approve-user-b-reservation',
+          category,
+          name: 'Cross-Tenant RPC Barrier: User A Cannot Approve User B Reservations',
+          status: 'FAIL',
+          operationType: 'STATE_CHANGING',
+          durationMs: Date.now() - t5a,
+          error: error ? `Invalid rejection response: ${error.message}` : `Unexpected success: ${JSON.stringify(data)}`,
+        });
+      }
+    } catch (err: any) {
       results.push({
-        id: 'tenant-user-a-cannot-decline-user-b-reservation',
+        id: 'tenant-user-a-cannot-approve-user-b-reservation',
         category,
-        name: 'Cross-Tenant RPC Barrier: User A Cannot Decline User B Reservations',
-        status: 'FAIL',
-        operationType: 'READ_ONLY',
-        durationMs: Date.now() - t5b,
-        error: `Unexpected response: ${JSON.stringify(data)}`,
+        name: 'Cross-Tenant RPC Barrier: User A Cannot Approve User B Reservations',
+        status: isCrossTenantAuthorizationRejection(err) ? 'PASS' : 'FAIL',
+        operationType: 'STATE_CHANGING',
+        durationMs: Date.now() - t5a,
+        error: err.message,
       });
     }
-  } catch (err: any) {
+  }
+
+  // 5b. User A cannot decline User B's reservation [STATE-CHANGING / GUARDED]
+  const t5b = Date.now();
+  if (!isStateChangingAllowed()) {
     results.push({
       id: 'tenant-user-a-cannot-decline-user-b-reservation',
       category,
       name: 'Cross-Tenant RPC Barrier: User A Cannot Decline User B Reservations',
-      status: 'PASS',
-      operationType: 'READ_ONLY',
-      durationMs: Date.now() - t5b,
-      details: `Execution blocked as intended: ${err.message}`,
+      status: 'BLOCKED',
+      operationType: 'STATE_CHANGING',
+      durationMs: 0,
+      details: 'State-changing test guarded: Set CONFIRM_TEST_ENV=true in .env.test to allow execution.',
     });
-  }
-
-  // 5c. User A cannot cancel User B's reservation [READ-ONLY / PERMISSION BARRIER]
-  const t5c = Date.now();
-  try {
-    const arbitraryResId = '00000000-0000-0000-0000-00000000000b';
-    const { data, error } = await ctxA.client.rpc('cancel_reservation_as_staff', {
-      p_reservation_id: arbitraryResId,
-      p_reason: 'Unauthorized cancellation attempt by User A',
+  } else if (!ctxB.disposableReservation) {
+    results.push({
+      id: 'tenant-user-a-cannot-decline-user-b-reservation',
+      category,
+      name: 'Cross-Tenant RPC Barrier: User A Cannot Decline User B Reservations',
+      status: 'BLOCKED',
+      operationType: 'STATE_CHANGING',
+      durationMs: 0,
+      details: 'No dedicated disposable test reservation (tagged TD-% or TEST-DISPOSABLE-%) exists in Facility B. Real customer records are protected and will never be targeted.',
     });
+  } else {
+    try {
+      const targetResId = ctxB.disposableReservation.id;
+      const initialStatus = ctxB.disposableReservation.status;
 
-    if (error && (isIntendedSecurityRejection(error) || error.message.includes('not found') || error.message.includes('Access denied'))) {
-      results.push({
-        id: 'tenant-user-a-cannot-cancel-user-b-reservation',
-        category,
-        name: 'Cross-Tenant RPC Barrier: User A Cannot Cancel User B Reservations',
-        status: 'PASS',
-        operationType: 'READ_ONLY',
-        durationMs: Date.now() - t5c,
-        details: `Unauthorized cancellation correctly rejected: ${error.message}`,
+      const { data, error } = await ctxA.client.rpc('decline_booking_request_as_staff', {
+        p_reservation_id: targetResId,
+        p_reason: 'Unauthorized decline attempt by User A',
       });
-    } else {
+
+      if (error && isCrossTenantAuthorizationRejection(error)) {
+        const { data: currentRes } = await ctxB.client
+          .from('reservations')
+          .select('status')
+          .eq('id', targetResId)
+          .single();
+
+        const isUnchanged = currentRes?.status === initialStatus;
+
+        results.push({
+          id: 'tenant-user-a-cannot-decline-user-b-reservation',
+          category,
+          name: 'Cross-Tenant RPC Barrier: User A Cannot Decline User B Reservations',
+          status: isUnchanged ? 'PASS' : 'FAIL',
+          operationType: 'STATE_CHANGING',
+          durationMs: Date.now() - t5b,
+          details: `Unauthorized decline correctly rejected by database authorization check: "${error.message}". Record status unchanged.`,
+        });
+      } else {
+        results.push({
+          id: 'tenant-user-a-cannot-decline-user-b-reservation',
+          category,
+          name: 'Cross-Tenant RPC Barrier: User A Cannot Decline User B Reservations',
+          status: 'FAIL',
+          operationType: 'STATE_CHANGING',
+          durationMs: Date.now() - t5b,
+          error: error ? `Invalid rejection response: ${error.message}` : `Unexpected success: ${JSON.stringify(data)}`,
+        });
+      }
+    } catch (err: any) {
       results.push({
-        id: 'tenant-user-a-cannot-cancel-user-b-reservation',
+        id: 'tenant-user-a-cannot-decline-user-b-reservation',
         category,
-        name: 'Cross-Tenant RPC Barrier: User A Cannot Cancel User B Reservations',
-        status: 'FAIL',
-        operationType: 'READ_ONLY',
-        durationMs: Date.now() - t5c,
-        error: `Unexpected response: ${JSON.stringify(data)}`,
+        name: 'Cross-Tenant RPC Barrier: User A Cannot Decline User B Reservations',
+        status: isCrossTenantAuthorizationRejection(err) ? 'PASS' : 'FAIL',
+        operationType: 'STATE_CHANGING',
+        durationMs: Date.now() - t5b,
+        error: err.message,
       });
     }
-  } catch (err: any) {
+  }
+
+  // 5c. User A cannot cancel User B's reservation [STATE-CHANGING / GUARDED]
+  const t5c = Date.now();
+  if (!isStateChangingAllowed()) {
     results.push({
       id: 'tenant-user-a-cannot-cancel-user-b-reservation',
       category,
       name: 'Cross-Tenant RPC Barrier: User A Cannot Cancel User B Reservations',
-      status: 'PASS',
-      operationType: 'READ_ONLY',
-      durationMs: Date.now() - t5c,
-      details: `Execution blocked as intended: ${err.message}`,
+      status: 'BLOCKED',
+      operationType: 'STATE_CHANGING',
+      durationMs: 0,
+      details: 'State-changing test guarded: Set CONFIRM_TEST_ENV=true in .env.test to allow execution.',
     });
-  }
-
-  // 5d. User A cannot reschedule User B's reservation [READ-ONLY / PERMISSION BARRIER]
-  const t5d = Date.now();
-  try {
-    const arbitraryResId = '00000000-0000-0000-0000-00000000000b';
-    const targetCourtId = ctxB.courts[0]?.id || arbitraryResId;
-    const { data, error } = await ctxA.client.rpc('reschedule_reservation_as_staff', {
-      p_reservation_id: arbitraryResId,
-      p_new_court_id: targetCourtId,
-      p_new_date: '2028-01-01',
-      p_new_start_time: '2028-01-01T08:00:00Z',
-      p_new_duration_minutes: 60,
+  } else if (!ctxB.disposableReservation) {
+    results.push({
+      id: 'tenant-user-a-cannot-cancel-user-b-reservation',
+      category,
+      name: 'Cross-Tenant RPC Barrier: User A Cannot Cancel User B Reservations',
+      status: 'BLOCKED',
+      operationType: 'STATE_CHANGING',
+      durationMs: 0,
+      details: 'No dedicated disposable test reservation (tagged TD-% or TEST-DISPOSABLE-%) exists in Facility B. Real customer records are protected and will never be targeted.',
     });
+  } else {
+    try {
+      const targetResId = ctxB.disposableReservation.id;
+      const initialStatus = ctxB.disposableReservation.status;
 
-    if (error && (isIntendedSecurityRejection(error) || error.message.includes('not found') || error.message.includes('Access denied'))) {
-      results.push({
-        id: 'tenant-user-a-cannot-reschedule-user-b-reservation',
-        category,
-        name: 'Cross-Tenant RPC Barrier: User A Cannot Reschedule User B Reservations',
-        status: 'PASS',
-        operationType: 'READ_ONLY',
-        durationMs: Date.now() - t5d,
-        details: `Unauthorized rescheduling correctly rejected: ${error.message}`,
+      const { data, error } = await ctxA.client.rpc('cancel_reservation_as_staff', {
+        p_reservation_id: targetResId,
+        p_reason: 'Unauthorized cancellation attempt by User A',
       });
-    } else {
+
+      if (error && isCrossTenantAuthorizationRejection(error)) {
+        const { data: currentRes } = await ctxB.client
+          .from('reservations')
+          .select('status')
+          .eq('id', targetResId)
+          .single();
+
+        const isUnchanged = currentRes?.status === initialStatus;
+
+        results.push({
+          id: 'tenant-user-a-cannot-cancel-user-b-reservation',
+          category,
+          name: 'Cross-Tenant RPC Barrier: User A Cannot Cancel User B Reservations',
+          status: isUnchanged ? 'PASS' : 'FAIL',
+          operationType: 'STATE_CHANGING',
+          durationMs: Date.now() - t5c,
+          details: `Unauthorized cancellation correctly rejected by database authorization check: "${error.message}". Record status unchanged.`,
+        });
+      } else {
+        results.push({
+          id: 'tenant-user-a-cannot-cancel-user-b-reservation',
+          category,
+          name: 'Cross-Tenant RPC Barrier: User A Cannot Cancel User B Reservations',
+          status: 'FAIL',
+          operationType: 'STATE_CHANGING',
+          durationMs: Date.now() - t5c,
+          error: error ? `Invalid rejection response: ${error.message}` : `Unexpected success: ${JSON.stringify(data)}`,
+        });
+      }
+    } catch (err: any) {
       results.push({
-        id: 'tenant-user-a-cannot-reschedule-user-b-reservation',
+        id: 'tenant-user-a-cannot-cancel-user-b-reservation',
         category,
-        name: 'Cross-Tenant RPC Barrier: User A Cannot Reschedule User B Reservations',
-        status: 'FAIL',
-        operationType: 'READ_ONLY',
-        durationMs: Date.now() - t5d,
-        error: `Unexpected response: ${JSON.stringify(data)}`,
+        name: 'Cross-Tenant RPC Barrier: User A Cannot Cancel User B Reservations',
+        status: isCrossTenantAuthorizationRejection(err) ? 'PASS' : 'FAIL',
+        operationType: 'STATE_CHANGING',
+        durationMs: Date.now() - t5c,
+        error: err.message,
       });
     }
-  } catch (err: any) {
+  }
+
+  // 5d. User A cannot reschedule User B's reservation [STATE-CHANGING / GUARDED]
+  const t5d = Date.now();
+  if (!isStateChangingAllowed()) {
     results.push({
       id: 'tenant-user-a-cannot-reschedule-user-b-reservation',
       category,
       name: 'Cross-Tenant RPC Barrier: User A Cannot Reschedule User B Reservations',
-      status: 'PASS',
-      operationType: 'READ_ONLY',
-      durationMs: Date.now() - t5d,
-      details: `Execution blocked as intended: ${err.message}`,
+      status: 'BLOCKED',
+      operationType: 'STATE_CHANGING',
+      durationMs: 0,
+      details: 'State-changing test guarded: Set CONFIRM_TEST_ENV=true in .env.test to allow execution.',
     });
+  } else if (!ctxB.disposableReservation) {
+    results.push({
+      id: 'tenant-user-a-cannot-reschedule-user-b-reservation',
+      category,
+      name: 'Cross-Tenant RPC Barrier: User A Cannot Reschedule User B Reservations',
+      status: 'BLOCKED',
+      operationType: 'STATE_CHANGING',
+      durationMs: 0,
+      details: 'No dedicated disposable test reservation (tagged TD-% or TEST-DISPOSABLE-%) exists in Facility B. Real customer records are protected and will never be targeted.',
+    });
+  } else {
+    try {
+      const targetResId = ctxB.disposableReservation.id;
+      const initialCourtId = ctxB.disposableReservation.court_id;
+      const targetCourtId = ctxB.courts[0]?.id || initialCourtId;
+
+      const { data, error } = await ctxA.client.rpc('reschedule_reservation_as_staff', {
+        p_reservation_id: targetResId,
+        p_new_court_id: targetCourtId,
+        p_new_date: '2028-01-01',
+        p_new_start_time: '2028-01-01T08:00:00Z',
+        p_new_duration_minutes: 60,
+      });
+
+      if (error && isCrossTenantAuthorizationRejection(error)) {
+        const { data: currentRes } = await ctxB.client
+          .from('reservations')
+          .select('court_id, booking_date')
+          .eq('id', targetResId)
+          .single();
+
+        const isUnchanged = currentRes?.court_id === initialCourtId;
+
+        results.push({
+          id: 'tenant-user-a-cannot-reschedule-user-b-reservation',
+          category,
+          name: 'Cross-Tenant RPC Barrier: User A Cannot Reschedule User B Reservations',
+          status: isUnchanged ? 'PASS' : 'FAIL',
+          operationType: 'STATE_CHANGING',
+          durationMs: Date.now() - t5d,
+          details: `Unauthorized rescheduling correctly rejected by database authorization check: "${error.message}". Record remains unchanged.`,
+        });
+      } else {
+        results.push({
+          id: 'tenant-user-a-cannot-reschedule-user-b-reservation',
+          category,
+          name: 'Cross-Tenant RPC Barrier: User A Cannot Reschedule User B Reservations',
+          status: 'FAIL',
+          operationType: 'STATE_CHANGING',
+          durationMs: Date.now() - t5d,
+          error: error ? `Invalid rejection response: ${error.message}` : `Unexpected success: ${JSON.stringify(data)}`,
+        });
+      }
+    } catch (err: any) {
+      results.push({
+        id: 'tenant-user-a-cannot-reschedule-user-b-reservation',
+        category,
+        name: 'Cross-Tenant RPC Barrier: User A Cannot Reschedule User B Reservations',
+        status: isCrossTenantAuthorizationRejection(err) ? 'PASS' : 'FAIL',
+        operationType: 'STATE_CHANGING',
+        durationMs: Date.now() - t5d,
+        error: err.message,
+      });
+    }
   }
 
-  // --------------------------------------------------------------------------
+  // ==========================================================================
   // Requirement 6: User B cannot approve, decline, cancel, or reschedule User A's reservations
-  // (Tested against real existing reservations in Facility A)
-  // --------------------------------------------------------------------------
-  const { data: realResAList } = await ctxA.client
-    .from('reservations')
-    .select('id, reference_code, status')
-    .eq('facility_id', ctxA.facility.id)
-    .limit(1);
+  // All operations are classified as STATE_CHANGING.
+  // Real customer reservations are NEVER targeted. Dedicated disposable fixtures required.
+  // ==========================================================================
 
-  const realResA = realResAList && realResAList.length > 0 ? realResAList[0] : null;
-
-  // 6a. User B cannot approve User A's reservation [READ-ONLY / PERMISSION BARRIER]
+  // 6a. User B cannot approve User A's reservation [STATE-CHANGING / GUARDED]
   const t6a = Date.now();
-  if (!realResA) {
+  if (!isStateChangingAllowed()) {
     results.push({
       id: 'tenant-user-b-cannot-approve-user-a-reservation',
       category,
       name: 'Cross-Tenant RPC Barrier: User B Cannot Approve User A Reservations',
       status: 'BLOCKED',
-      operationType: 'READ_ONLY',
+      operationType: 'STATE_CHANGING',
       durationMs: 0,
-      details: 'No existing reservation in Facility A to verify against.',
+      details: 'State-changing test guarded: Set CONFIRM_TEST_ENV=true in .env.test to allow execution.',
+    });
+  } else if (!ctxA.disposableReservation) {
+    results.push({
+      id: 'tenant-user-b-cannot-approve-user-a-reservation',
+      category,
+      name: 'Cross-Tenant RPC Barrier: User B Cannot Approve User A Reservations',
+      status: 'BLOCKED',
+      operationType: 'STATE_CHANGING',
+      durationMs: 0,
+      details: 'No dedicated disposable test reservation (tagged TD-% or TEST-DISPOSABLE-%) exists in Facility A. Existing customer records are protected and will never be targeted.',
     });
   } else {
     try {
+      const targetResId = ctxA.disposableReservation.id;
+      const initialStatus = ctxA.disposableReservation.status;
+
       const { data, error } = await ctxB.client.rpc('approve_booking_request_as_staff', {
-        p_reservation_id: realResA.id,
+        p_reservation_id: targetResId,
         p_notes: 'Cross-tenant approval attack attempt by User B',
       });
 
-      if (error && isIntendedSecurityRejection(error)) {
+      if (error && isCrossTenantAuthorizationRejection(error)) {
+        const { data: currentRes } = await ctxA.client
+          .from('reservations')
+          .select('status')
+          .eq('id', targetResId)
+          .single();
+
+        const isUnchanged = currentRes?.status === initialStatus;
+
         results.push({
           id: 'tenant-user-b-cannot-approve-user-a-reservation',
           category,
           name: 'Cross-Tenant RPC Barrier: User B Cannot Approve User A Reservations',
-          status: 'PASS',
-          operationType: 'READ_ONLY',
+          status: isUnchanged ? 'PASS' : 'FAIL',
+          operationType: 'STATE_CHANGING',
           durationMs: Date.now() - t6a,
-          details: `Cross-tenant approval actively blocked by database: "${error.message}"`,
+          details: `Cross-tenant approval actively blocked by database authorization check: "${error.message}". Record remains unchanged.`,
         });
       } else {
         results.push({
@@ -499,9 +851,9 @@ export async function runMultiTenantIsolationSuite(): Promise<TestResult[]> {
           category,
           name: 'Cross-Tenant RPC Barrier: User B Cannot Approve User A Reservations',
           status: 'FAIL',
-          operationType: 'READ_ONLY',
+          operationType: 'STATE_CHANGING',
           durationMs: Date.now() - t6a,
-          error: `Cross-tenant approval was not rejected: ${JSON.stringify(data)}`,
+          error: error ? `Invalid rejection response: ${error.message}` : `Unexpected success: ${JSON.stringify(data)}`,
         });
       }
     } catch (err: any) {
@@ -509,42 +861,63 @@ export async function runMultiTenantIsolationSuite(): Promise<TestResult[]> {
         id: 'tenant-user-b-cannot-approve-user-a-reservation',
         category,
         name: 'Cross-Tenant RPC Barrier: User B Cannot Approve User A Reservations',
-        status: 'PASS',
-        operationType: 'READ_ONLY',
+        status: isCrossTenantAuthorizationRejection(err) ? 'PASS' : 'FAIL',
+        operationType: 'STATE_CHANGING',
         durationMs: Date.now() - t6a,
-        details: `Rejected as intended: ${err.message}`,
+        error: err.message,
       });
     }
   }
 
-  // 6b. User B cannot decline User A's reservation [READ-ONLY / PERMISSION BARRIER]
+  // 6b. User B cannot decline User A's reservation [STATE-CHANGING / GUARDED]
   const t6b = Date.now();
-  if (!realResA) {
+  if (!isStateChangingAllowed()) {
     results.push({
       id: 'tenant-user-b-cannot-decline-user-a-reservation',
       category,
       name: 'Cross-Tenant RPC Barrier: User B Cannot Decline User A Reservations',
       status: 'BLOCKED',
-      operationType: 'READ_ONLY',
+      operationType: 'STATE_CHANGING',
       durationMs: 0,
-      details: 'No existing reservation in Facility A to verify against.',
+      details: 'State-changing test guarded: Set CONFIRM_TEST_ENV=true in .env.test to allow execution.',
+    });
+  } else if (!ctxA.disposableReservation) {
+    results.push({
+      id: 'tenant-user-b-cannot-decline-user-a-reservation',
+      category,
+      name: 'Cross-Tenant RPC Barrier: User B Cannot Decline User A Reservations',
+      status: 'BLOCKED',
+      operationType: 'STATE_CHANGING',
+      durationMs: 0,
+      details: 'No dedicated disposable test reservation (tagged TD-% or TEST-DISPOSABLE-%) exists in Facility A. Existing customer records are protected and will never be targeted.',
     });
   } else {
     try {
+      const targetResId = ctxA.disposableReservation.id;
+      const initialStatus = ctxA.disposableReservation.status;
+
       const { data, error } = await ctxB.client.rpc('decline_booking_request_as_staff', {
-        p_reservation_id: realResA.id,
+        p_reservation_id: targetResId,
         p_reason: 'Cross-tenant decline attack attempt by User B',
       });
 
-      if (error && isIntendedSecurityRejection(error)) {
+      if (error && isCrossTenantAuthorizationRejection(error)) {
+        const { data: currentRes } = await ctxA.client
+          .from('reservations')
+          .select('status')
+          .eq('id', targetResId)
+          .single();
+
+        const isUnchanged = currentRes?.status === initialStatus;
+
         results.push({
           id: 'tenant-user-b-cannot-decline-user-a-reservation',
           category,
           name: 'Cross-Tenant RPC Barrier: User B Cannot Decline User A Reservations',
-          status: 'PASS',
-          operationType: 'READ_ONLY',
+          status: isUnchanged ? 'PASS' : 'FAIL',
+          operationType: 'STATE_CHANGING',
           durationMs: Date.now() - t6b,
-          details: `Cross-tenant decline actively blocked by database: "${error.message}"`,
+          details: `Cross-tenant decline actively blocked by database authorization check: "${error.message}". Record remains unchanged.`,
         });
       } else {
         results.push({
@@ -552,9 +925,9 @@ export async function runMultiTenantIsolationSuite(): Promise<TestResult[]> {
           category,
           name: 'Cross-Tenant RPC Barrier: User B Cannot Decline User A Reservations',
           status: 'FAIL',
-          operationType: 'READ_ONLY',
+          operationType: 'STATE_CHANGING',
           durationMs: Date.now() - t6b,
-          error: `Cross-tenant decline was not rejected: ${JSON.stringify(data)}`,
+          error: error ? `Invalid rejection response: ${error.message}` : `Unexpected success: ${JSON.stringify(data)}`,
         });
       }
     } catch (err: any) {
@@ -562,42 +935,63 @@ export async function runMultiTenantIsolationSuite(): Promise<TestResult[]> {
         id: 'tenant-user-b-cannot-decline-user-a-reservation',
         category,
         name: 'Cross-Tenant RPC Barrier: User B Cannot Decline User A Reservations',
-        status: 'PASS',
-        operationType: 'READ_ONLY',
+        status: isCrossTenantAuthorizationRejection(err) ? 'PASS' : 'FAIL',
+        operationType: 'STATE_CHANGING',
         durationMs: Date.now() - t6b,
-        details: `Rejected as intended: ${err.message}`,
+        error: err.message,
       });
     }
   }
 
-  // 6c. User B cannot cancel User A's reservation [READ-ONLY / PERMISSION BARRIER]
+  // 6c. User B cannot cancel User A's reservation [STATE-CHANGING / GUARDED]
   const t6c = Date.now();
-  if (!realResA) {
+  if (!isStateChangingAllowed()) {
     results.push({
       id: 'tenant-user-b-cannot-cancel-user-a-reservation',
       category,
       name: 'Cross-Tenant RPC Barrier: User B Cannot Cancel User A Reservations',
       status: 'BLOCKED',
-      operationType: 'READ_ONLY',
+      operationType: 'STATE_CHANGING',
       durationMs: 0,
-      details: 'No existing reservation in Facility A to verify against.',
+      details: 'State-changing test guarded: Set CONFIRM_TEST_ENV=true in .env.test to allow execution.',
+    });
+  } else if (!ctxA.disposableReservation) {
+    results.push({
+      id: 'tenant-user-b-cannot-cancel-user-a-reservation',
+      category,
+      name: 'Cross-Tenant RPC Barrier: User B Cannot Cancel User A Reservations',
+      status: 'BLOCKED',
+      operationType: 'STATE_CHANGING',
+      durationMs: 0,
+      details: 'No dedicated disposable test reservation (tagged TD-% or TEST-DISPOSABLE-%) exists in Facility A. Existing customer records are protected and will never be targeted.',
     });
   } else {
     try {
+      const targetResId = ctxA.disposableReservation.id;
+      const initialStatus = ctxA.disposableReservation.status;
+
       const { data, error } = await ctxB.client.rpc('cancel_reservation_as_staff', {
-        p_reservation_id: realResA.id,
+        p_reservation_id: targetResId,
         p_reason: 'Cross-tenant cancel attack attempt by User B',
       });
 
-      if (error && isIntendedSecurityRejection(error)) {
+      if (error && isCrossTenantAuthorizationRejection(error)) {
+        const { data: currentRes } = await ctxA.client
+          .from('reservations')
+          .select('status')
+          .eq('id', targetResId)
+          .single();
+
+        const isUnchanged = currentRes?.status === initialStatus;
+
         results.push({
           id: 'tenant-user-b-cannot-cancel-user-a-reservation',
           category,
           name: 'Cross-Tenant RPC Barrier: User B Cannot Cancel User A Reservations',
-          status: 'PASS',
-          operationType: 'READ_ONLY',
+          status: isUnchanged ? 'PASS' : 'FAIL',
+          operationType: 'STATE_CHANGING',
           durationMs: Date.now() - t6c,
-          details: `Cross-tenant cancellation actively blocked by database: "${error.message}"`,
+          details: `Cross-tenant cancellation actively blocked by database authorization check: "${error.message}". Record remains unchanged.`,
         });
       } else {
         results.push({
@@ -605,9 +999,9 @@ export async function runMultiTenantIsolationSuite(): Promise<TestResult[]> {
           category,
           name: 'Cross-Tenant RPC Barrier: User B Cannot Cancel User A Reservations',
           status: 'FAIL',
-          operationType: 'READ_ONLY',
+          operationType: 'STATE_CHANGING',
           durationMs: Date.now() - t6c,
-          error: `Cross-tenant cancellation was not rejected: ${JSON.stringify(data)}`,
+          error: error ? `Invalid rejection response: ${error.message}` : `Unexpected success: ${JSON.stringify(data)}`,
         });
       }
     } catch (err: any) {
@@ -615,45 +1009,67 @@ export async function runMultiTenantIsolationSuite(): Promise<TestResult[]> {
         id: 'tenant-user-b-cannot-cancel-user-a-reservation',
         category,
         name: 'Cross-Tenant RPC Barrier: User B Cannot Cancel User A Reservations',
-        status: 'PASS',
-        operationType: 'READ_ONLY',
+        status: isCrossTenantAuthorizationRejection(err) ? 'PASS' : 'FAIL',
+        operationType: 'STATE_CHANGING',
         durationMs: Date.now() - t6c,
-        details: `Rejected as intended: ${err.message}`,
+        error: err.message,
       });
     }
   }
 
-  // 6d. User B cannot reschedule User A's reservation [READ-ONLY / PERMISSION BARRIER]
+  // 6d. User B cannot reschedule User A's reservation [STATE-CHANGING / GUARDED]
   const t6d = Date.now();
-  if (!realResA) {
+  if (!isStateChangingAllowed()) {
     results.push({
       id: 'tenant-user-b-cannot-reschedule-user-a-reservation',
       category,
       name: 'Cross-Tenant RPC Barrier: User B Cannot Reschedule User A Reservations',
       status: 'BLOCKED',
-      operationType: 'READ_ONLY',
+      operationType: 'STATE_CHANGING',
       durationMs: 0,
-      details: 'No existing reservation in Facility A to verify against.',
+      details: 'State-changing test guarded: Set CONFIRM_TEST_ENV=true in .env.test to allow execution.',
+    });
+  } else if (!ctxA.disposableReservation) {
+    results.push({
+      id: 'tenant-user-b-cannot-reschedule-user-a-reservation',
+      category,
+      name: 'Cross-Tenant RPC Barrier: User B Cannot Reschedule User A Reservations',
+      status: 'BLOCKED',
+      operationType: 'STATE_CHANGING',
+      durationMs: 0,
+      details: 'No dedicated disposable test reservation (tagged TD-% or TEST-DISPOSABLE-%) exists in Facility A. Existing customer records are protected and will never be targeted.',
     });
   } else {
     try {
+      const targetResId = ctxA.disposableReservation.id;
+      const initialCourtId = ctxA.disposableReservation.court_id;
+      const targetCourtId = ctxA.courts[0]?.id || initialCourtId;
+
       const { data, error } = await ctxB.client.rpc('reschedule_reservation_as_staff', {
-        p_reservation_id: realResA.id,
-        p_new_court_id: ctxA.courts[0]?.id || realResA.id,
+        p_reservation_id: targetResId,
+        p_new_court_id: targetCourtId,
         p_new_date: '2028-01-01',
         p_new_start_time: '2028-01-01T08:00:00Z',
         p_new_duration_minutes: 60,
       });
 
-      if (error && isIntendedSecurityRejection(error)) {
+      if (error && isCrossTenantAuthorizationRejection(error)) {
+        const { data: currentRes } = await ctxA.client
+          .from('reservations')
+          .select('court_id, booking_date')
+          .eq('id', targetResId)
+          .single();
+
+        const isUnchanged = currentRes?.court_id === initialCourtId;
+
         results.push({
           id: 'tenant-user-b-cannot-reschedule-user-a-reservation',
           category,
           name: 'Cross-Tenant RPC Barrier: User B Cannot Reschedule User A Reservations',
-          status: 'PASS',
-          operationType: 'READ_ONLY',
+          status: isUnchanged ? 'PASS' : 'FAIL',
+          operationType: 'STATE_CHANGING',
           durationMs: Date.now() - t6d,
-          details: `Cross-tenant rescheduling actively blocked by database: "${error.message}"`,
+          details: `Cross-tenant rescheduling actively blocked by database authorization check: "${error.message}". Record remains unchanged.`,
         });
       } else {
         results.push({
@@ -661,9 +1077,9 @@ export async function runMultiTenantIsolationSuite(): Promise<TestResult[]> {
           category,
           name: 'Cross-Tenant RPC Barrier: User B Cannot Reschedule User A Reservations',
           status: 'FAIL',
-          operationType: 'READ_ONLY',
+          operationType: 'STATE_CHANGING',
           durationMs: Date.now() - t6d,
-          error: `Cross-tenant rescheduling was not rejected: ${JSON.stringify(data)}`,
+          error: error ? `Invalid rejection response: ${error.message}` : `Unexpected success: ${JSON.stringify(data)}`,
         });
       }
     } catch (err: any) {
@@ -671,99 +1087,161 @@ export async function runMultiTenantIsolationSuite(): Promise<TestResult[]> {
         id: 'tenant-user-b-cannot-reschedule-user-a-reservation',
         category,
         name: 'Cross-Tenant RPC Barrier: User B Cannot Reschedule User A Reservations',
-        status: 'PASS',
-        operationType: 'READ_ONLY',
+        status: isCrossTenantAuthorizationRejection(err) ? 'PASS' : 'FAIL',
+        operationType: 'STATE_CHANGING',
         durationMs: Date.now() - t6d,
-        details: `Rejected as intended: ${err.message}`,
+        error: err.message,
       });
     }
   }
 
-  // --------------------------------------------------------------------------
+  // ==========================================================================
   // Requirement 7: Neither user can modify the other organization's facility settings
-  // --------------------------------------------------------------------------
-  // 7a. User A cannot modify Facility B confirmation settings via RPC [READ-ONLY / PERMISSION BARRIER]
-  const t7a = Date.now();
-  try {
-    const { data, error } = await ctxA.client.rpc('update_facility_confirmation_settings', {
-      p_facility_id: ctxB.facility.id,
-      p_mode: 'manual_approval',
-      p_hold_minutes: 45,
-    });
+  // All modifying operations are classified as STATE_CHANGING.
+  // ==========================================================================
 
-    if (error && isIntendedSecurityRejection(error)) {
-      results.push({
-        id: 'tenant-user-a-cannot-update-facility-b-settings-rpc',
-        category,
-        name: 'Settings Isolation: User A Cannot Update Facility B Settings via RPC',
-        status: 'PASS',
-        operationType: 'READ_ONLY',
-        durationMs: Date.now() - t7a,
-        details: `Rejected by authorization check: "${error.message}"`,
-      });
-    } else {
-      results.push({
-        id: 'tenant-user-a-cannot-update-facility-b-settings-rpc',
-        category,
-        name: 'Settings Isolation: User A Cannot Update Facility B Settings via RPC',
-        status: 'FAIL',
-        operationType: 'READ_ONLY',
-        durationMs: Date.now() - t7a,
-        error: `Cross-tenant settings update was not rejected: ${JSON.stringify(data)}`,
-      });
-    }
-  } catch (err: any) {
+  // 7a. User A cannot modify Facility B confirmation settings via RPC [STATE-CHANGING / GUARDED]
+  const t7a = Date.now();
+  if (!isStateChangingAllowed()) {
     results.push({
       id: 'tenant-user-a-cannot-update-facility-b-settings-rpc',
       category,
       name: 'Settings Isolation: User A Cannot Update Facility B Settings via RPC',
-      status: 'PASS',
-      operationType: 'READ_ONLY',
-      durationMs: Date.now() - t7a,
-      details: `Execution blocked as intended: ${err.message}`,
+      status: 'BLOCKED',
+      operationType: 'STATE_CHANGING',
+      durationMs: 0,
+      details: 'State-changing test guarded: Set CONFIRM_TEST_ENV=true in .env.test to allow execution.',
     });
-  }
+  } else {
+    try {
+      // Capture before-state of Facility B via authorized User B client
+      const { data: beforeFacB } = await ctxB.client
+        .from('facilities')
+        .select('booking_confirmation_mode, pending_hold_duration_minutes')
+        .eq('id', ctxB.facility.id)
+        .single();
 
-  // 7b. User B cannot modify Facility A confirmation settings via RPC [READ-ONLY / PERMISSION BARRIER]
-  const t7b = Date.now();
-  try {
-    const { data, error } = await ctxB.client.rpc('update_facility_confirmation_settings', {
-      p_facility_id: ctxA.facility.id,
-      p_mode: 'manual_approval',
-      p_hold_minutes: 45,
-    });
-
-    if (error && isIntendedSecurityRejection(error)) {
-      results.push({
-        id: 'tenant-user-b-cannot-update-facility-a-settings-rpc',
-        category,
-        name: 'Settings Isolation: User B Cannot Update Facility A Settings via RPC',
-        status: 'PASS',
-        operationType: 'READ_ONLY',
-        durationMs: Date.now() - t7b,
-        details: `Rejected by authorization check: "${error.message}"`,
+      const { data, error } = await ctxA.client.rpc('update_facility_confirmation_settings', {
+        p_facility_id: ctxB.facility.id,
+        p_mode: 'manual_approval',
+        p_hold_minutes: 45,
       });
-    } else {
+
+      if (error && isCrossTenantAuthorizationRejection(error)) {
+        // Verify post-attempt immutability via authorized User B client
+        const { data: afterFacB } = await ctxB.client
+          .from('facilities')
+          .select('booking_confirmation_mode, pending_hold_duration_minutes')
+          .eq('id', ctxB.facility.id)
+          .single();
+
+        const isUnchanged =
+          beforeFacB?.booking_confirmation_mode === afterFacB?.booking_confirmation_mode &&
+          beforeFacB?.pending_hold_duration_minutes === afterFacB?.pending_hold_duration_minutes;
+
+        results.push({
+          id: 'tenant-user-a-cannot-update-facility-b-settings-rpc',
+          category,
+          name: 'Settings Isolation: User A Cannot Update Facility B Settings via RPC',
+          status: isUnchanged ? 'PASS' : 'FAIL',
+          operationType: 'STATE_CHANGING',
+          durationMs: Date.now() - t7a,
+          details: `Rejected by database authorization check: "${error.message}". Facility B settings verified unchanged.`,
+        });
+      } else {
+        results.push({
+          id: 'tenant-user-a-cannot-update-facility-b-settings-rpc',
+          category,
+          name: 'Settings Isolation: User A Cannot Update Facility B Settings via RPC',
+          status: 'FAIL',
+          operationType: 'STATE_CHANGING',
+          durationMs: Date.now() - t7a,
+          error: error ? `Invalid rejection response: ${error.message}` : `Cross-tenant settings update was not rejected: ${JSON.stringify(data)}`,
+        });
+      }
+    } catch (err: any) {
       results.push({
-        id: 'tenant-user-b-cannot-update-facility-a-settings-rpc',
+        id: 'tenant-user-a-cannot-update-facility-b-settings-rpc',
         category,
-        name: 'Settings Isolation: User B Cannot Update Facility A Settings via RPC',
-        status: 'FAIL',
-        operationType: 'READ_ONLY',
-        durationMs: Date.now() - t7b,
-        error: `Cross-tenant settings update was not rejected: ${JSON.stringify(data)}`,
+        name: 'Settings Isolation: User A Cannot Update Facility B Settings via RPC',
+        status: isCrossTenantAuthorizationRejection(err) ? 'PASS' : 'FAIL',
+        operationType: 'STATE_CHANGING',
+        durationMs: Date.now() - t7a,
+        error: err.message,
       });
     }
-  } catch (err: any) {
+  }
+
+  // 7b. User B cannot modify Facility A confirmation settings via RPC [STATE-CHANGING / GUARDED]
+  const t7b = Date.now();
+  if (!isStateChangingAllowed()) {
     results.push({
       id: 'tenant-user-b-cannot-update-facility-a-settings-rpc',
       category,
       name: 'Settings Isolation: User B Cannot Update Facility A Settings via RPC',
-      status: 'PASS',
-      operationType: 'READ_ONLY',
-      durationMs: Date.now() - t7b,
-      details: `Execution blocked as intended: ${err.message}`,
+      status: 'BLOCKED',
+      operationType: 'STATE_CHANGING',
+      durationMs: 0,
+      details: 'State-changing test guarded: Set CONFIRM_TEST_ENV=true in .env.test to allow execution.',
     });
+  } else {
+    try {
+      // Capture before-state of Facility A via authorized User A client
+      const { data: beforeFacA } = await ctxA.client
+        .from('facilities')
+        .select('booking_confirmation_mode, pending_hold_duration_minutes')
+        .eq('id', ctxA.facility.id)
+        .single();
+
+      const { data, error } = await ctxB.client.rpc('update_facility_confirmation_settings', {
+        p_facility_id: ctxA.facility.id,
+        p_mode: 'manual_approval',
+        p_hold_minutes: 45,
+      });
+
+      if (error && isCrossTenantAuthorizationRejection(error)) {
+        // Verify post-attempt immutability via authorized User A client
+        const { data: afterFacA } = await ctxA.client
+          .from('facilities')
+          .select('booking_confirmation_mode, pending_hold_duration_minutes')
+          .eq('id', ctxA.facility.id)
+          .single();
+
+        const isUnchanged =
+          beforeFacA?.booking_confirmation_mode === afterFacA?.booking_confirmation_mode &&
+          beforeFacA?.pending_hold_duration_minutes === afterFacA?.pending_hold_duration_minutes;
+
+        results.push({
+          id: 'tenant-user-b-cannot-update-facility-a-settings-rpc',
+          category,
+          name: 'Settings Isolation: User B Cannot Update Facility A Settings via RPC',
+          status: isUnchanged ? 'PASS' : 'FAIL',
+          operationType: 'STATE_CHANGING',
+          durationMs: Date.now() - t7b,
+          details: `Rejected by database authorization check: "${error.message}". Facility A settings verified unchanged.`,
+        });
+      } else {
+        results.push({
+          id: 'tenant-user-b-cannot-update-facility-a-settings-rpc',
+          category,
+          name: 'Settings Isolation: User B Cannot Update Facility A Settings via RPC',
+          status: 'FAIL',
+          operationType: 'STATE_CHANGING',
+          durationMs: Date.now() - t7b,
+          error: error ? `Invalid rejection response: ${error.message}` : `Cross-tenant settings update was not rejected: ${JSON.stringify(data)}`,
+        });
+      }
+    } catch (err: any) {
+      results.push({
+        id: 'tenant-user-b-cannot-update-facility-a-settings-rpc',
+        category,
+        name: 'Settings Isolation: User B Cannot Update Facility A Settings via RPC',
+        status: isCrossTenantAuthorizationRejection(err) ? 'PASS' : 'FAIL',
+        operationType: 'STATE_CHANGING',
+        durationMs: Date.now() - t7b,
+        error: err.message,
+      });
+    }
   }
 
   // 7c. Direct UPDATE barrier: Neither user can modify other facility core attributes [STATE-CHANGING / GUARDED]
@@ -780,6 +1258,9 @@ export async function runMultiTenantIsolationSuite(): Promise<TestResult[]> {
     });
   } else {
     try {
+      const { data: beforeFacA } = await ctxA.client.from('facilities').select('default_hourly_rate').eq('id', ctxA.facility.id).single();
+      const { data: beforeFacB } = await ctxB.client.from('facilities').select('default_hourly_rate').eq('id', ctxB.facility.id).single();
+
       const { data: updateAonB } = await ctxA.client
         .from('facilities')
         .update({ default_hourly_rate: 999.0 })
@@ -792,10 +1273,16 @@ export async function runMultiTenantIsolationSuite(): Promise<TestResult[]> {
         .eq('id', ctxA.facility.id)
         .select();
 
+      const { data: afterFacA } = await ctxA.client.from('facilities').select('default_hourly_rate').eq('id', ctxA.facility.id).single();
+      const { data: afterFacB } = await ctxB.client.from('facilities').select('default_hourly_rate').eq('id', ctxB.facility.id).single();
+
       const isAonBBlocked = !updateAonB || updateAonB.length === 0;
       const isBonABlocked = !updateBonA || updateBonA.length === 0;
+      const areRatesUnchanged =
+        beforeFacA?.default_hourly_rate === afterFacA?.default_hourly_rate &&
+        beforeFacB?.default_hourly_rate === afterFacB?.default_hourly_rate;
 
-      if (isAonBBlocked && isBonABlocked) {
+      if (isAonBBlocked && isBonABlocked && areRatesUnchanged) {
         results.push({
           id: 'tenant-direct-update-facility-isolation',
           category,
@@ -803,7 +1290,7 @@ export async function runMultiTenantIsolationSuite(): Promise<TestResult[]> {
           status: 'PASS',
           operationType: 'STATE_CHANGING',
           durationMs: Date.now() - t7c,
-          details: 'RLS policy facility_admins_can_update_facility successfully blocked cross-tenant facility modifications (0 rows modified).',
+          details: 'RLS policy facility_admins_can_update_facility successfully blocked cross-tenant facility modifications (0 rows modified). Rates verified unchanged.',
         });
       } else {
         results.push({
@@ -829,9 +1316,10 @@ export async function runMultiTenantIsolationSuite(): Promise<TestResult[]> {
     }
   }
 
-  // --------------------------------------------------------------------------
+  // ==========================================================================
   // Requirement 8: Neither user can access or modify the other's organization memberships
-  // --------------------------------------------------------------------------
+  // ==========================================================================
+
   // 8a. User A cannot read User B organization memberships [READ-ONLY]
   const t8a = Date.now();
   try {
@@ -895,6 +1383,9 @@ export async function runMultiTenantIsolationSuite(): Promise<TestResult[]> {
     });
   } else {
     try {
+      const { data: beforeCountA } = await ctxA.client.from('organization_members').select('id').eq('organization_id', ctxA.orgId);
+      const { data: beforeCountB } = await ctxB.client.from('organization_members').select('id').eq('organization_id', ctxB.orgId);
+
       // User A attempts self-insertion into Org B
       const { data: insertDataA, error: insertErrA } = await ctxA.client
         .from('organization_members')
@@ -915,6 +1406,9 @@ export async function runMultiTenantIsolationSuite(): Promise<TestResult[]> {
         })
         .select();
 
+      const { data: afterCountA } = await ctxA.client.from('organization_members').select('id').eq('organization_id', ctxA.orgId);
+      const { data: afterCountB } = await ctxB.client.from('organization_members').select('id').eq('organization_id', ctxB.orgId);
+
       const isAInsertBlocked =
         Boolean(insertErrA && (isIntendedSecurityRejection(insertErrA) || insertErrA.code === '42501')) ||
         !insertDataA ||
@@ -925,7 +1419,11 @@ export async function runMultiTenantIsolationSuite(): Promise<TestResult[]> {
         !insertDataB ||
         insertDataB.length === 0;
 
-      if (isAInsertBlocked && isBInsertBlocked) {
+      const areCountsUnchanged =
+        (beforeCountA?.length || 0) === (afterCountA?.length || 0) &&
+        (beforeCountB?.length || 0) === (afterCountB?.length || 0);
+
+      if (isAInsertBlocked && isBInsertBlocked && areCountsUnchanged) {
         results.push({
           id: 'tenant-memberships-anti-tampering',
           category,
@@ -933,7 +1431,7 @@ export async function runMultiTenantIsolationSuite(): Promise<TestResult[]> {
           status: 'PASS',
           operationType: 'STATE_CHANGING',
           durationMs: Date.now() - t8b,
-          details: 'RLS policies owners_can_insert_teammates strictly rejected cross-tenant member self-assignment.',
+          details: 'RLS policies owners_can_insert_teammates strictly rejected cross-tenant member self-assignment. Membership rosters verified intact.',
         });
       } else {
         results.push({
@@ -959,9 +1457,10 @@ export async function runMultiTenantIsolationSuite(): Promise<TestResult[]> {
     }
   }
 
-  // --------------------------------------------------------------------------
+  // ==========================================================================
   // Requirement 9: Anonymous customers cannot read private reservation or owner information
-  // --------------------------------------------------------------------------
+  // ==========================================================================
+
   // 9a. Anonymous customer cannot read reservations table [READ-ONLY]
   const t9a = Date.now();
   try {
