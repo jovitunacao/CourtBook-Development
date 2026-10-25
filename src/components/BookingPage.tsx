@@ -579,65 +579,78 @@ export const BookingPage: React.FC<BookingPageProps> = ({
       setIsSubmitting(false);
 
       if (functionRes.success) {
-        setIsUncertainOutcome(false);
         const d = functionRes.data || {};
         const raw = functionRes.raw || {};
 
-        // Resolve reference code from all potential locations (nested reservation, data, or raw)
-        const referenceCode =
+        // Extract reference code strictly from authoritative server response (never generate fictional CB-...)
+        const referenceCode = (
           d.reference_code ||
           d.referenceCode ||
           raw.reference_code ||
-          raw.reservation?.reference_code ||
-          `CB-${Math.floor(10000 + Math.random() * 90000)}`;
+          raw.reservation?.reference_code
+        )?.toString()?.trim();
 
-        // Resolve reservation ID
-        const reservationId =
+        // Extract reservation ID strictly from authoritative server response (never generate fictional res-...)
+        const reservationId = (
           d.reservation_id ||
           d.id ||
           raw.reservation_id ||
-          raw.reservation?.id ||
-          `res-${Date.now()}`;
+          raw.reservation?.id
+        )?.toString()?.trim();
 
-        // Resolve confirmed vs pending status
-        const isPending =
-          d.status === 'pending' ||
-          raw.status === 'pending' ||
-          raw.confirmation_mode === 'manual_approval' ||
-          d.booking_confirmation_mode === 'manual_approval' ||
-          courtStatus?.booking_confirmation_mode === 'manual_approval' ||
-          settings.bookingConfirmationMode === 'manual_approval';
-        const reservationStatus: 'confirmed' | 'pending' = isPending ? 'pending' : 'confirmed';
+        // Determine confirmed vs pending strictly from authoritative reservation status
+        // Never infer status from facility settings or client confirmation-mode assumptions
+        const serverStatus = (
+          d.status ||
+          raw.status ||
+          raw.reservation?.status
+        )?.toString()?.toLowerCase()?.trim();
+        const isValidStatus = serverStatus === 'confirmed' || serverStatus === 'pending';
 
-        // Resolve hold expiration
-        const holdExpiresAt =
-          d.hold_expires_at ||
-          d.holdExpiresAt ||
-          d.expires_at ||
-          raw.expires_at ||
-          (isPending
-            ? new Date(
-                Date.now() +
-                  (courtStatus?.hold_duration_minutes || settings.holdDurationMinutes || 30) * 60 * 1000
-              ).toISOString()
-            : null);
-
-        // Resolve total price
-        const price = Number(
+        // Extract total price strictly from server response (never invent prices from court hourlyRate)
+        const rawPrice =
           d.total_price ??
           d.price ??
           raw.total_price ??
-          selectedCourt.hourlyRate
-        );
+          raw.reservation?.total_price ??
+          raw.reservation?.price;
+        const hasValidPrice =
+          rawPrice !== undefined &&
+          rawPrice !== null &&
+          rawPrice !== '' &&
+          !isNaN(Number(rawPrice));
+
+        // If any required authoritative reservation detail is missing or invalid:
+        // Do NOT create a fictional or assumed confirmation. Display uncertain outcome and preserve key.
+        if (!referenceCode || !reservationId || !isValidStatus || !hasValidPrice) {
+          setIsUncertainOutcome(true);
+          setErrorMessage(
+            'Booking status could not be verified: The booking service returned an incomplete or invalid reservation response. ' +
+            'Your booking attempt key has been preserved. If your reservation was already processed, complete bot verification and click retry to safely retrieve your confirmed booking without double-booking.'
+          );
+          resetCaptcha();
+          return;
+        }
+
+        const reservationStatus: 'confirmed' | 'pending' = serverStatus as 'confirmed' | 'pending';
+        const price = Number(rawPrice);
+
+        // Server-provided hold expiration deadline only - NEVER calculate or invent a hold deadline
+        const holdExpiresAt =
+          d.hold_expires_at ||
+          d.holdExpiresAt ||
+          raw.hold_expires_at ||
+          raw.reservation?.hold_expires_at ||
+          null;
 
         const liveReservation: Reservation = {
           id: reservationId,
           referenceCode,
           courtId: selectedCourt.id,
-          courtName: d.court_name || raw.court_name || selectedCourt.name,
-          date: d.booking_date || d.date || selectedDate,
+          courtName: d.court_name || raw.court_name || raw.reservation?.court_name || selectedCourt.name,
+          date: d.booking_date || d.date || raw.reservation?.booking_date || selectedDate,
           timeSlotId: selectedSlot.id,
-          timeSlotLabel: d.time_slot_label || selectedSlot.label,
+          timeSlotLabel: d.time_slot_label || raw.reservation?.time_slot_label || selectedSlot.label,
           customerName: customerName.trim(),
           customerPhone: customerPhone.trim() || undefined,
           customerEmail: customerEmail.trim() || undefined,
@@ -645,7 +658,7 @@ export const BookingPage: React.FC<BookingPageProps> = ({
           status: reservationStatus,
           holdExpiresAt,
           isDemo: false,
-          createdAt: new Date().toISOString(),
+          createdAt: d.created_at || raw.reservation?.created_at || new Date().toISOString(),
         };
 
         try {
@@ -656,6 +669,7 @@ export const BookingPage: React.FC<BookingPageProps> = ({
 
         setConfirmedReservation(liveReservation);
         setErrorMessage(null);
+        setIsUncertainOutcome(false);
 
         // Success confirmed: generate fresh key for subsequent bookings
         setBookingAttemptId(generateAttemptKey());
@@ -678,7 +692,15 @@ export const BookingPage: React.FC<BookingPageProps> = ({
       // DO NOT rotate bookingAttemptId! The key is preserved for retries of the same request.
       resetCaptcha();
 
-      if (functionRes.isConflict) {
+      if (functionRes.isIncompleteResponse) {
+        // UNCERTAIN OUTCOME: Incomplete or invalid server response
+        setIsUncertainOutcome(true);
+        setErrorMessage(
+          functionRes.error ||
+            'Booking status could not be verified: The booking service returned an incomplete or invalid reservation response. ' +
+            'Your booking attempt key has been preserved. If your reservation was already processed, complete bot verification and click retry to safely retrieve your confirmed booking without double-booking.'
+        );
+      } else if (functionRes.isConflict) {
         setIsUncertainOutcome(false);
         setErrorMessage(
           functionRes.error ||

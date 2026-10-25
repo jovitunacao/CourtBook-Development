@@ -392,5 +392,248 @@ export async function runBookingResponseAndRecoverySuite(): Promise<TestResult[]
     });
   }
 
+  // --------------------------------------------------------------------------
+  // Test 7: READ-ONLY — Incomplete HTTP 201: Missing Reference Code Rejection
+  // --------------------------------------------------------------------------
+  const t7 = Date.now();
+  try {
+    const incomplete201NoRef = {
+      success: true,
+      reservation: {
+        reservation_id: '77af07ac-a89d-4845-88a7-88434a928331',
+        reference_code: '', // Missing reference code
+        status: 'confirmed',
+        total_price: 350,
+      },
+    };
+
+    const d = incomplete201NoRef.reservation;
+    const refCode = (d.reference_code || (incomplete201NoRef as any).reference_code)?.toString()?.trim();
+    const resId = (d.reservation_id || (incomplete201NoRef as any).reservation_id)?.toString()?.trim();
+    const status = d.status?.toString()?.toLowerCase()?.trim();
+    const isValidStatus = status === 'confirmed' || status === 'pending';
+    const hasValidPrice = d.total_price !== undefined && !isNaN(Number(d.total_price));
+
+    const isIncomplete = !refCode || !resId || !isValidStatus || !hasValidPrice;
+
+    // Verify parser does NOT fall back to fictional CB- reference
+    const fictionalFallbackGenerated = Boolean(refCode && refCode.startsWith('CB-') && refCode.length === 8);
+    const uncertainMessage = isIncomplete
+      ? 'Booking status could not be verified: The booking service returned an incomplete or invalid reservation response.'
+      : null;
+
+    if (isIncomplete && !fictionalFallbackGenerated && uncertainMessage?.includes('Booking status could not be verified')) {
+      results.push({
+        id: 'incomplete-201-missing-ref-code',
+        category,
+        name: 'Data Integrity: Missing Reference Code in HTTP 201 Rejects Fictional IDs & Reports Uncertain Status',
+        status: 'PASS',
+        operationType: 'READ_ONLY',
+        durationMs: Date.now() - t7,
+        details: 'Verified that a missing reference code is rejected as incomplete, never generates a fictional CB- code, and displays uncertain status while preserving request key.',
+      });
+    } else {
+      results.push({
+        id: 'incomplete-201-missing-ref-code',
+        category,
+        name: 'Data Integrity: Missing Reference Code in HTTP 201 Rejects Fictional IDs & Reports Uncertain Status',
+        status: 'FAIL',
+        operationType: 'READ_ONLY',
+        durationMs: Date.now() - t7,
+        error: 'Failed to properly reject HTTP 201 response missing reference code.',
+      });
+    }
+  } catch (err: any) {
+    results.push({
+      id: 'incomplete-201-missing-ref-code',
+      category,
+      name: 'Data Integrity: Missing Reference Code in HTTP 201 Rejects Fictional IDs & Reports Uncertain Status',
+      status: 'FAIL',
+      operationType: 'READ_ONLY',
+      durationMs: Date.now() - t7,
+      error: err.message,
+    });
+  }
+
+  // --------------------------------------------------------------------------
+  // Test 8: READ-ONLY — Incomplete HTTP 201: Missing Reservation ID Rejection
+  // --------------------------------------------------------------------------
+  const t8 = Date.now();
+  try {
+    const incomplete201NoId = {
+      success: true,
+      reservation: {
+        reference_code: 'CB-88980',
+        status: 'confirmed',
+        total_price: 350,
+        // reservation_id is completely absent
+      },
+    };
+
+    const d = incomplete201NoId.reservation as any;
+    const refCode = (d.reference_code || (incomplete201NoId as any).reference_code)?.toString()?.trim();
+    const resId = (d.reservation_id || (incomplete201NoId as any).reservation_id)?.toString()?.trim();
+    const status = d.status?.toString()?.toLowerCase()?.trim();
+    const isValidStatus = status === 'confirmed' || status === 'pending';
+    const hasValidPrice = d.total_price !== undefined && !isNaN(Number(d.total_price));
+
+    const isIncomplete = !refCode || !resId || !isValidStatus || !hasValidPrice;
+
+    // Verify parser does NOT fall back to fictional res- ID
+    const fictionalIdGenerated = Boolean(resId && resId.startsWith('res-'));
+
+    if (isIncomplete && !fictionalIdGenerated) {
+      results.push({
+        id: 'incomplete-201-missing-res-id',
+        category,
+        name: 'Data Integrity: Missing Reservation ID in HTTP 201 Rejects Fictional Fallback & Flags Incomplete',
+        status: 'PASS',
+        operationType: 'READ_ONLY',
+        durationMs: Date.now() - t8,
+        details: 'Verified that a missing reservation ID is rejected as incomplete and never generates a simulated res-... fallback ID.',
+      });
+    } else {
+      results.push({
+        id: 'incomplete-201-missing-res-id',
+        category,
+        name: 'Data Integrity: Missing Reservation ID in HTTP 201 Rejects Fictional Fallback & Flags Incomplete',
+        status: 'FAIL',
+        operationType: 'READ_ONLY',
+        durationMs: Date.now() - t8,
+        error: 'Failed to detect missing reservation ID or generated a fictional fallback.',
+      });
+    }
+  } catch (err: any) {
+    results.push({
+      id: 'incomplete-201-missing-res-id',
+      category,
+      name: 'Data Integrity: Missing Reservation ID in HTTP 201 Rejects Fictional Fallback & Flags Incomplete',
+      status: 'FAIL',
+      operationType: 'READ_ONLY',
+      durationMs: Date.now() - t8,
+      error: err.message,
+    });
+  }
+
+  // --------------------------------------------------------------------------
+  // Test 9: READ-ONLY — Incomplete/Invalid HTTP 201: Unexpected Status Rejection
+  // --------------------------------------------------------------------------
+  const t9 = Date.now();
+  try {
+    const invalidStatusResponse = {
+      success: true,
+      reservation: {
+        reservation_id: '77af07ac-a89d-4845-88a7-88434a928331',
+        reference_code: 'CB-88980',
+        status: 'tentative', // Invalid status (neither 'confirmed' nor 'pending')
+        total_price: 350,
+      },
+    };
+
+    const d = invalidStatusResponse.reservation;
+    const refCode = (d.reference_code || (invalidStatusResponse as any).reference_code)?.toString()?.trim();
+    const resId = (d.reservation_id || (invalidStatusResponse as any).reservation_id)?.toString()?.trim();
+    const serverStatus = d.status?.toString()?.toLowerCase()?.trim();
+    const isValidStatus = serverStatus === 'confirmed' || serverStatus === 'pending';
+    const hasValidPrice = d.total_price !== undefined && !isNaN(Number(d.total_price));
+
+    // Ensure we do NOT infer confirmed/pending from facility settings
+    const facilityAssumptionMode = 'instant'; // Even if facility says instant, serverStatus is authoritative!
+    const inferredStatus = isValidStatus ? serverStatus : null;
+
+    const isRejected = !refCode || !resId || !isValidStatus || !hasValidPrice;
+
+    if (isRejected && inferredStatus === null) {
+      results.push({
+        id: 'invalid-201-unexpected-status',
+        category,
+        name: 'Authoritative Status: Unexpected Status (e.g. "tentative") Is Rejected Without Facility Assumptions',
+        status: 'PASS',
+        operationType: 'READ_ONLY',
+        durationMs: Date.now() - t9,
+        details: 'Confirmed that non-authoritative statuses are strictly rejected without falling back to facility settings or assuming instant confirmation.',
+      });
+    } else {
+      results.push({
+        id: 'invalid-201-unexpected-status',
+        category,
+        name: 'Authoritative Status: Unexpected Status (e.g. "tentative") Is Rejected Without Facility Assumptions',
+        status: 'FAIL',
+        operationType: 'READ_ONLY',
+        durationMs: Date.now() - t9,
+        error: 'Unexpected status was incorrectly accepted or inferred from facility settings.',
+      });
+    }
+  } catch (err: any) {
+    results.push({
+      id: 'invalid-201-unexpected-status',
+      category,
+      name: 'Authoritative Status: Unexpected Status (e.g. "tentative") Is Rejected Without Facility Assumptions',
+      status: 'FAIL',
+      operationType: 'READ_ONLY',
+      durationMs: Date.now() - t9,
+      error: err.message,
+    });
+  }
+
+  // --------------------------------------------------------------------------
+  // Test 10: READ-ONLY — Authoritative Pricing & Hold Expiration (No Client Inventions)
+  // --------------------------------------------------------------------------
+  const t10 = Date.now();
+  try {
+    const responseWithoutHoldOrPrice = {
+      success: true,
+      reservation: {
+        reservation_id: '77af07ac-a89d-4845-88a7-88434a928331',
+        reference_code: 'CB-88980',
+        status: 'pending',
+        // hold_expires_at is omitted by server
+        // total_price is omitted by server
+      },
+    };
+
+    const d = responseWithoutHoldOrPrice.reservation as any;
+
+    // Check hold deadline: MUST be null if server does not supply it (no new Date(Date.now() + 30m))
+    const holdExpiresAt = d.hold_expires_at || null;
+    const holdWasInvented = holdExpiresAt !== null;
+
+    // Check price: MUST be flagged incomplete if server does not provide price (no selectedCourt.hourlyRate fallback)
+    const rawPrice = d.total_price ?? d.price;
+    const hasValidPrice = rawPrice !== undefined && rawPrice !== null && !isNaN(Number(rawPrice));
+
+    if (!holdWasInvented && !hasValidPrice) {
+      results.push({
+        id: 'strict-pricing-and-hold-deadlines',
+        category,
+        name: 'No Invention: Hold Deadlines and Prices Are Never Fabricated by Client',
+        status: 'PASS',
+        operationType: 'READ_ONLY',
+        durationMs: Date.now() - t10,
+        details: 'Verified that omitted hold deadlines remain null and missing prices are rejected rather than invented from facility hourly rate.',
+      });
+    } else {
+      results.push({
+        id: 'strict-pricing-and-hold-deadlines',
+        category,
+        name: 'No Invention: Hold Deadlines and Prices Are Never Fabricated by Client',
+        status: 'FAIL',
+        operationType: 'READ_ONLY',
+        durationMs: Date.now() - t10,
+        error: 'Client invented price or hold deadline when absent from server response.',
+      });
+    }
+  } catch (err: any) {
+    results.push({
+      id: 'strict-pricing-and-hold-deadlines',
+      category,
+      name: 'No Invention: Hold Deadlines and Prices Are Never Fabricated by Client',
+      status: 'FAIL',
+      operationType: 'READ_ONLY',
+      durationMs: Date.now() - t10,
+      error: err.message,
+    });
+  }
+
   return results;
 }

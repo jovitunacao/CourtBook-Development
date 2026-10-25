@@ -666,6 +666,7 @@ export interface PublicBookingResult {
   isCaptchaRequired?: boolean;
   isNetworkError?: boolean;
   isTimeout?: boolean;
+  isIncompleteResponse?: boolean;
   retryAfter?: number;
   idempotentReplayed?: boolean;
   httpStatus?: number;
@@ -758,6 +759,52 @@ export async function submitPublicBookingViaFunction(
       (result && (result.reference_code || result.reservation_id) ? result : null) ||
       result ||
       {};
+
+    // Authoritative field extraction & completeness validation (never accept incomplete or missing authoritative data)
+    const refCode = (
+      reservationData.reference_code ||
+      reservationData.referenceCode ||
+      result?.reference_code
+    )?.toString()?.trim();
+
+    const resId = (
+      reservationData.reservation_id ||
+      reservationData.id ||
+      result?.reservation_id ||
+      result?.id
+    )?.toString()?.trim();
+
+    const rawStatus = (
+      reservationData.status ||
+      result?.status
+    )?.toString()?.toLowerCase()?.trim();
+    const isValidStatus = rawStatus === 'confirmed' || rawStatus === 'pending';
+
+    const rawPrice =
+      reservationData.total_price ??
+      reservationData.price ??
+      result?.total_price ??
+      result?.price;
+    const hasValidPrice =
+      rawPrice !== undefined &&
+      rawPrice !== null &&
+      rawPrice !== '' &&
+      !isNaN(Number(rawPrice));
+
+    // If HTTP 200/201 arrives but reservation details are incomplete or invalid:
+    // Report uncertain outcome, NEVER generate fictional codes/statuses, and allow safe idempotent recovery.
+    if (!refCode || !resId || !isValidStatus || !hasValidPrice) {
+      return {
+        success: false,
+        isIncompleteResponse: true,
+        data: reservationData,
+        raw: result,
+        error:
+          'Booking status could not be verified: The booking service returned an incomplete or invalid reservation response. ' +
+          'Your booking attempt key has been preserved. If your reservation was already processed, complete bot verification and click retry to safely retrieve your confirmed booking without double-booking.',
+        httpStatus: response.status,
+      };
+    }
 
     return {
       success: true,
