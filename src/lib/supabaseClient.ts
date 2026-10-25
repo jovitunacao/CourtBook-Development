@@ -267,6 +267,29 @@ export function getLocalSlotUtcBounds(
 }
 
 /**
+ * Returns today's date formatted as YYYY-MM-DD in the specified IANA timezone.
+ * Robust against differences between the user's browser timezone and facility timezone.
+ */
+export function getTodayStringInTimezone(timeZone: string): string {
+  const tz = timeZone || 'Asia/Manila';
+  try {
+    const fmt = new Intl.DateTimeFormat('en-CA', {
+      timeZone: tz,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    });
+    return fmt.format(new Date()); // Formats as YYYY-MM-DD
+  } catch {
+    const d = new Date();
+    const year = d.getFullYear();
+    const month = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  }
+}
+
+/**
  * Determines whether a slot (startHour to endHour on slotDate in facilityTimezone)
  * is busy or blocked given busy intervals returned by get_court_busy_slots.
  */
@@ -656,9 +679,186 @@ export interface PublicBookingInput {
   is_demo?: boolean;
 }
 
+export interface AuthoritativeReservationDetails {
+  reservationId: string;
+  referenceCode: string;
+  status: 'confirmed' | 'pending';
+  price: number;
+  holdExpiresAt: string | null;
+  courtName?: string;
+  facilityName?: string;
+  bookingDate?: string;
+  timeSlotLabel?: string;
+  currency?: string;
+  createdAt?: string;
+}
+
+/**
+ * Robustly inspects all candidate objects and nested envelopes returned by
+ * the create-booking Edge Function or database RPC (e.g. result.reservation,
+ * result.data.reservation, result.data, top-level result) and validates that
+ * an authentic, non-fictional reservation was created.
+ */
+export function extractAuthoritativeReservation(
+  rawResponse: any
+): AuthoritativeReservationDetails | null {
+  if (!rawResponse || typeof rawResponse !== 'object') {
+    return null;
+  }
+
+  // Candidate sources ordered from most specific reservation object to top-level envelope
+  const candidateObjects = [
+    rawResponse.reservation,
+    rawResponse.data?.reservation,
+    rawResponse.data?.data,
+    rawResponse.data,
+    rawResponse.booking,
+    rawResponse,
+  ].filter((obj): obj is Record<string, any> => Boolean(obj && typeof obj === 'object'));
+
+  // 1. Reference Code
+  let referenceCode: string | null = null;
+  for (const obj of candidateObjects) {
+    const val =
+      obj.reference_code ??
+      obj.referenceCode ??
+      obj.booking_reference ??
+      obj.bookingReference ??
+      obj.ref_code ??
+      obj.refCode ??
+      obj.reference;
+    if (val !== undefined && val !== null) {
+      const s = String(val).trim();
+      if (s.length > 0) {
+        referenceCode = s;
+        break;
+      }
+    }
+  }
+
+  // 2. Reservation ID
+  let reservationId: string | null = null;
+  for (const obj of candidateObjects) {
+    const val =
+      obj.reservation_id ??
+      obj.reservationId ??
+      obj.id ??
+      obj.res_id ??
+      obj.resId ??
+      obj.booking_id ??
+      obj.bookingId;
+    if (val !== undefined && val !== null) {
+      const s = String(val).trim();
+      if (s.length > 0) {
+        reservationId = s;
+        break;
+      }
+    }
+  }
+
+  // 3. Authoritative Status ('confirmed' | 'pending')
+  let status: 'confirmed' | 'pending' | null = null;
+  for (const obj of candidateObjects) {
+    const val =
+      obj.status ??
+      obj.reservation_status ??
+      obj.reservationStatus ??
+      obj.booking_status ??
+      obj.bookingStatus;
+    if (val && typeof val === 'string') {
+      const lower = val.toLowerCase().trim();
+      if (lower === 'confirmed' || lower === 'pending') {
+        status = lower as 'confirmed' | 'pending';
+        break;
+      }
+    }
+  }
+
+  // 4. Total Price
+  let price: number | null = null;
+  for (const obj of candidateObjects) {
+    const val =
+      obj.total_price ??
+      obj.totalPrice ??
+      obj.price ??
+      obj.total ??
+      obj.amount ??
+      obj.total_amount ??
+      obj.totalAmount;
+    if (val !== undefined && val !== null && val !== '') {
+      if (typeof val === 'number' && !isNaN(val)) {
+        price = val;
+        break;
+      }
+      if (typeof val === 'string') {
+        // Strip any currency prefixes/symbols: e.g. "₱350.00", "PHP 350", "350"
+        const cleaned = val.replace(/[^0-9.-]/g, '').trim();
+        const num = Number(cleaned);
+        if (!isNaN(num) && cleaned.length > 0) {
+          price = num;
+          break;
+        }
+      }
+    }
+  }
+
+  // If any required authoritative field is missing or invalid, response is incomplete
+  if (!referenceCode || !reservationId || !status || price === null) {
+    return null;
+  }
+
+  // 5. Hold Expiration (null if instant or omitted, never invented)
+  let holdExpiresAt: string | null = null;
+  for (const obj of candidateObjects) {
+    const val =
+      obj.hold_expires_at ??
+      obj.holdExpiresAt ??
+      obj.expires_at ??
+      obj.expiresAt ??
+      obj.hold_expiration ??
+      obj.holdExpiration;
+    if (val && typeof val === 'string' && val.trim().length > 0) {
+      holdExpiresAt = val.trim();
+      break;
+    }
+  }
+
+  // Authoritative metadata from database RPC
+  let courtName: string | undefined;
+  let facilityName: string | undefined;
+  let bookingDate: string | undefined;
+  let timeSlotLabel: string | undefined;
+  let currency: string | undefined;
+  let createdAt: string | undefined;
+
+  for (const obj of candidateObjects) {
+    if (!courtName && (obj.court_name || obj.courtName)) courtName = String(obj.court_name || obj.courtName).trim();
+    if (!facilityName && (obj.facility_name || obj.facilityName)) facilityName = String(obj.facility_name || obj.facilityName).trim();
+    if (!bookingDate && (obj.booking_date || obj.bookingDate || obj.date)) bookingDate = String(obj.booking_date || obj.bookingDate || obj.date).trim();
+    if (!timeSlotLabel && (obj.time_slot_label || obj.timeSlotLabel || obj.time_slot || obj.timeSlot)) timeSlotLabel = String(obj.time_slot_label || obj.timeSlotLabel || obj.time_slot || obj.timeSlot).trim();
+    if (!currency && (obj.currency || obj.currency_symbol)) currency = String(obj.currency || obj.currency_symbol).trim();
+    if (!createdAt && (obj.created_at || obj.createdAt)) createdAt = String(obj.created_at || obj.createdAt).trim();
+  }
+
+  return {
+    referenceCode,
+    reservationId,
+    status,
+    price,
+    holdExpiresAt,
+    courtName,
+    facilityName,
+    bookingDate,
+    timeSlotLabel,
+    currency,
+    createdAt,
+  };
+}
+
 export interface PublicBookingResult {
   success: boolean;
   data?: any;
+  authoritative?: AuthoritativeReservationDetails;
   raw?: any;
   error?: string;
   isConflict?: boolean;
@@ -752,52 +952,14 @@ export async function submitPublicBookingViaFunction(
     }
 
     // Success response handling (HTTP 200 or HTTP 201):
-    // Support all envelope shapes: result.reservation, result.data, or top-level result
-    const reservationData =
-      result?.reservation ||
-      result?.data ||
-      (result && (result.reference_code || result.reservation_id) ? result : null) ||
-      result ||
-      {};
+    // Authoritative field extraction & completeness validation across all response envelope shapes
+    const authDetails = extractAuthoritativeReservation(result);
 
-    // Authoritative field extraction & completeness validation (never accept incomplete or missing authoritative data)
-    const refCode = (
-      reservationData.reference_code ||
-      reservationData.referenceCode ||
-      result?.reference_code
-    )?.toString()?.trim();
-
-    const resId = (
-      reservationData.reservation_id ||
-      reservationData.id ||
-      result?.reservation_id ||
-      result?.id
-    )?.toString()?.trim();
-
-    const rawStatus = (
-      reservationData.status ||
-      result?.status
-    )?.toString()?.toLowerCase()?.trim();
-    const isValidStatus = rawStatus === 'confirmed' || rawStatus === 'pending';
-
-    const rawPrice =
-      reservationData.total_price ??
-      reservationData.price ??
-      result?.total_price ??
-      result?.price;
-    const hasValidPrice =
-      rawPrice !== undefined &&
-      rawPrice !== null &&
-      rawPrice !== '' &&
-      !isNaN(Number(rawPrice));
-
-    // If HTTP 200/201 arrives but reservation details are incomplete or invalid:
-    // Report uncertain outcome, NEVER generate fictional codes/statuses, and allow safe idempotent recovery.
-    if (!refCode || !resId || !isValidStatus || !hasValidPrice) {
+    if (!authDetails) {
       return {
         success: false,
         isIncompleteResponse: true,
-        data: reservationData,
+        data: result?.reservation || result?.data || result || {},
         raw: result,
         error:
           'Booking status could not be verified: The booking service returned an incomplete or invalid reservation response. ' +
@@ -806,9 +968,26 @@ export async function submitPublicBookingViaFunction(
       };
     }
 
+    const reservationData = {
+      ...(result?.reservation || result?.data || result || {}),
+      reservation_id: authDetails.reservationId,
+      id: authDetails.reservationId,
+      reference_code: authDetails.referenceCode,
+      status: authDetails.status,
+      total_price: authDetails.price,
+      price: authDetails.price,
+      hold_expires_at: authDetails.holdExpiresAt,
+      court_name: authDetails.courtName,
+      facility_name: authDetails.facilityName,
+      booking_date: authDetails.bookingDate,
+      time_slot_label: authDetails.timeSlotLabel,
+      currency: authDetails.currency,
+    };
+
     return {
       success: true,
       data: reservationData,
+      authoritative: authDetails,
       raw: result,
       idempotentReplayed: Boolean(
         result?.idempotent_replayed ||

@@ -39,6 +39,8 @@ import {
   getCourtBusySlots,
   isSlotBusyInTimezone,
   getLocalSlotUtcBounds,
+  getTodayStringInTimezone,
+  extractAuthoritativeReservation,
   isValidUuid,
   CourtBookingStatusResult,
   BusySlotRow,
@@ -67,8 +69,23 @@ export const BookingPage: React.FC<BookingPageProps> = ({
   const { isConfigured, publicFacilities, publicCourts, activePublicFacility, setActivePublicFacilityId } =
     useSupabaseAuth();
 
-  const today = getTodayString();
-  const [selectedDate, setSelectedDate] = useState<string>(today);
+  // Cloudflare Turnstile bot verification
+  // Supabase RPC states for live court status & busy slots
+  const [courtStatus, setCourtStatus] = useState<CourtBookingStatusResult | null>(null);
+  const [busySlots, setBusySlots] = useState<BusySlotRow[]>([]);
+  const [isLoadingSlots, setIsLoadingSlots] = useState<boolean>(false);
+
+  // Determine effective IANA timezone (from RPC courtStatus, active public facility, or settings)
+  const effectiveTimezone = courtStatus?.timezone || activePublicFacility?.timezone || settings.timezone || 'Asia/Manila';
+
+  // Compute current calendar date in the facility's actual timezone (avoids client browser skew)
+  const todayInTimezone = useMemo(() => {
+    return getTodayStringInTimezone(effectiveTimezone);
+  }, [effectiveTimezone]);
+
+  const [selectedDate, setSelectedDate] = useState<string>(() =>
+    getTodayStringInTimezone(activePublicFacility?.timezone || settings.timezone || 'Asia/Manila')
+  );
   const [customerName, setCustomerName] = useState<string>('');
   const [customerPhone, setCustomerPhone] = useState<string>('');
   const [customerEmail, setCustomerEmail] = useState<string>('');
@@ -77,11 +94,13 @@ export const BookingPage: React.FC<BookingPageProps> = ({
   const [isUncertainOutcome, setIsUncertainOutcome] = useState<boolean>(false);
   const [confirmedReservation, setConfirmedReservation] = useState<Reservation | null>(null);
 
-  // Cloudflare Turnstile bot verification
-  // Supabase RPC states for live court status & busy slots
-  const [courtStatus, setCourtStatus] = useState<CourtBookingStatusResult | null>(null);
-  const [busySlots, setBusySlots] = useState<BusySlotRow[]>([]);
-  const [isLoadingSlots, setIsLoadingSlots] = useState<boolean>(false);
+  // If selectedDate is in the past relative to the facility timezone, automatically reset to today
+  useEffect(() => {
+    if (selectedDate < todayInTimezone) {
+      setSelectedDate(todayInTimezone);
+      setSelectedSlotId(null);
+    }
+  }, [selectedDate, todayInTimezone]);
 
   // Effective courts: Prioritize live Supabase publicCourts when configured, or mapped settings.courts
   const effectiveCourts: Court[] = useMemo(() => {
@@ -170,8 +189,6 @@ export const BookingPage: React.FC<BookingPageProps> = ({
     return timeSlots.find((s) => s.id === selectedSlotId) || null;
   }, [timeSlots, selectedSlotId]);
 
-  // Determine effective IANA timezone (from RPC courtStatus or facility settings)
-  const effectiveTimezone = courtStatus?.timezone || settings.timezone || 'Asia/Manila';
 
   // Cloudflare Turnstile bot verification
   const turnstileSiteKey = (import.meta.env.VITE_TURNSTILE_SITE_KEY as string | undefined)?.trim() || '';
@@ -305,7 +322,7 @@ export const BookingPage: React.FC<BookingPageProps> = ({
     };
   }, [selectedCourtId, selectedDate, isConfigured]);
 
-  // Evaluates availability of a specific slot considering Supabase RPC & local reservations
+  // Evaluates availability of a specific slot considering Supabase RPC, past time rules & local reservations
   const getSlotAvailability = useCallback(
     (slot: TimeSlot) => {
       // 1. Explicit check if court is marked not bookable in Supabase
@@ -318,7 +335,26 @@ export const BookingPage: React.FC<BookingPageProps> = ({
         };
       }
 
-      // 2. Check Supabase busy / maintenance slots via get_court_busy_slots RPC
+      // 2. Compute slot start/end using the facility's actual timezone from Supabase
+      // Disables all past dates and slots whose start time is less than or equal to current time
+      const bounds = getLocalSlotUtcBounds(
+        selectedDate,
+        slot.hour,
+        slot.hour + 1,
+        effectiveTimezone
+      );
+      const nowMs = Date.now();
+
+      if (bounds.startUtcMs <= nowMs) {
+        return {
+          isAvailable: false,
+          reason: 'This time slot has already started or passed',
+          badge: 'Past',
+          type: 'past' as const,
+        };
+      }
+
+      // 3. Check Supabase busy / maintenance slots via get_court_busy_slots RPC
       const supabaseCheck = isSlotBusyInTimezone(
         selectedDate,
         slot.hour,
@@ -352,7 +388,7 @@ export const BookingPage: React.FC<BookingPageProps> = ({
         };
       }
 
-      // 3. Check local reservations (for local demo simulation)
+      // 4. Check local reservations (for local demo simulation)
       if (selectedCourt && isSlotBooked(reservations, selectedCourt.id, selectedDate, slot.id)) {
         return {
           isAvailable: false,
@@ -372,7 +408,7 @@ export const BookingPage: React.FC<BookingPageProps> = ({
     [courtStatus, busySlots, selectedDate, effectiveTimezone, selectedCourt, reservations]
   );
 
-  // Clear selected slot if it becomes busy
+  // Clear selected slot if it becomes busy or invalid (e.g. slot has passed)
   useEffect(() => {
     if (selectedSlot) {
       const avail = getSlotAvailability(selectedSlot);
@@ -382,49 +418,81 @@ export const BookingPage: React.FC<BookingPageProps> = ({
     }
   }, [selectedSlot, getSlotAvailability]);
 
-  // Quick dates for next 5 days
+  // Periodic recheck interval (every 15 seconds) so that as time advances, past slots deselect automatically
+  useEffect(() => {
+    const timer = setInterval(() => {
+      if (selectedSlot) {
+        const avail = getSlotAvailability(selectedSlot);
+        if (!avail.isAvailable) {
+          setSelectedSlotId(null);
+        }
+      }
+    }, 15000);
+    return () => clearInterval(timer);
+  }, [selectedSlot, getSlotAvailability]);
+
+  // Quick dates for next 5 days computed in the facility's actual timezone (never displays past calendar dates)
   const quickDates = useMemo(() => {
     const list = [];
-    const base = new Date();
+    const [y, m, d] = todayInTimezone.split('-').map(Number);
+    const baseDate = new Date(Date.UTC(y, m - 1, d, 12, 0, 0));
+
     for (let i = 0; i < 5; i++) {
-      const d = new Date(base);
-      d.setDate(base.getDate() + i);
-      const year = d.getFullYear();
-      const month = String(d.getMonth() + 1).padStart(2, '0');
-      const day = String(d.getDate()).padStart(2, '0');
-      const dateStr = `${year}-${month}-${day}`;
+      const targetDate = new Date(baseDate);
+      targetDate.setUTCDate(baseDate.getUTCDate() + i);
+
+      const yr = targetDate.getUTCFullYear();
+      const mo = String(targetDate.getUTCMonth() + 1).padStart(2, '0');
+      const dy = String(targetDate.getUTCDate()).padStart(2, '0');
+      const dateStr = `${yr}-${mo}-${dy}`;
+
       const label =
         i === 0
           ? 'Today'
           : i === 1
           ? 'Tomorrow'
-          : d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+          : targetDate.toLocaleDateString('en-US', {
+              weekday: 'short',
+              month: 'short',
+              day: 'numeric',
+              timeZone: 'UTC',
+            });
+
       list.push({
         dateStr,
         label,
-        dayName: d.toLocaleDateString('en-US', { weekday: 'short' }),
-        dayNum: d.getDate(),
+        dayName: targetDate.toLocaleDateString('en-US', { weekday: 'short', timeZone: 'UTC' }),
+        dayNum: targetDate.getUTCDate(),
       });
     }
     return list;
-  }, []);
+  }, [todayInTimezone]);
 
-  // Count available slots for all enabled courts on this date
+  // Count truly available future slots for all enabled courts on this date
   const courtAvailabilityCounts = useMemo(() => {
     const counts: Record<string, number> = {};
+    const nowMs = Date.now();
+
     enabledCourts.forEach((court) => {
       if (!court.isEnabled) {
         counts[court.id] = 0;
         return;
       }
-      const localBookedCount = reservations.filter(
-        (r) => r.courtId === court.id && r.date === selectedDate && r.status === 'confirmed'
-      ).length;
-      const liveBusyCount = court.id === selectedCourtId ? busySlots.length : 0;
-      counts[court.id] = Math.max(0, timeSlots.length - localBookedCount - liveBusyCount);
+      if (court.id === selectedCourtId) {
+        counts[court.id] = timeSlots.filter((slot) => getSlotAvailability(slot).isAvailable).length;
+      } else {
+        const nonPastCount = timeSlots.filter((slot) => {
+          const bounds = getLocalSlotUtcBounds(selectedDate, slot.hour, slot.hour + 1, effectiveTimezone);
+          return bounds.startUtcMs > nowMs;
+        }).length;
+        const localBookedCount = reservations.filter(
+          (r) => r.courtId === court.id && r.date === selectedDate && r.status === 'confirmed'
+        ).length;
+        counts[court.id] = Math.max(0, nonPastCount - localBookedCount);
+      }
     });
     return counts;
-  }, [enabledCourts, reservations, selectedDate, timeSlots.length, selectedCourtId, busySlots.length]);
+  }, [enabledCourts, selectedCourtId, timeSlots, getSlotAvailability, selectedDate, effectiveTimezone, reservations]);
 
   const handleSelectSlot = (slot: TimeSlot) => {
     const avail = getSlotAvailability(slot);
@@ -443,7 +511,12 @@ export const BookingPage: React.FC<BookingPageProps> = ({
   };
 
   const handleDateChange = (newDate: string) => {
+    if (newDate < todayInTimezone) {
+      setErrorMessage('Cannot select dates in the past. Please select today or a future date.');
+      return;
+    }
     setSelectedDate(newDate);
+    setSelectedSlotId(null);
     setErrorMessage(null);
     setIsUncertainOutcome(false);
     setBookingAttemptId(generateAttemptKey());
@@ -579,50 +652,14 @@ export const BookingPage: React.FC<BookingPageProps> = ({
       setIsSubmitting(false);
 
       if (functionRes.success) {
-        const d = functionRes.data || {};
-        const raw = functionRes.raw || {};
-
-        // Extract reference code strictly from authoritative server response (never generate fictional CB-...)
-        const referenceCode = (
-          d.reference_code ||
-          d.referenceCode ||
-          raw.reference_code ||
-          raw.reservation?.reference_code
-        )?.toString()?.trim();
-
-        // Extract reservation ID strictly from authoritative server response (never generate fictional res-...)
-        const reservationId = (
-          d.reservation_id ||
-          d.id ||
-          raw.reservation_id ||
-          raw.reservation?.id
-        )?.toString()?.trim();
-
-        // Determine confirmed vs pending strictly from authoritative reservation status
-        // Never infer status from facility settings or client confirmation-mode assumptions
-        const serverStatus = (
-          d.status ||
-          raw.status ||
-          raw.reservation?.status
-        )?.toString()?.toLowerCase()?.trim();
-        const isValidStatus = serverStatus === 'confirmed' || serverStatus === 'pending';
-
-        // Extract total price strictly from server response (never invent prices from court hourlyRate)
-        const rawPrice =
-          d.total_price ??
-          d.price ??
-          raw.total_price ??
-          raw.reservation?.total_price ??
-          raw.reservation?.price;
-        const hasValidPrice =
-          rawPrice !== undefined &&
-          rawPrice !== null &&
-          rawPrice !== '' &&
-          !isNaN(Number(rawPrice));
+        const authDetails =
+          functionRes.authoritative ||
+          extractAuthoritativeReservation(functionRes.data) ||
+          extractAuthoritativeReservation(functionRes.raw);
 
         // If any required authoritative reservation detail is missing or invalid:
         // Do NOT create a fictional or assumed confirmation. Display uncertain outcome and preserve key.
-        if (!referenceCode || !reservationId || !isValidStatus || !hasValidPrice) {
+        if (!authDetails) {
           setIsUncertainOutcome(true);
           setErrorMessage(
             'Booking status could not be verified: The booking service returned an incomplete or invalid reservation response. ' +
@@ -632,33 +669,22 @@ export const BookingPage: React.FC<BookingPageProps> = ({
           return;
         }
 
-        const reservationStatus: 'confirmed' | 'pending' = serverStatus as 'confirmed' | 'pending';
-        const price = Number(rawPrice);
-
-        // Server-provided hold expiration deadline only - NEVER calculate or invent a hold deadline
-        const holdExpiresAt =
-          d.hold_expires_at ||
-          d.holdExpiresAt ||
-          raw.hold_expires_at ||
-          raw.reservation?.hold_expires_at ||
-          null;
-
         const liveReservation: Reservation = {
-          id: reservationId,
-          referenceCode,
+          id: authDetails.reservationId,
+          referenceCode: authDetails.referenceCode,
           courtId: selectedCourt.id,
-          courtName: d.court_name || raw.court_name || raw.reservation?.court_name || selectedCourt.name,
-          date: d.booking_date || d.date || raw.reservation?.booking_date || selectedDate,
+          courtName: authDetails.courtName || selectedCourt.name,
+          date: authDetails.bookingDate || selectedDate,
           timeSlotId: selectedSlot.id,
-          timeSlotLabel: d.time_slot_label || raw.reservation?.time_slot_label || selectedSlot.label,
+          timeSlotLabel: authDetails.timeSlotLabel || selectedSlot.label,
           customerName: customerName.trim(),
           customerPhone: customerPhone.trim() || undefined,
           customerEmail: customerEmail.trim() || undefined,
-          price,
-          status: reservationStatus,
-          holdExpiresAt,
+          price: authDetails.price,
+          status: authDetails.status,
+          holdExpiresAt: authDetails.holdExpiresAt,
           isDemo: false,
-          createdAt: d.created_at || raw.reservation?.created_at || new Date().toISOString(),
+          createdAt: authDetails.createdAt || new Date().toISOString(),
         };
 
         try {
@@ -1198,7 +1224,7 @@ export const BookingPage: React.FC<BookingPageProps> = ({
                   <div className="relative inline-block">
                     <input
                       type="date"
-                      min={today}
+                      min={todayInTimezone}
                       value={selectedDate}
                       onChange={(e) => handleDateChange(e.target.value)}
                       className="px-3 py-1.5 text-xs font-semibold border border-slate-200 rounded-lg bg-slate-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 cursor-pointer"
@@ -1330,6 +1356,10 @@ export const BookingPage: React.FC<BookingPageProps> = ({
                     <span className="w-3 h-3 rounded bg-amber-100 border border-amber-300"></span>
                     <span>Maintenance Block</span>
                   </div>
+                  <div className="flex items-center gap-1.5">
+                    <span className="w-3 h-3 rounded bg-slate-100 border border-slate-200"></span>
+                    <span className="text-slate-500">Past / Started</span>
+                  </div>
                 </div>
 
                 {/* Grid of 1-Hour Slots */}
@@ -1348,11 +1378,15 @@ export const BookingPage: React.FC<BookingPageProps> = ({
                               ? 'bg-amber-50 border-amber-200 text-amber-800'
                               : avail.type === 'reserved'
                               ? 'bg-purple-50 border-purple-200 text-purple-800'
+                              : avail.type === 'past'
+                              ? 'bg-slate-100/75 border-slate-200/80 text-slate-400 opacity-65'
                               : 'bg-slate-100 border-slate-200 text-slate-500'
                           }`}
                         >
                           <div className="flex items-center justify-between text-xs font-semibold mb-1">
-                            <span>{slot.label.split('–')[0]}</span>
+                            <span className={avail.type === 'past' ? 'line-through text-slate-400' : ''}>
+                              {slot.label.split('–')[0]}
+                            </span>
                             {avail.type === 'blocked' ? (
                               <Wrench className="w-3 h-3 text-amber-600" />
                             ) : (
@@ -1360,6 +1394,8 @@ export const BookingPage: React.FC<BookingPageProps> = ({
                                 className={`text-[9px] px-1.5 py-0.5 rounded font-bold uppercase ${
                                   avail.type === 'reserved'
                                     ? 'bg-purple-200 text-purple-900'
+                                    : avail.type === 'past'
+                                    ? 'bg-slate-200 text-slate-500'
                                     : 'bg-slate-200 text-slate-700'
                                 }`}
                               >
@@ -1368,7 +1404,11 @@ export const BookingPage: React.FC<BookingPageProps> = ({
                             )}
                           </div>
                           <span className="text-[10px] block opacity-85 line-clamp-1">
-                            {avail.type === 'blocked' ? 'Maintenance Block' : avail.reason}
+                            {avail.type === 'blocked'
+                              ? 'Maintenance Block'
+                              : avail.type === 'past'
+                              ? 'Passed / Unavailable'
+                              : avail.reason}
                           </span>
                         </div>
                       );
