@@ -13,8 +13,10 @@ import {
   generateReservationRef,
   validateDatabaseConstraints,
   provisionDisposableCluster,
+  rollbackPartialCluster,
   teardownDisposableCluster,
   assertExactRunOwnership,
+  createMockAdminClient,
 } from '../fixtures/disposable-manager';
 
 /**
@@ -246,6 +248,56 @@ export async function runCrossTenantWriteIsolationSuite(): Promise<TestResult[]>
     }
     if (!protectedSlugCaught) throw new Error('Failed to catch protected seed slug violation.');
 
+    // 7. Offline Simulation: Failed delete operation must fail teardown and rollback
+    const failDeleteClient = createMockAdminClient({ deleteError: { message: 'Simulated delete permission failure' } });
+    const failDeleteReport = await teardownDisposableCluster(validMockCluster, failDeleteClient);
+    if (failDeleteReport.success || failDeleteReport.errors.length === 0) {
+      throw new Error('Teardown counted a failed delete as successful cleanup!');
+    }
+
+    let rollbackDeleteCaught = false;
+    try {
+      await rollbackPartialCluster(
+        { resIds: ['00000000-0000-0000-0000-000000000007'], memberIds: [], runId: testMockRunUuid },
+        failDeleteClient
+      );
+    } catch {
+      rollbackDeleteCaught = true;
+    }
+    if (!rollbackDeleteCaught) throw new Error('Rollback swallowed delete failure!');
+
+    // 8. Offline Simulation: Failed verification SELECT query must fail teardown and rollback
+    const failSelectClient = createMockAdminClient({ selectError: { message: 'Simulated query timeout on SELECT' } });
+    const failSelectReport = await teardownDisposableCluster(validMockCluster, failSelectClient);
+    if (failSelectReport.success || failSelectReport.errors.length === 0) {
+      throw new Error('Teardown counted a failed select query as successful cleanup!');
+    }
+
+    let rollbackSelectCaught = false;
+    try {
+      await rollbackPartialCluster(
+        { resIds: ['00000000-0000-0000-0000-000000000007'], memberIds: [], runId: testMockRunUuid },
+        failSelectClient
+      );
+    } catch {
+      rollbackSelectCaught = true;
+    }
+    if (!rollbackSelectCaught) throw new Error('Rollback swallowed select query failure!');
+
+    // 9. Offline Simulation: Un-deleted residual records must fail teardown and rollback
+    const residualClient = createMockAdminClient({ remainingRecords: [{ id: 'residual-record-001' }] });
+    const residualReport = await teardownDisposableCluster(validMockCluster, residualClient);
+    if (residualReport.success || residualReport.remainingRecords.length === 0) {
+      throw new Error('Teardown failed to detect residual records!');
+    }
+
+    // 10. Offline Simulation: Clean teardown returns success
+    const cleanClient = createMockAdminClient();
+    const cleanReport = await teardownDisposableCluster(validMockCluster, cleanClient);
+    if (!cleanReport.success || cleanReport.errors.length > 0 || cleanReport.remainingRecords.length > 0) {
+      throw new Error('Clean mock teardown unexpectedly reported failures!');
+    }
+
     results.push({
       id: 'write-iso-governance-guard',
       category,
@@ -253,7 +305,7 @@ export async function runCrossTenantWriteIsolationSuite(): Promise<TestResult[]>
       status: 'PASS',
       operationType: 'READ_ONLY',
       durationMs: Date.now() - tGov,
-      details: 'Offline verification verified: UUID runId, 13-char reference codes (within 5-20), currency (1-5), court hourly rate (>0), duration (30-480 min), hold_expires_at, and protected seed isolation pass.',
+      details: 'Offline verification verified: UUID runId, 13-char reference codes (within 5-20), currency (1-5), court hourly rate (>0), duration (30-480 min), hold_expires_at, protected seed isolation, and simulated delete/select failure handling pass.',
     });
   } catch (err: any) {
     results.push({

@@ -11,7 +11,7 @@ import { EXISTING_FIXTURES } from '../config';
  *    (e.g., 'TD-xxxxxxxx-P', 13 chars) strictly satisfy the database limit (5–20 chars).
  * 3. Does NOT require full 36-char textual UUID inside reservation reference codes.
  * 4. Cleanup targets ONLY exact database UUIDs recorded during the current run;
- *    never uses broad name or prefix matching.
+ *    never uses broad name, slug, or reference prefixes to select deletion targets.
  * 5. Complete constraint validation:
  *    - reservations.reference_code: 5–20 characters.
  *    - facilities.currency & reservations.currency: 1–5 characters.
@@ -20,8 +20,10 @@ import { EXISTING_FIXTURES } from '../config';
  *    - Reservation duration must be 30–480 minutes.
  *    - Court hourly_rate must be greater than zero (> 0).
  * 6. Partial-provisioning failures trigger verified cleanup of every created record.
- * 7. Positive confirmation that every disposable record was removed (zero residue).
- * 8. Strict authentication context verification for create_organization_with_owner(p_name, p_slug, p_billing_email, p_is_demo).
+ * 7. Inspects errors from every organization_members deletion operation.
+ * 8. Verifies that every recorded membership UUID has actually been removed.
+ * 9. Checks errors from every cleanup-verification SELECT query; unsuccessful queries never count as successful cleanup.
+ * 10. Preserves original provisioning errors and reports cleanup errors separately.
  */
 
 export interface DisposableOrganization {
@@ -269,7 +271,10 @@ export function assertExactRunOwnership(cluster: DisposableCluster, runId: strin
 /**
  * Rollback helper for partially provisioned clusters.
  * Targets ONLY exact recorded UUIDs.
- * Positively confirms deletion and throws an explicit error if any record remains.
+ * - Inspects errors from every organization_members deletion operation.
+ * - Checks errors from every cleanup-verification SELECT query (unsuccessful queries fail cleanup).
+ * - Positively confirms that every recorded membership, reservation, court, facility, and org UUID is gone.
+ * - Never silently swallows any cleanup error.
  */
 export async function rollbackPartialCluster(
   partial: {
@@ -320,39 +325,117 @@ export async function rollbackPartialCluster(
   }
 
   // 4. Delete exact recorded membership and organization UUIDs
-  const orgIds = [partial.orgAId, partial.orgBId].filter(Boolean) as string[];
-  if (orgIds.length > 0 || partial.memberIds.length > 0) {
+  // Inspect errors from EVERY organization_members deletion operation!
+  if (partial.memberIds.length > 0) {
     try {
-      if (partial.memberIds.length > 0) {
-        await adminClient.from('organization_members').delete().in('id', partial.memberIds);
+      const { error: errMemberIds } = await adminClient
+        .from('organization_members')
+        .delete()
+        .in('id', partial.memberIds);
+      if (errMemberIds) {
+        rollbackErrors.push(`Failed to delete organization members by exact id in rollback: ${errMemberIds.message}`);
       }
-      if (orgIds.length > 0) {
-        await adminClient.from('organization_members').delete().in('organization_id', orgIds);
-        const { error } = await adminClient.from('organizations').delete().in('id', orgIds);
-        if (error) rollbackErrors.push(`Failed to delete organizations in rollback: ${error.message}`);
+    } catch (err: any) {
+      rollbackErrors.push(`Exception deleting organization members by id in rollback: ${err?.message || String(err)}`);
+    }
+  }
+
+  const orgIds = [partial.orgAId, partial.orgBId].filter(Boolean) as string[];
+  if (orgIds.length > 0) {
+    try {
+      const { error: errMembersByOrg } = await adminClient
+        .from('organization_members')
+        .delete()
+        .in('organization_id', orgIds);
+      if (errMembersByOrg) {
+        rollbackErrors.push(`Failed to delete organization members by organization_id in rollback: ${errMembersByOrg.message}`);
+      }
+
+      const { error: errOrgs } = await adminClient
+        .from('organizations')
+        .delete()
+        .in('id', orgIds);
+      if (errOrgs) {
+        rollbackErrors.push(`Failed to delete organizations in rollback: ${errOrgs.message}`);
       }
     } catch (err: any) {
       rollbackErrors.push(`Exception deleting organizations in rollback: ${err?.message || String(err)}`);
     }
   }
 
-  // 5. Positive verification that every created record was actually removed
+  // 5. Positive verification: Check errors from EVERY cleanup-verification SELECT query.
+  // An unsuccessful query must never count as successful cleanup!
   const remainingResiduals: string[] = [];
+
   if (partial.resIds.length > 0) {
-    const { data: remRes } = await adminClient.from('reservations').select('id').in('id', partial.resIds);
-    if (remRes && remRes.length > 0) remRes.forEach((r) => remainingResiduals.push(`reservation:${r.id}`));
+    const { data: remRes, error: errRemRes } = await adminClient
+      .from('reservations')
+      .select('id')
+      .in('id', partial.resIds);
+    if (errRemRes) {
+      rollbackErrors.push(`Cleanup verification query failed for reservations: ${errRemRes.message}`);
+    } else if (remRes && remRes.length > 0) {
+      remRes.forEach((r) => remainingResiduals.push(`reservation:${r.id}`));
+    }
   }
+
   if (courtIds.length > 0) {
-    const { data: remCourts } = await adminClient.from('courts').select('id').in('id', courtIds);
-    if (remCourts && remCourts.length > 0) remCourts.forEach((c) => remainingResiduals.push(`court:${c.id}`));
+    const { data: remCourts, error: errRemCourts } = await adminClient
+      .from('courts')
+      .select('id')
+      .in('id', courtIds);
+    if (errRemCourts) {
+      rollbackErrors.push(`Cleanup verification query failed for courts: ${errRemCourts.message}`);
+    } else if (remCourts && remCourts.length > 0) {
+      remCourts.forEach((c) => remainingResiduals.push(`court:${c.id}`));
+    }
   }
+
   if (facIds.length > 0) {
-    const { data: remFacs } = await adminClient.from('facilities').select('id').in('id', facIds);
-    if (remFacs && remFacs.length > 0) remFacs.forEach((f) => remainingResiduals.push(`facility:${f.id}`));
+    const { data: remFacs, error: errRemFacs } = await adminClient
+      .from('facilities')
+      .select('id')
+      .in('id', facIds);
+    if (errRemFacs) {
+      rollbackErrors.push(`Cleanup verification query failed for facilities: ${errRemFacs.message}`);
+    } else if (remFacs && remFacs.length > 0) {
+      remFacs.forEach((f) => remainingResiduals.push(`facility:${f.id}`));
+    }
   }
+
+  // Verify that every recorded membership UUID has actually been removed
+  if (partial.memberIds.length > 0) {
+    const { data: remMembers, error: errRemMembers } = await adminClient
+      .from('organization_members')
+      .select('id')
+      .in('id', partial.memberIds);
+    if (errRemMembers) {
+      rollbackErrors.push(`Cleanup verification query failed for organization members by id: ${errRemMembers.message}`);
+    } else if (remMembers && remMembers.length > 0) {
+      remMembers.forEach((m) => remainingResiduals.push(`member:${m.id}`));
+    }
+  }
+
   if (orgIds.length > 0) {
-    const { data: remOrgs } = await adminClient.from('organizations').select('id').in('id', orgIds);
-    if (remOrgs && remOrgs.length > 0) remOrgs.forEach((o) => remainingResiduals.push(`org:${o.id}`));
+    const { data: remOrgMembers, error: errRemOrgMembers } = await adminClient
+      .from('organization_members')
+      .select('id')
+      .in('organization_id', orgIds);
+    if (errRemOrgMembers) {
+      rollbackErrors.push(`Cleanup verification query failed for organization members by org_id: ${errRemOrgMembers.message}`);
+    } else if (remOrgMembers && remOrgMembers.length > 0) {
+      remOrgMembers.forEach((m) => remainingResiduals.push(`member:${m.id}`));
+    }
+
+    const { data: remOrgs, error: errRemOrgs } = await adminClient
+      .from('organizations')
+      .select('id')
+      .in('id', orgIds);
+    if (errRemOrgs) {
+      rollbackErrors.push(`Cleanup verification query failed for organizations: ${errRemOrgs.message}`);
+    } else if (remOrgs && remOrgs.length > 0) {
+      remOrgs.forEach((o) => remainingResiduals.push(`org:${o.id}`));
+    }
   }
 
   if (remainingResiduals.length > 0) {
@@ -377,6 +460,7 @@ export async function rollbackPartialCluster(
  * - Requires verified authentication context on clientA and clientB for create_organization_with_owner.
  * - Requires trusted server-side admin client (service-role) for reservation seeding and exact-UUID teardown.
  * - If any creation or reservation insert fails, aborts immediately and performs verified rollback.
+ * - Preserves original provisioning errors and reports cleanup errors separately.
  */
 export async function provisionDisposableCluster(
   runId: string,
@@ -430,12 +514,15 @@ export async function provisionDisposableCluster(
     orgAId = orgAResult;
 
     // Record created membership ID for Org A
-    const { data: memberAData } = await adminClient
+    const { data: memberAData, error: errMemberA } = await adminClient
       .from('organization_members')
       .select('id')
       .eq('organization_id', orgAId)
       .eq('user_id', userAData.user.id)
       .single();
+    if (errMemberA) {
+      throw new Error(`Failed to record membership for Org A: ${errMemberA.message}`);
+    }
     if (memberAData?.id) memberIds.push(memberAData.id);
 
     // 3. User B creates Disposable Org B via create_organization_with_owner(p_name, p_slug, p_billing_email, p_is_demo)
@@ -451,12 +538,15 @@ export async function provisionDisposableCluster(
     orgBId = orgBResult;
 
     // Record created membership ID for Org B
-    const { data: memberBData } = await adminClient
+    const { data: memberBData, error: errMemberB } = await adminClient
       .from('organization_members')
       .select('id')
       .eq('organization_id', orgBId)
       .eq('user_id', userBData.user.id)
       .single();
+    if (errMemberB) {
+      throw new Error(`Failed to record membership for Org B: ${errMemberB.message}`);
+    }
     if (memberBData?.id) memberIds.push(memberBData.id);
 
     // 4. User A creates Disposable Facility A
@@ -628,11 +718,26 @@ export async function provisionDisposableCluster(
     assertExactRunOwnership(cluster, runId);
     return cluster;
   } catch (err: any) {
-    // Abort provisioning immediately and trigger verified cleanup of all partially created records
-    await rollbackPartialCluster(
-      { orgAId, orgBId, facAId, facBId, courtAId, courtBId, resIds, memberIds, runId },
-      adminClient
-    );
+    // Preserve the original provisioning error and report any cleanup errors separately
+    let cleanupErr: any = null;
+    try {
+      await rollbackPartialCluster(
+        { orgAId, orgBId, facAId, facBId, courtAId, courtBId, resIds, memberIds, runId },
+        adminClient
+      );
+    } catch (cErr: any) {
+      cleanupErr = cErr;
+    }
+
+    if (cleanupErr) {
+      const combined = new Error(
+        `Provisioning failed: ${err?.message || String(err)} | Cleanup error: ${cleanupErr?.message || String(cleanupErr)}`
+      );
+      (combined as any).originalProvisioningError = err;
+      (combined as any).cleanupError = cleanupErr;
+      throw combined;
+    }
+
     throw err;
   }
 }
@@ -650,8 +755,8 @@ export async function provisionDisposableCluster(
  * 4. Organization Memberships (exact recorded UUIDs and org IDs)
  * 5. Organizations (exact recorded UUIDs)
  *
- * Queries the database using adminClient (bypassing RLS) to positively confirm
- * that every disposable record was completely removed.
+ * Checks errors from every cleanup-verification query:
+ * An unsuccessful query never counts as successful cleanup.
  */
 export async function teardownDisposableCluster(
   cluster: DisposableCluster,
@@ -783,21 +888,31 @@ export async function teardownDisposableCluster(
   const orgIds = [cluster.orgA.id, cluster.orgB.id];
   const memberIds = [cluster.memberAId, cluster.memberBId].filter(Boolean) as string[];
 
-  try {
-    if (memberIds.length > 0) {
-      const { count } = await adminClient
+  // Inspect errors from every organization_members deletion operation
+  if (memberIds.length > 0) {
+    try {
+      const { count, error: errMemberIds } = await adminClient
         .from('organization_members')
         .delete({ count: 'exact' })
         .in('id', memberIds);
-      report.deletedMembers += count ?? 0;
+      if (errMemberIds) {
+        report.errors.push(`Failed to delete organization members by exact id: ${errMemberIds.message}`);
+      } else {
+        report.deletedMembers += count ?? 0;
+      }
+    } catch (err: any) {
+      report.errors.push(`Exception deleting organization members by id: ${err?.message || String(err)}`);
     }
-    const { count, error } = await adminClient
+  }
+
+  try {
+    const { count, error: errOrgMembers } = await adminClient
       .from('organization_members')
       .delete({ count: 'exact' })
       .in('organization_id', orgIds);
 
-    if (error) {
-      report.errors.push(`Failed to delete organization members: ${error.message}`);
+    if (errOrgMembers) {
+      report.errors.push(`Failed to delete organization members by organization_id: ${errOrgMembers.message}`);
     } else {
       report.deletedMembers += count ?? 0;
     }
@@ -805,14 +920,28 @@ export async function teardownDisposableCluster(
     report.errors.push(`Exception deleting organization members: ${err?.message || String(err)}`);
   }
 
-  // Positive confirmation: Verify memberships are gone
+  // Positive confirmation: Verify memberships are gone by both exact member IDs and org IDs
+  if (memberIds.length > 0) {
+    const { data: remMembersById, error: errRemMembersById } = await adminClient
+      .from('organization_members')
+      .select('id')
+      .in('id', memberIds);
+
+    if (errRemMembersById) {
+      report.errors.push(`Verification query failed for memberships by exact id: ${errRemMembersById.message}`);
+    } else if (remMembersById && remMembersById.length > 0) {
+      report.success = false;
+      remMembersById.forEach((m) => report.remainingRecords.push(`member:${m.id}`));
+    }
+  }
+
   const { data: remMembers, error: errRemMembers } = await adminClient
     .from('organization_members')
     .select('id')
     .in('organization_id', orgIds);
 
   if (errRemMembers) {
-    report.errors.push(`Verification query failed for memberships: ${errRemMembers.message}`);
+    report.errors.push(`Verification query failed for memberships by org_id: ${errRemMembers.message}`);
   } else if (remMembers && remMembers.length > 0) {
     report.success = false;
     remMembers.forEach((m) => report.remainingRecords.push(`member:${m.id}`));
@@ -852,4 +981,35 @@ export async function teardownDisposableCluster(
   }
 
   return report;
+}
+
+/**
+ * Creates an offline mock admin client to simulate failure scenarios:
+ * - Failed deletes
+ * - Failed verification queries
+ * - Remaining residual records
+ */
+export function createMockAdminClient(options?: {
+  deleteError?: { message: string };
+  selectError?: { message: string };
+  remainingRecords?: any[];
+}): SupabaseClient {
+  const handler = {
+    delete: (_opts?: any) => ({
+      in: async (_col: string, ids: any[]) => ({
+        count: options?.deleteError ? 0 : ids.length,
+        error: options?.deleteError || null,
+      }),
+    }),
+    select: (_cols?: any) => ({
+      in: async (_col: string, _ids: any[]) => ({
+        data: options?.selectError ? null : (options?.remainingRecords || []),
+        error: options?.selectError || null,
+      }),
+    }),
+  };
+
+  return {
+    from: (_table: string) => handler,
+  } as unknown as SupabaseClient;
 }
