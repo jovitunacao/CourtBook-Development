@@ -139,9 +139,9 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     }
 
     if (result.needsEmailVerification) {
-      // Supabase email confirmation required
+      // Supabase email confirmation: privacy-preserving generic message compatible with Supabase GoTrue
       setVerificationNotice(
-        `Registration received for ${cleanEmail}! Please check your email inbox to verify your address before signing in.`
+        `Registration request received. If an account can be created for ${cleanEmail}, a verification link has been sent. Please check your inbox to confirm your email, or proceed to Sign In if you already have an account.`
       );
       setPassword('');
       setConfirmPassword('');

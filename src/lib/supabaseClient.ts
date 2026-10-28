@@ -515,6 +515,22 @@ export async function fetchStaffMembershipLookup(
       chosenFacility = availableFacilities[0];
     }
 
+    // If user has organization memberships but no facilities exist, report incomplete workspace error
+    if (allFacilities.length === 0 || !chosenFacility) {
+      return {
+        data: {
+          userOrganizations,
+          activeOrganization: activeOrg,
+          activeRole,
+          activeFacility: null,
+          availableFacilities: [],
+          courts: [],
+        },
+        hasMemberships: true,
+        error: `Organization "${activeOrg.name}" has no registered facilities. Facility configuration is required.`,
+      };
+    }
+
     // 4. Fetch courts for the active facility
     let courts: SupabaseCourt[] = [];
     if (chosenFacility) {
@@ -525,7 +541,12 @@ export async function fetchStaffMembershipLookup(
         .order('display_order', { ascending: true });
 
       if (courtErr) {
-        console.warn('Database error querying courts for facility:', courtErr.message);
+        console.error('Database error querying courts for facility:', courtErr.message);
+        return {
+          data: null,
+          hasMemberships: true,
+          error: `Failed to load courts for facility "${chosenFacility.name}": ${courtErr.message}`,
+        };
       } else if (courtRows) {
         courts = courtRows as SupabaseCourt[];
       }
@@ -536,7 +557,7 @@ export async function fetchStaffMembershipLookup(
         userOrganizations,
         activeOrganization: activeOrg,
         activeRole,
-        activeFacility: chosenFacility || null,
+        activeFacility: chosenFacility,
         availableFacilities,
         courts,
       },

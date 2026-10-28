@@ -238,17 +238,32 @@ export const SupabaseAuthProvider: React.FC<{ children: React.ReactNode }> = ({ 
           return;
         }
 
-        // Query succeeded with >= 1 memberships -> ready
+        // Validate that required facility exists (incomplete workspace must not be treated as ready)
+        if (!lookup.data.activeFacility) {
+          setStaffData(lookup.data);
+          setSupabaseReservations([]);
+          setMembershipLookupError(
+            `Organization "${lookup.data.activeOrganization?.name || 'Selected'}" has no active facility configured.`
+          );
+          setOnboardingState('error');
+          return;
+        }
+
+        // Query succeeded with >= 1 memberships and valid active facility -> ready
         setStaffData(lookup.data);
         setMembershipLookupError(null);
         setOnboardingState('ready');
 
-        if (lookup.data.activeFacility) {
+        try {
           const reservations = await fetchFacilityReservations(lookup.data.activeFacility.id);
           // Set live Supabase reservations (remains [] if facility has 0 reservations)
           setSupabaseReservations(mapSupabaseRowsToReservations(reservations, lookup.data.courts));
-        } else {
-          setSupabaseReservations([]);
+        } catch (resErr: any) {
+          console.error('Failed to load reservations for active facility:', resErr);
+          setMembershipLookupError(
+            `Failed to load facility reservations: ${resErr?.message || 'Database error'}`
+          );
+          setOnboardingState('error');
         }
       } catch (err: any) {
         console.error('Failed to load staff data:', err);
@@ -407,25 +422,29 @@ export const SupabaseAuthProvider: React.FC<{ children: React.ReactNode }> = ({ 
         password,
       });
 
-      if (error) {
-        let msg = error.message;
-        if (
-          msg.toLowerCase().includes('already registered') ||
-          msg.toLowerCase().includes('already exists') ||
-          msg.toLowerCase().includes('user already has an account')
-        ) {
-          msg = 'An account with this email address already exists. Please sign in instead.';
-        }
-        setAuthError(msg);
-        return { success: false, sessionCreated: false, error: msg };
-      }
+      const isDuplicateError = error && (
+        error.message.toLowerCase().includes('already registered') ||
+        error.message.toLowerCase().includes('already exists') ||
+        error.message.toLowerCase().includes('user already has an account')
+      );
 
       // Supabase GoTrue with user enumeration protection returns data.user with empty identities if already registered
       const identities = data?.user?.identities;
-      if (identities && identities.length === 0) {
-        const msg = 'An account with this email address already exists. Please sign in instead.';
-        setAuthError(msg);
-        return { success: false, sessionCreated: false, error: msg };
+      const isDuplicateIdentity = identities && identities.length === 0;
+
+      if (isDuplicateError || isDuplicateIdentity) {
+        // Privacy-preserving: Do not disclose whether this email address is already registered.
+        // Return a generic response indicating a confirmation message is sent if eligible.
+        return {
+          success: true,
+          sessionCreated: false,
+          needsEmailVerification: true,
+        };
+      }
+
+      if (error) {
+        setAuthError(error.message);
+        return { success: false, sessionCreated: false, error: error.message };
       }
 
       if (data?.session && data.user) {
