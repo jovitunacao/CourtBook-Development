@@ -17,6 +17,7 @@ import {
   SupabaseFacility,
   SupabaseCourt,
   SupabaseReservationRow,
+  FacilityReservationsResult,
 } from '../lib/supabaseClient';
 import { FacilitySettings, Reservation } from '../types/booking';
 
@@ -249,22 +250,27 @@ export const SupabaseAuthProvider: React.FC<{ children: React.ReactNode }> = ({ 
           return;
         }
 
-        // Query succeeded with >= 1 memberships and valid active facility -> ready
-        setStaffData(lookup.data);
-        setMembershipLookupError(null);
-        setOnboardingState('ready');
+        // Query reservations for active facility BEFORE declaring workspace ready
+        const resResult = await fetchFacilityReservations(lookup.data.activeFacility.id);
 
-        try {
-          const reservations = await fetchFacilityReservations(lookup.data.activeFacility.id);
-          // Set live Supabase reservations (remains [] if facility has 0 reservations)
-          setSupabaseReservations(mapSupabaseRowsToReservations(reservations, lookup.data.courts));
-        } catch (resErr: any) {
-          console.error('Failed to load reservations for active facility:', resErr);
+        if (resResult.error) {
+          console.error('Failed to load reservations for active facility:', resResult.error);
+          setStaffData(lookup.data);
+          setSupabaseReservations([]);
           setMembershipLookupError(
-            `Failed to load facility reservations: ${resErr?.message || 'Database error'}`
+            `Failed to load facility reservations: ${resResult.error}`
           );
           setOnboardingState('error');
+          return;
         }
+
+        // All required workspace data (organization, facility, courts, and reservations query)
+        // successfully loaded without error -> set workspace ready!
+        // Legitimate organizations with zero reservations (resResult.data is []) are preserved as valid, ready workspaces.
+        setStaffData(lookup.data);
+        setSupabaseReservations(mapSupabaseRowsToReservations(resResult.data, lookup.data.courts));
+        setMembershipLookupError(null);
+        setOnboardingState('ready');
       } catch (err: any) {
         console.error('Failed to load staff data:', err);
         setStaffData(null);
@@ -575,8 +581,10 @@ export const SupabaseAuthProvider: React.FC<{ children: React.ReactNode }> = ({ 
     const res = await cancelReservationViaRpc(id, reason);
     if (res.success) {
       // Refresh reservations for the active facility
-      const freshRows = await fetchFacilityReservations(staffData.activeFacility.id);
-      setSupabaseReservations(mapSupabaseRowsToReservations(freshRows, staffData.courts));
+      const freshResult = await fetchFacilityReservations(staffData.activeFacility.id);
+      if (!freshResult.error) {
+        setSupabaseReservations(mapSupabaseRowsToReservations(freshResult.data, staffData.courts));
+      }
     }
     return res;
   };
@@ -598,8 +606,10 @@ export const SupabaseAuthProvider: React.FC<{ children: React.ReactNode }> = ({ 
 
     const res = await approveBookingRequestViaRpc(id, notes);
     if (res.success) {
-      const freshRows = await fetchFacilityReservations(staffData.activeFacility.id);
-      setSupabaseReservations(mapSupabaseRowsToReservations(freshRows, staffData.courts));
+      const freshResult = await fetchFacilityReservations(staffData.activeFacility.id);
+      if (!freshResult.error) {
+        setSupabaseReservations(mapSupabaseRowsToReservations(freshResult.data, staffData.courts));
+      }
     }
     return res;
   };
@@ -621,8 +631,10 @@ export const SupabaseAuthProvider: React.FC<{ children: React.ReactNode }> = ({ 
 
     const res = await declineBookingRequestViaRpc(id, reason);
     if (res.success) {
-      const freshRows = await fetchFacilityReservations(staffData.activeFacility.id);
-      setSupabaseReservations(mapSupabaseRowsToReservations(freshRows, staffData.courts));
+      const freshResult = await fetchFacilityReservations(staffData.activeFacility.id);
+      if (!freshResult.error) {
+        setSupabaseReservations(mapSupabaseRowsToReservations(freshResult.data, staffData.courts));
+      }
     }
     return res;
   };

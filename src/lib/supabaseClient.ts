@@ -587,20 +587,49 @@ export async function fetchAuthenticatedStaffData(
   return result.data;
 }
 
+export interface FacilityReservationsResult {
+  data: SupabaseReservationRow[];
+  error: string | null;
+}
+
 /**
  * Fetches reservations for a given facility via Supabase.
  * Allowed ONLY for authenticated staff members through RLS policy `staff_can_view_facility_reservations`.
+ * Returns an explicit error object when query fails rather than silently returning an empty array.
  */
 export async function fetchFacilityReservations(
   facilityId: string
-): Promise<SupabaseReservationRow[]> {
-  if (!supabase || !isValidUuid(facilityId)) return [];
+): Promise<FacilityReservationsResult> {
+  if (!supabase) {
+    return {
+      data: [],
+      error: 'Supabase client is not initialized',
+    };
+  }
+
+  if (!isValidUuid(facilityId)) {
+    return {
+      data: [],
+      error: `Invalid facility ID: ${facilityId}`,
+    };
+  }
 
   try {
-    const { data: sessionData } = await supabase.auth.getSession();
+    const { data: sessionData, error: sessionErr } = await supabase.auth.getSession();
+    if (sessionErr) {
+      console.warn('Could not verify session for reservation query:', sessionErr.message);
+      return {
+        data: [],
+        error: `Session verification error: ${sessionErr.message}`,
+      };
+    }
+
     if (!sessionData?.session?.user) {
       // Must be authenticated to view private reservation records
-      return [];
+      return {
+        data: [],
+        error: 'Authentication required to view facility reservations.',
+      };
     }
 
     const { data, error } = await supabase
@@ -610,14 +639,23 @@ export async function fetchFacilityReservations(
       .order('start_time', { ascending: false });
 
     if (error) {
-      console.warn('Could not fetch reservations for facility:', facilityId, error.message);
-      return [];
+      console.error('Database error querying reservations for facility:', facilityId, error.message);
+      return {
+        data: [],
+        error: error.message,
+      };
     }
 
-    return (data as SupabaseReservationRow[]) || [];
-  } catch (err) {
-    console.error('Failed to fetch reservations from Supabase:', err);
-    return [];
+    return {
+      data: (data as SupabaseReservationRow[]) || [],
+      error: null,
+    };
+  } catch (err: any) {
+    console.error('Unexpected exception querying reservations from Supabase:', err);
+    return {
+      data: [],
+      error: err?.message || 'Unexpected failure loading reservations',
+    };
   }
 }
 
