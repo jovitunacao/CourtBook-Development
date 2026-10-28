@@ -27,6 +27,7 @@ export const SupabaseStatusBanner: React.FC<SupabaseStatusBannerProps> = ({
     user,
     session,
     staffData,
+    onboardingState,
     isDemoSession,
     demoProfile,
     signOut,
@@ -35,10 +36,15 @@ export const SupabaseStatusBanner: React.FC<SupabaseStatusBannerProps> = ({
   } = useSupabaseAuth();
 
   const isAuthenticated = Boolean(user || isDemoSession);
+  const isNeedsOnboarding = Boolean(user && onboardingState === 'needs_onboarding');
   const email = user?.email || demoProfile?.email;
-  const role = staffData?.activeRole || demoProfile?.role || 'staff';
-  const orgName = staffData?.activeOrganization?.name || demoProfile?.orgName;
-  const orgSlug = staffData?.activeOrganization?.slug || demoProfile?.orgSlug;
+  const role = isNeedsOnboarding
+    ? 'Owner (Setup Needed)'
+    : staffData?.activeRole || demoProfile?.role || 'staff';
+  const orgName = isNeedsOnboarding
+    ? 'No Organization Configured'
+    : staffData?.activeOrganization?.name || demoProfile?.orgName;
+  const orgSlug = isNeedsOnboarding ? null : staffData?.activeOrganization?.slug || demoProfile?.orgSlug;
   const facilityName = staffData?.activeFacility?.name || demoProfile?.facilityName;
 
   if (compact) {
@@ -46,12 +52,22 @@ export const SupabaseStatusBanner: React.FC<SupabaseStatusBannerProps> = ({
       return (
         <div className="flex items-center gap-2 text-xs">
           <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-50 text-emerald-800 border border-emerald-200">
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+            <span
+              className={`w-1.5 h-1.5 rounded-full ${
+                isNeedsOnboarding ? 'bg-amber-500' : 'bg-emerald-500 animate-pulse'
+              }`}
+            ></span>
             <span className="font-bold truncate max-w-[140px] sm:max-w-[200px]">
-              {orgName || email}
+              {isNeedsOnboarding ? (email || 'Owner Account') : (orgName || email)}
             </span>
-            <span className="text-[10px] uppercase font-extrabold px-1 py-0.2 rounded bg-emerald-200/70 text-emerald-900">
-              {role}
+            <span
+              className={`text-[10px] uppercase font-extrabold px-1 py-0.2 rounded ${
+                isNeedsOnboarding
+                  ? 'bg-amber-200/80 text-amber-900'
+                  : 'bg-emerald-200/70 text-emerald-900'
+              }`}
+            >
+              {isNeedsOnboarding ? 'Setup Needed' : role}
             </span>
           </div>
           <button
@@ -113,7 +129,13 @@ export const SupabaseStatusBanner: React.FC<SupabaseStatusBannerProps> = ({
                 {isConfigured ? 'BookSuite-Dev (Live)' : 'Local / Demo Mode'}
               </span>
               {isAuthenticated && (
-                <span className="text-[10px] font-bold uppercase px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 border border-blue-200">
+                <span
+                  className={`text-[10px] font-bold uppercase px-2 py-0.5 rounded-full border ${
+                    isNeedsOnboarding
+                      ? 'bg-amber-50 text-amber-700 border-amber-200'
+                      : 'bg-blue-50 text-blue-700 border-blue-200'
+                  }`}
+                >
                   Role: {role}
                 </span>
               )}
@@ -123,7 +145,7 @@ export const SupabaseStatusBanner: React.FC<SupabaseStatusBannerProps> = ({
               {isAuthenticated ? (
                 <>
                   <h3 className="text-base sm:text-lg font-extrabold text-slate-900">
-                    {orgName || 'Authorized Facility'}
+                    {orgName}
                   </h3>
                   {orgSlug && (
                     <span className="text-xs font-mono text-slate-600 bg-slate-100 px-1.5 py-0.5 rounded">

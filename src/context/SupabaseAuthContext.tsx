@@ -3,6 +3,7 @@ import { User, Session } from '@supabase/supabase-js';
 import {
   supabase,
   isSupabaseConfigured,
+  fetchStaffMembershipLookup,
   fetchAuthenticatedStaffData,
   fetchFacilityReservations,
   cancelReservationViaRpc,
@@ -12,11 +13,14 @@ import {
   fetchPublicFacilities,
   fetchPublicCourts,
   StaffMembershipData,
+  StaffLookupResult,
   SupabaseFacility,
   SupabaseCourt,
   SupabaseReservationRow,
 } from '../lib/supabaseClient';
 import { FacilitySettings, Reservation } from '../types/booking';
+
+export type OnboardingState = 'loading' | 'needs_onboarding' | 'ready' | 'error';
 
 export interface DemoAccountProfile {
   email: string;
@@ -55,6 +59,8 @@ export const FICTIONAL_ACCOUNTS: Record<'user_a' | 'user_b', DemoAccountProfile>
 interface SupabaseAuthContextType {
   isConfigured: boolean;
   isLoading: boolean;
+  onboardingState: OnboardingState;
+  membershipLookupError: string | null;
   user: User | null;
   session: Session | null;
   staffData: StaffMembershipData | null;
@@ -64,6 +70,15 @@ interface SupabaseAuthContextType {
   isUsingSupabaseData: boolean;
   authError: string | null;
   signIn: (email: string, password: string) => Promise<{ success: boolean; error?: string }>;
+  signUp: (
+    email: string,
+    password: string
+  ) => Promise<{
+    success: boolean;
+    sessionCreated: boolean;
+    needsEmailVerification?: boolean;
+    error?: string;
+  }>;
   signOut: () => Promise<void>;
   simulateDemoSignIn: (account: 'user_a' | 'user_b') => void;
   clearAuthError: () => void;
@@ -144,6 +159,8 @@ function mapFacilityToSettings(
 
 export const SupabaseAuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [onboardingState, setOnboardingState] = useState<OnboardingState>('ready');
+  const [membershipLookupError, setMembershipLookupError] = useState<string | null>(null);
   const [user, setUser] = useState<User | null>(null);
   const [session, setSession] = useState<Session | null>(null);
   const [staffData, setStaffData] = useState<StaffMembershipData | null>(null);
@@ -193,22 +210,52 @@ export const SupabaseAuthProvider: React.FC<{ children: React.ReactNode }> = ({ 
   }, []);
 
   // Load real Supabase staff data for an authenticated user
+  // Strictly complies with Requirement 7:
+  // Determine needs_onboarding ONLY after successful authenticated membership lookup confirms the user has no organization membership (0 rows).
+  // Never infer it solely from staffData === null (if query fails/errors, state must be 'error').
   const loadStaffDataForUser = useCallback(
     async (userId: string, preferredOrgId?: string, preferredFacilityId?: string) => {
+      setOnboardingState('loading');
+      setMembershipLookupError(null);
       try {
-        const data = await fetchAuthenticatedStaffData(userId, preferredOrgId, preferredFacilityId);
-        setStaffData(data);
-        if (data && data.activeFacility) {
-          const reservations = await fetchFacilityReservations(data.activeFacility.id);
+        const lookup = await fetchStaffMembershipLookup(userId, preferredOrgId, preferredFacilityId);
+
+        if (lookup.error) {
+          console.error('Membership lookup failed for user:', userId, lookup.error);
+          setStaffData(null);
+          setSupabaseReservations([]);
+          setMembershipLookupError(lookup.error);
+          setOnboardingState('error');
+          return;
+        }
+
+        if (!lookup.hasMemberships || !lookup.data) {
+          // Query succeeded with 0 memberships -> strictly confirmed needs_onboarding
+          setStaffData(null);
+          setSupabaseReservations([]);
+          setMembershipLookupError(null);
+          setOnboardingState('needs_onboarding');
+          return;
+        }
+
+        // Query succeeded with >= 1 memberships -> ready
+        setStaffData(lookup.data);
+        setMembershipLookupError(null);
+        setOnboardingState('ready');
+
+        if (lookup.data.activeFacility) {
+          const reservations = await fetchFacilityReservations(lookup.data.activeFacility.id);
           // Set live Supabase reservations (remains [] if facility has 0 reservations)
-          setSupabaseReservations(mapSupabaseRowsToReservations(reservations, data.courts));
+          setSupabaseReservations(mapSupabaseRowsToReservations(reservations, lookup.data.courts));
         } else {
           setSupabaseReservations([]);
         }
-      } catch (err) {
+      } catch (err: any) {
         console.error('Failed to load staff data:', err);
         setStaffData(null);
         setSupabaseReservations([]);
+        setMembershipLookupError(err?.message || 'Failed to verify organization membership');
+        setOnboardingState('error');
       }
     },
     []
@@ -228,15 +275,19 @@ export const SupabaseAuthProvider: React.FC<{ children: React.ReactNode }> = ({ 
         const { data: sessionData, error } = await supabase.auth.getSession();
         if (error) {
           console.warn('Error reading stored session:', error);
+          if (isMounted) setOnboardingState('ready');
         } else if (sessionData?.session) {
           if (isMounted) {
             setSession(sessionData.session);
             setUser(sessionData.session.user);
             await loadStaffDataForUser(sessionData.session.user.id);
           }
+        } else {
+          if (isMounted) setOnboardingState('ready');
         }
       } catch (err) {
         console.error('Auth initialization error:', err);
+        if (isMounted) setOnboardingState('ready');
       } finally {
         if (isMounted) setIsLoading(false);
       }
@@ -259,6 +310,8 @@ export const SupabaseAuthProvider: React.FC<{ children: React.ReactNode }> = ({ 
           } else {
             setStaffData(null);
             setSupabaseReservations([]);
+            setOnboardingState('ready');
+            setMembershipLookupError(null);
           }
         }
       );
@@ -299,7 +352,7 @@ export const SupabaseAuthProvider: React.FC<{ children: React.ReactNode }> = ({ 
         return { success: false, error: error.message };
       }
 
-      if (data.session) {
+      if (data.session && data.user) {
         setSession(data.session);
         setUser(data.user);
         setIsDemoSession(false);
@@ -312,6 +365,86 @@ export const SupabaseAuthProvider: React.FC<{ children: React.ReactNode }> = ({ 
       const msg = err.message || 'An unexpected error occurred during sign-in.';
       setAuthError(msg);
       return { success: false, error: msg };
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Real Supabase sign up for prospective court owners (Phase 3 Stage 3.2)
+  const signUp = async (
+    email: string,
+    password: string
+  ): Promise<{
+    success: boolean;
+    sessionCreated: boolean;
+    needsEmailVerification?: boolean;
+    error?: string;
+  }> => {
+    setAuthError(null);
+    if (!isSupabaseConfigured || !supabase) {
+      const err = 'Supabase credentials are not configured in this environment.';
+      setAuthError(err);
+      return { success: false, sessionCreated: false, error: err };
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+    if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      const err = 'Please enter a valid email address.';
+      setAuthError(err);
+      return { success: false, sessionCreated: false, error: err };
+    }
+
+    if (!password || password.length < 8) {
+      const err = 'Password must be at least 8 characters long.';
+      setAuthError(err);
+      return { success: false, sessionCreated: false, error: err };
+    }
+
+    setIsLoading(true);
+    try {
+      const { data, error } = await supabase.auth.signUp({
+        email: cleanEmail,
+        password,
+      });
+
+      if (error) {
+        let msg = error.message;
+        if (
+          msg.toLowerCase().includes('already registered') ||
+          msg.toLowerCase().includes('already exists') ||
+          msg.toLowerCase().includes('user already has an account')
+        ) {
+          msg = 'An account with this email address already exists. Please sign in instead.';
+        }
+        setAuthError(msg);
+        return { success: false, sessionCreated: false, error: msg };
+      }
+
+      // Supabase GoTrue with user enumeration protection returns data.user with empty identities if already registered
+      const identities = data?.user?.identities;
+      if (identities && identities.length === 0) {
+        const msg = 'An account with this email address already exists. Please sign in instead.';
+        setAuthError(msg);
+        return { success: false, sessionCreated: false, error: msg };
+      }
+
+      if (data?.session && data.user) {
+        // Active session created immediately (e.g., auto-confirm is enabled)
+        setSession(data.session);
+        setUser(data.user);
+        setIsDemoSession(false);
+        setDemoProfile(null);
+        await loadStaffDataForUser(data.user.id);
+        return { success: true, sessionCreated: true, needsEmailVerification: false };
+      }
+
+      // No active session: email confirmation required
+      // Crucial: Do NOT start onboarding or set user session until confirmed session exists
+      return { success: true, sessionCreated: false, needsEmailVerification: true };
+    } catch (err: any) {
+      const msg = err.message || 'An unexpected error occurred during owner registration.';
+      setAuthError(msg);
+      return { success: false, sessionCreated: false, error: msg };
     } finally {
       setIsLoading(false);
     }
@@ -334,6 +467,8 @@ export const SupabaseAuthProvider: React.FC<{ children: React.ReactNode }> = ({ 
       setDemoProfile(null);
       setSupabaseReservations([]);
       setAuthError(null);
+      setOnboardingState('ready');
+      setMembershipLookupError(null);
       setIsLoading(false);
     }
   };
@@ -509,11 +644,16 @@ export const SupabaseAuthProvider: React.FC<{ children: React.ReactNode }> = ({ 
 
   // Derive mapped facility settings if available:
   // 1. Staff authenticated active facility
-  // 2. Live active public facility (from Supabase BookSuite database)
-  // 3. Demo profile if in simulation
+  // 2. If authenticated without organization (needs_onboarding), do NOT fall back to Tenant A
+  // 3. Live active public facility (from Supabase BookSuite database) for visitors
+  // 4. Demo profile if in simulation
   const mappedFacilitySettings: FacilitySettings | null = useMemo(() => {
     if (staffData?.activeFacility) {
       return mapFacilityToSettings(staffData.activeFacility, staffData.courts);
+    }
+    // Requirement 10: Do not fall back to displaying Tenant A's administrative data for an authenticated user without an organization
+    if (user && (onboardingState === 'needs_onboarding' || onboardingState === 'error')) {
+      return null;
     }
     if (activePublicFacility) {
       const courtsToUse = activePublicCourts.length > 0 ? activePublicCourts : publicCourts;
@@ -546,7 +686,7 @@ export const SupabaseAuthProvider: React.FC<{ children: React.ReactNode }> = ({ 
       };
     }
     return null;
-  }, [staffData, activePublicFacility, activePublicCourts, publicCourts, demoProfile]);
+  }, [staffData, user, onboardingState, activePublicFacility, activePublicCourts, publicCourts, demoProfile]);
 
   const isUsingSupabaseData = Boolean(staffData?.activeFacility) || isDemoSession;
 
@@ -555,6 +695,8 @@ export const SupabaseAuthProvider: React.FC<{ children: React.ReactNode }> = ({ 
       value={{
         isConfigured: isSupabaseConfigured,
         isLoading,
+        onboardingState,
+        membershipLookupError,
         user,
         session,
         staffData,
@@ -564,6 +706,7 @@ export const SupabaseAuthProvider: React.FC<{ children: React.ReactNode }> = ({ 
         isUsingSupabaseData,
         authError,
         signIn,
+        signUp,
         signOut,
         simulateDemoSignIn,
         clearAuthError,

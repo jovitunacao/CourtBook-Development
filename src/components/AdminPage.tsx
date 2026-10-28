@@ -19,6 +19,10 @@ import {
   Layers,
   ChevronDown,
   Info,
+  Loader2,
+  RefreshCw,
+  LogOut,
+  ArrowRight,
 } from 'lucide-react';
 import { FacilitySettings, Reservation, formatHour12 } from '../types/booking';
 import { formatDatePretty, getTodayString } from '../utils/storage';
@@ -53,6 +57,10 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   const {
     user,
     staffData,
+    onboardingState,
+    membershipLookupError,
+    signOut,
+    refreshStaffData,
     isUsingSupabaseData,
     isDemoSession,
     demoProfile,
@@ -201,8 +209,133 @@ export const AdminPage: React.FC<AdminPageProps> = ({
         {/* Supabase Status Banner */}
         <SupabaseStatusBanner onOpenAuthModal={onOpenAuthModal} />
 
-        {/* Multi-Tenant Organization & Facility Selection Header (Requirement 7) */}
-        {staffData && (
+        {/* Loading State during Membership Lookup */}
+        {user && onboardingState === 'loading' && (
+          <div className="bg-white rounded-2xl border border-slate-200 p-8 sm:p-12 text-center shadow-xs space-y-4">
+            <div className="w-12 h-12 rounded-2xl bg-blue-50 text-blue-600 flex items-center justify-center mx-auto">
+              <Loader2 className="w-6 h-6 animate-spin" />
+            </div>
+            <div>
+              <h3 className="text-base font-bold text-slate-900">Verifying Organization Membership</h3>
+              <p className="text-xs text-slate-500 mt-1">
+                Checking organization access and roles for <strong className="text-slate-800">{user.email}</strong>...
+              </p>
+            </div>
+          </div>
+        )}
+
+        {/* Error State if Membership Lookup Failed */}
+        {user && onboardingState === 'error' && (
+          <div className="bg-white rounded-2xl border border-red-200 p-6 sm:p-8 shadow-xs space-y-4">
+            <div className="flex items-start gap-3.5">
+              <div className="w-10 h-10 rounded-xl bg-red-100 text-red-600 flex items-center justify-center shrink-0">
+                <AlertCircle className="w-5 h-5" />
+              </div>
+              <div className="space-y-1">
+                <h3 className="text-sm font-bold text-red-900">Membership Lookup Failed</h3>
+                <p className="text-xs text-red-700 leading-relaxed">
+                  {membershipLookupError || 'An unexpected error occurred while communicating with the database.'}
+                </p>
+                <p className="text-[11px] text-slate-500">
+                  Please verify your network connection or try refreshing your credentials.
+                </p>
+              </div>
+            </div>
+            <div className="pt-3 border-t border-red-100 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => signOut()}
+                className="px-3.5 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold transition-colors cursor-pointer"
+              >
+                Sign Out
+              </button>
+              <button
+                type="button"
+                onClick={() => refreshStaffData()}
+                className="px-3.5 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span>Retry Verification</span>
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Organization Setup Required Placeholder (Phase 3 Stage 3.2) */}
+        {user && onboardingState === 'needs_onboarding' && (
+          <div className="bg-white rounded-2xl border border-slate-200/90 p-6 sm:p-10 shadow-xs space-y-6">
+            <div className="flex flex-col sm:flex-row sm:items-center gap-4 pb-6 border-b border-slate-100">
+              <div className="w-14 h-14 rounded-2xl bg-emerald-50 border border-emerald-200 text-emerald-600 flex items-center justify-center shrink-0">
+                <Building className="w-7 h-7" />
+              </div>
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] uppercase font-extrabold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800">
+                    Authenticated Owner Account
+                  </span>
+                  <span className="text-xs text-slate-400 font-mono">
+                    ID: {user.id.slice(0, 8)}...
+                  </span>
+                </div>
+                <h2 className="text-xl font-extrabold text-slate-900 tracking-tight">
+                  Organization Setup Required
+                </h2>
+                <p className="text-xs text-slate-600">
+                  Signed in as <strong className="text-slate-900">{user.email}</strong>
+                </p>
+              </div>
+            </div>
+
+            <div className="p-4 rounded-xl bg-slate-50 border border-slate-200/80 space-y-2">
+              <div className="flex items-center gap-2 text-xs font-bold text-slate-800">
+                <Info className="w-4 h-4 text-blue-600 shrink-0" />
+                <span>Welcome to CourtBook / BookSuite!</span>
+              </div>
+              <p className="text-xs text-slate-600 leading-relaxed">
+                Your owner account has been registered and verified in Supabase Auth. However, you do not have an active sports organization or facility associated with your account yet.
+              </p>
+              <p className="text-xs text-slate-500 leading-relaxed">
+                Self-service organization creation and court configuration will be enabled in <strong>Stage 3.3</strong>. Once completed, your organization's facilities and courts will appear here for management.
+              </p>
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-3 pt-2">
+              <button
+                type="button"
+                onClick={() => onNavigateToBooking()}
+                className="px-4 py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-bold flex items-center gap-2 transition-colors cursor-pointer"
+              >
+                <span>View Public Booking Directory</span>
+                <ArrowRight className="w-3.5 h-3.5 text-slate-500" />
+              </button>
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => refreshStaffData()}
+                  className="px-3.5 py-2.5 rounded-xl bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span>Check Status</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => signOut()}
+                  className="px-3.5 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer"
+                >
+                  <LogOut className="w-3.5 h-3.5" />
+                  <span>Sign Out</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Regular Admin View: Only rendered if user is ready (or unauthenticated visitor in demo) */}
+        {(!user || onboardingState === 'ready') && (
+          <>
+            {/* Multi-Tenant Organization & Facility Selection Header (Requirement 7) */}
+            {staffData && (
           <div className="bg-white rounded-2xl border border-slate-200/90 p-4 sm:p-5 shadow-xs">
             <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
               <div className="flex flex-wrap items-center gap-4">
@@ -881,7 +1014,9 @@ export const AdminPage: React.FC<AdminPageProps> = ({
             </div>
           )}
         </div>
-      </div>
-    </div>
-  );
+      </>
+    )}
+  </div>
+</div>
+);
 };

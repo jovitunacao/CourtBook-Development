@@ -381,16 +381,31 @@ export async function fetchPublicCourts(facilityId?: string): Promise<SupabaseCo
   }
 }
 
+export interface StaffLookupResult {
+  data: StaffMembershipData | null;
+  hasMemberships: boolean;
+  error: string | null;
+}
+
 /**
- * Fetches the authenticated staff member's organizations, roles, facilities, and courts.
- * Supports multiple organizations and facilities, relying strictly on Supabase RLS policies.
+ * Performs a rigorous lookup of an authenticated user's organization memberships.
+ * Strictly distinguishes between:
+ *   - Query error / failure (error: string, hasMemberships: false) -> maps to 'error' onboarding state
+ *   - Verified successful query returning 0 memberships (error: null, hasMemberships: false) -> maps to 'needs_onboarding' state
+ *   - Successful query with >=1 memberships (error: null, hasMemberships: true, data: StaffMembershipData) -> maps to 'ready' state
  */
-export async function fetchAuthenticatedStaffData(
+export async function fetchStaffMembershipLookup(
   userId: string,
   preferredOrgId?: string,
   preferredFacilityId?: string
-): Promise<StaffMembershipData | null> {
-  if (!supabase) return null;
+): Promise<StaffLookupResult> {
+  if (!supabase) {
+    return {
+      data: null,
+      hasMemberships: false,
+      error: 'Supabase client is not initialized',
+    };
+  }
 
   try {
     // 1. Fetch all organization memberships for current user
@@ -399,9 +414,22 @@ export async function fetchAuthenticatedStaffData(
       .select('id, organization_id, user_id, role, created_at')
       .eq('user_id', userId);
 
-    if (memberErr || !memberRows || memberRows.length === 0) {
-      console.warn('No organization memberships found for user:', userId, memberErr);
-      return null;
+    if (memberErr) {
+      console.warn('Database error querying organization memberships:', memberErr.message);
+      return {
+        data: null,
+        hasMemberships: false,
+        error: memberErr.message,
+      };
+    }
+
+    // Query succeeded, but user belongs to 0 organizations -> confirmed needs onboarding
+    if (!memberRows || memberRows.length === 0) {
+      return {
+        data: null,
+        hasMemberships: false,
+        error: null,
+      };
     }
 
     const orgIds = memberRows.map((m) => m.organization_id);
@@ -413,9 +441,21 @@ export async function fetchAuthenticatedStaffData(
       .in('id', orgIds)
       .order('name', { ascending: true });
 
-    if (orgErr || !orgRows || orgRows.length === 0) {
-      console.warn('Organizations not accessible:', orgIds, orgErr);
-      return null;
+    if (orgErr) {
+      console.warn('Database error querying organizations:', orgErr.message);
+      return {
+        data: null,
+        hasMemberships: true,
+        error: orgErr.message,
+      };
+    }
+
+    if (!orgRows || orgRows.length === 0) {
+      return {
+        data: null,
+        hasMemberships: true,
+        error: 'Organizations associated with user memberships could not be loaded.',
+      };
     }
 
     // 3. Fetch all facilities for these organizations
@@ -424,6 +464,15 @@ export async function fetchAuthenticatedStaffData(
       .select('*')
       .in('organization_id', orgIds)
       .order('created_at', { ascending: true });
+
+    if (facErr) {
+      console.warn('Database error querying facilities:', facErr.message);
+      return {
+        data: null,
+        hasMemberships: true,
+        error: facErr.message,
+      };
+    }
 
     const allFacilities = (facilityRows as SupabaseFacility[]) || [];
 
@@ -439,7 +488,11 @@ export async function fetchAuthenticatedStaffData(
     });
 
     if (userOrganizations.length === 0) {
-      return null;
+      return {
+        data: null,
+        hasMemberships: true,
+        error: 'No accessible organizations found for your membership.',
+      };
     }
 
     // Determine active organization
@@ -471,23 +524,46 @@ export async function fetchAuthenticatedStaffData(
         .eq('facility_id', chosenFacility.id)
         .order('display_order', { ascending: true });
 
-      if (!courtErr && courtRows) {
+      if (courtErr) {
+        console.warn('Database error querying courts for facility:', courtErr.message);
+      } else if (courtRows) {
         courts = courtRows as SupabaseCourt[];
       }
     }
 
     return {
-      userOrganizations,
-      activeOrganization: activeOrg,
-      activeRole,
-      activeFacility: chosenFacility || null,
-      availableFacilities,
-      courts,
+      data: {
+        userOrganizations,
+        activeOrganization: activeOrg,
+        activeRole,
+        activeFacility: chosenFacility || null,
+        availableFacilities,
+        courts,
+      },
+      hasMemberships: true,
+      error: null,
     };
-  } catch (err) {
-    console.error('Error fetching authenticated staff data:', err);
-    return null;
+  } catch (err: any) {
+    console.error('Unexpected exception during staff membership lookup:', err);
+    return {
+      data: null,
+      hasMemberships: false,
+      error: err?.message || 'Unexpected failure loading staff data',
+    };
   }
+}
+
+/**
+ * Fetches the authenticated staff member's organizations, roles, facilities, and courts.
+ * Supports multiple organizations and facilities, relying strictly on Supabase RLS policies.
+ */
+export async function fetchAuthenticatedStaffData(
+  userId: string,
+  preferredOrgId?: string,
+  preferredFacilityId?: string
+): Promise<StaffMembershipData | null> {
+  const result = await fetchStaffMembershipLookup(userId, preferredOrgId, preferredFacilityId);
+  return result.data;
 }
 
 /**

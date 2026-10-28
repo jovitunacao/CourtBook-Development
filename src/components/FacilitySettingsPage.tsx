@@ -44,6 +44,8 @@ export const FacilitySettingsPage: React.FC<FacilitySettingsPageProps> = ({
 }) => {
   const {
     isConfigured,
+    user,
+    onboardingState,
     staffData,
     demoProfile,
     isUsingSupabaseData,
@@ -258,7 +260,56 @@ export const FacilitySettingsPage: React.FC<FacilitySettingsPageProps> = ({
   return (
     <div className="bg-slate-50 min-h-[calc(100vh-64px)] py-8 sm:py-12">
       <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 space-y-8">
-        {/* Navigation Breadcrumb / Sub-Tabs */}
+        {user && onboardingState === 'needs_onboarding' ? (
+          <div className="bg-white rounded-2xl border border-slate-200/90 p-6 sm:p-10 shadow-xs space-y-6">
+            <div className="flex flex-col sm:flex-row sm:items-center gap-4 pb-6 border-b border-slate-100">
+              <div className="w-14 h-14 rounded-2xl bg-emerald-50 border border-emerald-200 text-emerald-600 flex items-center justify-center shrink-0">
+                <Building2 className="w-7 h-7" />
+              </div>
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] uppercase font-extrabold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800">
+                    Owner Onboarding Required
+                  </span>
+                  <span className="text-xs text-slate-400 font-mono">
+                    {user.email}
+                  </span>
+                </div>
+                <h2 className="text-xl font-extrabold text-slate-900 tracking-tight">
+                  Facility Configuration Pending Organization Setup
+                </h2>
+                <p className="text-xs text-slate-600">
+                  Your court owner account is registered, but no sports facility has been provisioned yet.
+                </p>
+              </div>
+            </div>
+
+            <div className="p-4 rounded-xl bg-slate-50 border border-slate-200/80 space-y-2">
+              <p className="text-xs text-slate-600 leading-relaxed">
+                Self-service organization and facility onboarding will be provided in <strong>Stage 3.3</strong>. Once completed, your facility settings and courts can be viewed and customized here.
+              </p>
+            </div>
+
+            <div className="flex items-center justify-between gap-3 pt-2">
+              <button
+                type="button"
+                onClick={() => onNavigateToBooking()}
+                className="px-4 py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-bold transition-colors cursor-pointer"
+              >
+                View Public Booking Directory
+              </button>
+              <button
+                type="button"
+                onClick={() => onNavigateToReservations()}
+                className="px-4 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold transition-colors cursor-pointer"
+              >
+                Go to Status Console
+              </button>
+            </div>
+          </div>
+        ) : (
+          <>
+            {/* Navigation Breadcrumb / Sub-Tabs */}
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 pb-4 border-b border-slate-200">
           <div>
             <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-900 text-white text-xs font-bold uppercase tracking-wider mb-2">
@@ -824,7 +875,9 @@ export const FacilitySettingsPage: React.FC<FacilitySettingsPageProps> = ({
             </div>
           </div>
         </form>
-      </div>
-    </div>
-  );
+      </>
+    )}
+  </div>
+</div>
+);
 };

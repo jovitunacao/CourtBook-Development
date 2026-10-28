@@ -18,11 +18,16 @@ export const Navbar: React.FC<NavbarProps> = ({
   onOpenAuthModal,
 }) => {
   const [mobileMenuOpen, setMobileMenuOpen] = React.useState(false);
-  const { isConfigured, user, isDemoSession, demoProfile, staffData, signOut } = useSupabaseAuth();
+  const { isConfigured, user, isDemoSession, demoProfile, staffData, onboardingState, signOut } = useSupabaseAuth();
 
   const isAuthenticated = Boolean(user || isDemoSession);
-  const activeOrgName = staffData?.activeOrganization?.name || demoProfile?.orgName;
-  const staffRole = staffData?.activeRole || demoProfile?.role;
+  const isNeedsOnboarding = Boolean(user && onboardingState === 'needs_onboarding');
+  const activeOrgName = isNeedsOnboarding
+    ? 'Setup Needed'
+    : staffData?.activeOrganization?.name || demoProfile?.orgName;
+  const staffRole = isNeedsOnboarding
+    ? 'Owner (Setup Needed)'
+    : staffData?.activeRole || demoProfile?.role;
   const staffEmail = user?.email || demoProfile?.email;
 
   const handleNav = (tab: 'home' | 'booking' | 'admin' | 'settings') => {
