@@ -1,7 +1,7 @@
 -- ==============================================================================
 -- CourtBook / BookSuite — Database Schema Migration
 -- Migration: 005a1_financial_journal_engine.sql
--- Description: Phase 4.2.2 Financial Journal Engine & Accounting Routines (Hardened)
+-- Description: Phase 4.2.2 Financial Journal Engine & Accounting Routines (Security Hardened)
 --
 -- STATUS: REVIEW ONLY (Do NOT execute on live BookSuite-Dev until approved)
 --
@@ -16,16 +16,18 @@
 --   - public.payments table (provider transaction IDs, checkout session IDs, payment state)
 --   - public.payouts table (payout request state machine: requested, in_transit, paid, failed)
 --   - public.organization_payout_methods table (bank accounts, e-wallets, KYC state)
+--   - Authoritative gateway settlement batch reconciliation tables
 --
 -- EXPLICITLY DISABLED OPERATIONS UNTIL MIGRATION 005B:
 --   - External payment webhook intake (PayMongo / Xendit webhook handlers)
 --   - Direct online checkout initialization
 --   - Owner self-service payout requests
---   - Public or authenticated RPC access to financial mutations (all strictly REVOKED)
+--   - Direct client/RPC execution of post_journal_entry_internal (REVOKED from service_role, anon, authenticated)
+--   - Unverified provider settlement clearance (guarded by courtbook.enable_unverified_clearing_in_test)
 -- ==============================================================================
 
 -- ==============================================================================
--- 1. Schema Refinements & Structural Protections on Foundation Tables
+-- 1. Schema Refinements & Storage Constraints on Foundation Tables
 -- ==============================================================================
 
 DO $$
@@ -45,6 +47,7 @@ BEGIN
             'payout_reserve',
             'payout_disbursement',
             'payout_failed_release',
+            'merchant_debt_recovery',
             'dispute_hold',
             'excess_payment_liability',
             'late_payment_liability',
@@ -53,17 +56,17 @@ BEGIN
 
     -- 1.2 Refined Chart of Accounts in ledger_entries
     -- Chart of Accounts:
-    --   1010: Gateway In-Transit Clearing Funds    (Asset - held by gateway provider)
-    --   1020: Platform Settled Cash                (Asset - settled in platform operating/payout account)
-    --   1030: Platform Merchant Recovery Receivable (Asset - platform claim for post-payout refund overdrafts)
-    --   2010: Owner Payable - Unsettled Clearing   (Liability - booking funds captured, awaiting clearance)
-    --   2011: Owner Payable - Available for Payout (Liability - fully cleared owner funds eligible for withdrawal)
-    --   2012: Owner Payable - Restricted Reserve   (Liability - held for provisional fee reserve or dispute)
-    --   2015: Owner Payable - Pending Payout       (Liability - reserved during active payout disbursement)
-    --   2020: Undecided Gateway Fee Escrow         (Liability - provisional MDR held pending merchant agreement)
-    --   2030: Customer Refund Liability            (Liability - excess, duplicate or late charges owed to guest)
-    --   4010: Platform Commission Revenue          (5% CourtBook commission earned)
-    --   5010: Platform Processing Expense          (Platform-absorbed gateway MDR or payout disbursement fees)
+    --   1010: Gateway In-Transit Clearing Funds     (Asset - held by gateway provider)
+    --   1020: Platform Settled Cash                 (Asset - settled in platform operating/payout account)
+    --   1030: Platform Merchant Recovery Receivable  (Asset - platform claim for post-payout refund overdrafts)
+    --   2010: Owner Payable - Unsettled Clearing    (Liability - booking funds captured, awaiting clearance)
+    --   2011: Owner Payable - Available for Payout  (Liability - fully cleared owner funds eligible for withdrawal)
+    --   2012: Owner Payable - Restricted Reserve    (Liability - held for provisional fee reserve or dispute)
+    --   2015: Owner Payable - Pending Payout        (Liability - reserved during active payout disbursement)
+    --   2020: Undecided Gateway Fee Escrow          (Liability - provisional MDR held pending merchant agreement)
+    --   2030: Customer Refund Liability             (Liability - excess, duplicate or late charges owed to guest)
+    --   4010: Platform Commission Revenue           (5% CourtBook commission earned)
+    --   5010: Platform Processing Expense           (Platform-absorbed gateway MDR or payout disbursement fees)
     ALTER TABLE public.ledger_entries
         DROP CONSTRAINT IF EXISTS ledger_entries_account_code_check;
 
@@ -76,7 +79,20 @@ BEGIN
             '5010'
         ));
 
-    -- 1.3 Add Negative Recovery Balance Column to organization_balances
+    -- 1.3 Canonical Financial Payload Hash Column
+    -- Stores cryptographic hash of canonical financial payload (accounts, directions, amounts, refs).
+    -- Guarantees full idempotency verification: different accounts/allocations with identical totals FAIL.
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'financial_transactions'
+          AND column_name = 'canonical_payload_hash'
+    ) THEN
+        ALTER TABLE public.financial_transactions
+            ADD COLUMN canonical_payload_hash TEXT;
+    END IF;
+
+    -- 1.4 Add Negative Recovery Balance Column to organization_balances
     -- Tracks explicit platform merchant recovery receivables when refunds or chargebacks occur
     -- after an owner has already withdrawn funds. Eliminates GREATEST(0, ...) hacks and guarantees
     -- zero hidden debt and strict non-negative balance enforcement.
@@ -91,7 +107,7 @@ BEGIN
             CHECK (negative_recovery_balance >= 0.00);
     END IF;
 
-    -- 1.4 Composite Constraint on financial_transactions for Cross-Tenant Ledger Integrity
+    -- 1.5 Composite Constraint on financial_transactions for Cross-Tenant Ledger Integrity
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.table_constraints
         WHERE constraint_name = 'uq_financial_tx_id_org'
@@ -102,7 +118,7 @@ BEGIN
             ADD CONSTRAINT uq_financial_tx_id_org UNIQUE (id, organization_id);
     END IF;
 
-    -- 1.5 Composite Foreign Key on ledger_entries Enforcing Strict Organization Match
+    -- 1.6 Composite Foreign Key on ledger_entries Enforcing Strict Organization Match
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.table_constraints
         WHERE constraint_name = 'fk_ledger_entry_tx_org'
@@ -117,7 +133,19 @@ BEGIN
     END IF;
 END $$;
 
--- 1.6 Anti-Bypass Trigger on Financial Tables
+-- 1.7 Concurrency-Safe Payout Lifecycle Unique Partial Indexes
+-- Physically prevents race conditions at the database engine level:
+--   - Exactly ONE payout_reserve per payout reference ID.
+--   - Exactly ONE terminal outcome (payout_disbursement OR payout_failed_release) per payout reference ID.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_payout_reserve_per_reference
+    ON public.financial_transactions (reference_id)
+    WHERE (transaction_type = 'payout_reserve');
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_payout_terminal_per_reference
+    ON public.financial_transactions (reference_id)
+    WHERE (transaction_type IN ('payout_disbursement', 'payout_failed_release'));
+
+-- 1.8 Anti-Bypass Trigger on Financial Tables
 -- Physically prevents unauthorized direct INSERT into financial_transactions and ledger_entries
 -- unless executed within the authorized post_journal_entry_internal() procedure.
 CREATE OR REPLACE FUNCTION public.prevent_unauthorized_financial_insert()
@@ -149,10 +177,11 @@ CREATE TRIGGER tr_prevent_direct_ledger_entries_insert
 -- ==============================================================================
 -- The low-level atomic double-entry processor.
 -- Rules:
+--   - Private internal engine: EXECUTE revoked from service_role, anon, authenticated.
 --   - Sets local session override authorizing insert triggers.
 --   - Row-locks target organization_balances FIRST (FOR UPDATE).
---   - Comprehensive Idempotency Verification: Verifies organization, facility,
---     transaction_type, reference_id, total debits, total credits, and entry count.
+--   - Full Idempotency Verification: Verifies canonical payload hash (accounts, directions,
+--     amounts, facility, reference). Different account allocations with equal totals FAIL.
 --   - Sum(debits) must equal sum(credits) to the exact centavo.
 --   - Validates account movements against permitted whitelist per transaction_type.
 --   - Uses typed variables only (zero uninstantiated RECORD field assignments).
@@ -180,9 +209,6 @@ DECLARE
     v_clean_desc TEXT;
     v_clean_type VARCHAR(32);
     v_existing_tx RECORD;
-    v_existing_entry_count INT;
-    v_existing_debits NUMERIC(10, 2);
-    v_existing_credits NUMERIC(10, 2);
     v_new_tx_id UUID;
     v_new_tx_number BIGINT;
     v_total_debits NUMERIC(10, 2) := 0.00;
@@ -190,6 +216,11 @@ DECLARE
     v_item JSONB;
     v_order SMALLINT := 1;
     v_org_balance RECORD;
+
+    -- Canonical payload serialization & hash for full idempotency comparison
+    v_normalized_entries JSONB := '[]'::jsonb;
+    v_canonical_payload JSONB;
+    v_canonical_hash TEXT;
 
     -- Explicitly typed entry variables (avoids runtime record-field assignment errors)
     v_entry_account VARCHAR(10);
@@ -243,6 +274,7 @@ BEGIN
         'payout_reserve',
         'payout_disbursement',
         'payout_failed_release',
+        'merchant_debt_recovery',
         'dispute_hold',
         'excess_payment_liability',
         'late_payment_liability',
@@ -282,7 +314,7 @@ BEGIN
         RAISE EXCEPTION 'Organization balance record not found for organization: %', p_organization_id;
     END IF;
 
-    -- 3. Calculate payload total debits and credits upfront for validation and idempotency check
+    -- 3. Calculate payload total debits, credits, and build normalized canonical payload
     FOR v_item IN SELECT * FROM jsonb_array_elements(p_entries)
     LOOP
         IF jsonb_typeof(v_item) != 'object' THEN
@@ -324,16 +356,32 @@ BEGIN
         ELSE
             v_total_credits := v_total_credits + v_entry_amount;
         END IF;
+
+        v_normalized_entries := v_normalized_entries || jsonb_build_object(
+            'account_code', v_entry_account,
+            'entry_direction', v_entry_direction,
+            'amount', v_entry_amount
+        );
     END LOOP;
 
-    -- 4. Idempotency Check & Comprehensive Conflict Detection Under Exclusive Lock
-    SELECT id, organization_id, facility_id, transaction_type, reference_id, description
+    -- Construct canonical payload and hash for comprehensive idempotency verification
+    v_canonical_payload := jsonb_build_object(
+        'organization_id', p_organization_id,
+        'facility_id', p_facility_id,
+        'transaction_type', v_clean_type,
+        'reference_id', p_reference_id,
+        'entries', v_normalized_entries
+    );
+    v_canonical_hash := md5(v_canonical_payload::text);
+
+    -- 4. Full Idempotency Check & Comprehensive Conflict Detection Under Exclusive Lock
+    SELECT id, organization_id, facility_id, transaction_type, reference_id, description, canonical_payload_hash
     INTO v_existing_tx
     FROM public.financial_transactions
     WHERE idempotency_key = v_clean_key;
 
     IF FOUND THEN
-        -- Verify parameters match existing transaction
+        -- Comprehensive parameter verification
         IF v_existing_tx.organization_id != p_organization_id OR
            (v_existing_tx.facility_id IS DISTINCT FROM p_facility_id) OR
            v_existing_tx.transaction_type != v_clean_type OR
@@ -342,19 +390,10 @@ BEGIN
                 v_clean_key, v_existing_tx.organization_id, v_existing_tx.facility_id, v_existing_tx.transaction_type, v_existing_tx.reference_id;
         END IF;
 
-        -- Verify ledger payload matches existing transaction
-        SELECT count(*),
-               COALESCE(sum(amount) FILTER (WHERE entry_direction = 'DEBIT'), 0.00),
-               COALESCE(sum(amount) FILTER (WHERE entry_direction = 'CREDIT'), 0.00)
-        INTO v_existing_entry_count, v_existing_debits, v_existing_credits
-        FROM public.ledger_entries
-        WHERE transaction_id = v_existing_tx.id;
-
-        IF v_existing_entry_count != jsonb_array_length(p_entries) OR
-           v_existing_debits != v_total_debits OR
-           v_existing_credits != v_total_credits THEN
-            RAISE EXCEPTION 'Idempotency conflict: Key "%" was previously executed with different financial amounts or entries (existing debits: ₱%, payload debits: ₱%).',
-                v_clean_key, v_existing_debits, v_total_debits;
+        -- Full Canonical Payload Hash Comparison: Rejects different accounts/allocations even if totals match!
+        IF v_existing_tx.canonical_payload_hash IS NOT NULL AND v_existing_tx.canonical_payload_hash != v_canonical_hash THEN
+            RAISE EXCEPTION 'Idempotency conflict: Key "%" was previously executed with a different financial payload or account allocation.',
+                v_clean_key;
         END IF;
 
         RETURN jsonb_build_object(
@@ -395,14 +434,27 @@ BEGIN
 
         ELSIF v_clean_type = 'funds_cleared_to_available' THEN
             -- Settles funds from Gateway Clearing (1010) to Platform Settled Cash (1020)
-            -- and Owner Unsettled (2010) to Owner Available (2011)
-            IF v_entry_account NOT IN ('1010', '1020', '2010', '2011') THEN
+            -- and Owner Unsettled (2010) to Owner Available (2011) or Debt Recovery (1030)
+            IF v_entry_account NOT IN ('1010', '1020', '1030', '2010', '2011') THEN
                 RAISE EXCEPTION 'Account % not permitted for funds_cleared_to_available.', v_entry_account;
             END IF;
             IF v_entry_direction = 'DEBIT' AND v_entry_account = '2010' THEN
                 v_delta_unsettled_clearing := v_delta_unsettled_clearing - v_entry_amount;
             ELSIF v_entry_direction = 'CREDIT' AND v_entry_account = '2011' THEN
                 v_delta_available_withdrawable := v_delta_available_withdrawable + v_entry_amount;
+            ELSIF v_entry_direction = 'CREDIT' AND v_entry_account = '1030' THEN
+                -- Explicit double-entry credit reducing merchant recovery debt
+                v_delta_negative_recovery := v_delta_negative_recovery - v_entry_amount;
+            END IF;
+
+        ELSIF v_clean_type = 'merchant_debt_recovery' THEN
+            IF v_entry_account NOT IN ('1030', '2011') THEN
+                RAISE EXCEPTION 'Account % not permitted for merchant_debt_recovery.', v_entry_account;
+            END IF;
+            IF v_entry_direction = 'DEBIT' AND v_entry_account = '2011' THEN
+                v_delta_available_withdrawable := v_delta_available_withdrawable - v_entry_amount;
+            ELSIF v_entry_direction = 'CREDIT' AND v_entry_account = '1030' THEN
+                v_delta_negative_recovery := v_delta_negative_recovery - v_entry_amount;
             END IF;
 
         ELSIF v_clean_type = 'refund_reversal' THEN
@@ -492,17 +544,6 @@ BEGIN
     v_new_withdrawn := v_org_balance.total_withdrawn + v_delta_total_withdrawn;
     v_new_negative_recovery := v_org_balance.negative_recovery_balance + v_delta_negative_recovery;
 
-    -- Auto-reconciliation of negative recovery balance during clearing shifts
-    IF v_clean_type = 'funds_cleared_to_available' AND v_new_negative_recovery > 0.00 AND v_new_available > 0.00 THEN
-        DECLARE
-            v_reconciled NUMERIC(10, 2);
-        BEGIN
-            v_reconciled := LEAST(v_new_negative_recovery, v_new_available);
-            v_new_negative_recovery := v_new_negative_recovery - v_reconciled;
-            v_new_available := v_new_available - v_reconciled;
-        END;
-    END IF;
-
     IF v_new_gross < 0.00 THEN
         RAISE EXCEPTION 'Balance invariant violation: total_gross_settled cannot be negative (would be ₱%).', v_new_gross;
     END IF;
@@ -526,7 +567,7 @@ BEGIN
         RAISE EXCEPTION 'Balance invariant violation: negative_recovery_balance cannot be negative (would be ₱%).', v_new_negative_recovery;
     END IF;
 
-    -- 8. Create Financial Transaction Header
+    -- 8. Create Financial Transaction Header with Canonical Payload Hash
     INSERT INTO public.financial_transactions (
         organization_id,
         facility_id,
@@ -534,6 +575,7 @@ BEGIN
         idempotency_key,
         reference_id,
         description,
+        canonical_payload_hash,
         metadata
     ) VALUES (
         p_organization_id,
@@ -542,10 +584,12 @@ BEGIN
         v_clean_key,
         p_reference_id,
         v_clean_desc,
+        v_canonical_hash,
         p_metadata || jsonb_build_object(
             'total_debits', v_total_debits,
             'total_credits', v_total_credits,
-            'entry_count', jsonb_array_length(p_entries)
+            'entry_count', jsonb_array_length(p_entries),
+            'canonical_payload', v_canonical_payload
         )
     ) RETURNING id, transaction_number INTO v_new_tx_id, v_new_tx_number;
 
@@ -826,10 +870,10 @@ END;
 $$;
 
 
--- 3.2 Gateway Clearance & Settlement Shift (Verified Settlement Evidence Required)
+-- 3.2 Gateway Clearance & Settlement Shift (Verified Settlement Authenticity Required)
 -- Moves funds from Gateway Clearing (1010) to Platform Settled Cash (1020),
--- and Owner Unsettled (2010) to Owner Available (2011).
--- Requires verified settlement evidence (p_settlement_reference) from gateway batch.
+-- and Owner Unsettled (2010) to Owner Available (2011) or Merchant Debt Recovery (1030).
+-- Explicitly DISABLED in production until Migration 005B provider settlement batch reconciliation.
 CREATE OR REPLACE FUNCTION public.post_funds_cleared_event(
     p_organization_id UUID,
     p_facility_id UUID,
@@ -845,40 +889,79 @@ SET search_path = public, pg_temp
 AS $$
 DECLARE
     v_clean_settle_ref TEXT;
+    v_org_bal RECORD;
     v_entries JSONB;
+    v_reconciled NUMERIC(10, 2) := 0.00;
+    v_net_to_available NUMERIC(10, 2) := 0.00;
 BEGIN
+    -- Operational Boundary Guard: Unverified clearance is prohibited outside test fixtures
+    IF current_setting('courtbook.enable_unverified_clearing_in_test', true) IS DISTINCT FROM 'true' THEN
+        RAISE EXCEPTION 'Unverified settlement clearance is disabled in production. Authoritative provider batch reconciliation records will be deployed in Migration 005B.';
+    END IF;
+
     IF p_cleared_amount <= 0.00 THEN
         RAISE EXCEPTION 'Cleared amount must be strictly positive. Got: %', p_cleared_amount;
     END IF;
 
     v_clean_settle_ref := trim(COALESCE(p_settlement_reference, ''));
-    IF char_length(v_clean_settle_ref) < 5 THEN
-        RAISE EXCEPTION 'Verified settlement reference evidence is required (e.g. gateway payout/batch ID). Got: "%".', p_settlement_reference;
+    IF char_length(v_clean_settle_ref) < 8 THEN
+        RAISE EXCEPTION 'Verified settlement reference evidence is required (e.g. gateway payout/batch ID, min 8 chars). Got: "%".', p_settlement_reference;
     END IF;
+
+    -- Inspect current balance under lock to check for negative recovery debt
+    SELECT * INTO v_org_bal
+    FROM public.organization_balances
+    WHERE organization_id = p_organization_id
+    FOR UPDATE;
+
+    IF p_cleared_amount > v_org_bal.unsettled_clearing_amount THEN
+        RAISE EXCEPTION 'Settlement clearance exceeds unsettled funds: Requested ₱%, available unsettled ₱%.',
+            p_cleared_amount, v_org_bal.unsettled_clearing_amount;
+    END IF;
+
+    -- Determine if any cleared funds must pay down merchant recovery debt (Account 1030)
+    IF v_org_bal.negative_recovery_balance > 0.00 THEN
+        v_reconciled := LEAST(v_org_bal.negative_recovery_balance, p_cleared_amount);
+    END IF;
+    v_net_to_available := p_cleared_amount - v_reconciled;
 
     -- Double-Entry Ledger Lines:
     --   DEBIT  1020 (Platform Settled Cash):             ₱ClearedAmount
     --   CREDIT 1010 (Gateway In-Transit Clearing Funds): ₱ClearedAmount
     --   DEBIT  2010 (Owner Payable - Unsettled):         ₱ClearedAmount
-    --   CREDIT 2011 (Owner Payable - Available):         ₱ClearedAmount
+    --   CREDIT 1030 (Platform Merchant Recovery):        ₱Reconciled (explicit auditable debt reduction!)
+    --   CREDIT 2011 (Owner Payable - Available):         ₱NetToAvailable
     v_entries := jsonb_build_array(
         jsonb_build_object('account_code', '1020', 'entry_direction', 'DEBIT', 'amount', p_cleared_amount),
         jsonb_build_object('account_code', '1010', 'entry_direction', 'CREDIT', 'amount', p_cleared_amount),
-        jsonb_build_object('account_code', '2010', 'entry_direction', 'DEBIT', 'amount', p_cleared_amount),
-        jsonb_build_object('account_code', '2011', 'entry_direction', 'CREDIT', 'amount', p_cleared_amount)
+        jsonb_build_object('account_code', '2010', 'entry_direction', 'DEBIT', 'amount', p_cleared_amount)
     );
+
+    IF v_reconciled > 0.00 THEN
+        v_entries := v_entries || jsonb_build_array(
+            jsonb_build_object('account_code', '1030', 'entry_direction', 'CREDIT', 'amount', v_reconciled)
+        );
+    END IF;
+
+    IF v_net_to_available > 0.00 THEN
+        v_entries := v_entries || jsonb_build_array(
+            jsonb_build_object('account_code', '2011', 'entry_direction', 'CREDIT', 'amount', v_net_to_available)
+        );
+    END IF;
 
     RETURN public.post_journal_entry_internal(
         p_organization_id,
         p_facility_id,
         'funds_cleared_to_available',
         p_idempotency_key,
-        p_organization_id, -- logical reference is the organization clearing batch
-        format('Gateway settlement cleared to available withdrawable funds (Ref: %s, Amount: ₱%s)',
-            v_clean_settle_ref, p_cleared_amount),
+        p_organization_id,
+        format('Gateway settlement cleared to available withdrawable funds (Ref: %s, Amount: ₱%s, Debt Recovered: ₱%s)',
+            v_clean_settle_ref, p_cleared_amount, v_reconciled),
         p_metadata || jsonb_build_object(
             'settlement_reference', v_clean_settle_ref,
-            'cleared_amount', p_cleared_amount
+            'cleared_amount', p_cleared_amount,
+            'debt_recovered', v_reconciled,
+            'net_to_available', v_net_to_available
         ),
         v_entries
     );
@@ -1015,7 +1098,7 @@ $$;
 
 
 -- 3.4 Chargeback & Dispute Adjustment Event
--- Fully implements chargeback reversals, fee allocation, and merchant overdraft handling
+-- Fully implements chargeback reversals, dispute fee allocation, and merchant overdraft handling
 CREATE OR REPLACE FUNCTION public.post_chargeback_adjustment_event(
     p_organization_id UUID,
     p_facility_id UUID,
@@ -1206,7 +1289,7 @@ $$;
 -- 3.6 Payout Hold Reservation (Two-Phase Payout Phase 1)
 -- Enforces:
 --   - Payout amount between configured min_payout_amount and max_payout_amount.
---   - Payout ID must not already exist as an active reserve.
+--   - Concurrency-safe: Rejects duplicate reserve attempts under different keys.
 --   - Deducts from available_withdrawable_balance and increments pending_payout_amount.
 CREATE OR REPLACE FUNCTION public.post_payout_reserve_event(
     p_organization_id UUID,
@@ -1222,7 +1305,8 @@ SET search_path = public, pg_temp
 AS $$
 DECLARE
     v_billing_config RECORD;
-    v_existing_reserve UUID;
+    v_existing_reserve RECORD;
+    v_existing_terminal RECORD;
     v_entries JSONB;
 BEGIN
     IF p_amount <= 0.00 THEN
@@ -1244,14 +1328,27 @@ BEGIN
             p_amount, v_billing_config.max_payout_amount;
     END IF;
 
-    -- Lifecycle Check: Verify payout_id is not already reserved
-    SELECT id INTO v_existing_reserve
+    -- Concurrency-Safe Lifecycle Guard: Check existing reserve
+    SELECT id, idempotency_key INTO v_existing_reserve
     FROM public.financial_transactions
     WHERE reference_id = p_payout_id AND transaction_type = 'payout_reserve';
 
     IF FOUND THEN
-        -- If already reserved, let idempotency check in post_journal_entry_internal verify key
-        NULL;
+        IF v_existing_reserve.idempotency_key != trim(p_idempotency_key) THEN
+            RAISE EXCEPTION 'Payout lifecycle conflict: Payout ID % already has an active reservation under a different idempotency key.',
+                p_payout_id;
+        END IF;
+    END IF;
+
+    -- Check if payout is already terminal
+    SELECT id, transaction_type INTO v_existing_terminal
+    FROM public.financial_transactions
+    WHERE reference_id = p_payout_id
+      AND transaction_type IN ('payout_disbursement', 'payout_failed_release');
+
+    IF FOUND THEN
+        RAISE EXCEPTION 'Payout lifecycle conflict: Payout ID % has already reached terminal status "%". Cannot reserve.',
+            p_payout_id, v_existing_terminal.transaction_type;
     END IF;
 
     -- Double-Entry Ledger Lines:
@@ -1279,7 +1376,7 @@ $$;
 -- 3.7 Payout Disbursement (Two-Phase Payout Phase 2: Success)
 -- Enforces:
 --   - Payout reserve MUST exist for this payout_id with matching amount and organization.
---   - Payout must NOT have already reached a terminal state (disbursed or released).
+--   - Rejects duplicate terminal outcomes under different keys.
 --   - Deducts from pending_payout_amount and increments total_withdrawn.
 CREATE OR REPLACE FUNCTION public.post_payout_disbursement_event(
     p_organization_id UUID,
@@ -1322,15 +1419,17 @@ BEGIN
             (v_reserve_record.metadata->>'amount'), p_amount;
     END IF;
 
-    -- Lifecycle Enforcement: Verify payout is not already terminal
-    SELECT id, transaction_type INTO v_terminal_tx
+    -- Concurrency-Safe Lifecycle Guard: Check terminal status
+    SELECT id, transaction_type, idempotency_key INTO v_terminal_tx
     FROM public.financial_transactions
     WHERE reference_id = p_payout_id
       AND transaction_type IN ('payout_disbursement', 'payout_failed_release');
 
     IF FOUND THEN
-        -- If same idempotency key, let idempotency handler handle resubmission
-        NULL;
+        IF v_terminal_tx.idempotency_key != trim(p_idempotency_key) OR v_terminal_tx.transaction_type != 'payout_disbursement' THEN
+            RAISE EXCEPTION 'Payout lifecycle conflict: Payout ID % has already reached terminal status "%". Duplicate or conflicting terminal outcome rejected.',
+                p_payout_id, v_terminal_tx.transaction_type;
+        END IF;
     END IF;
 
     -- Double-Entry Ledger Lines:
@@ -1358,7 +1457,7 @@ $$;
 -- 3.8 Payout Failed Release (Two-Phase Payout Phase 2: Failure)
 -- Enforces:
 --   - Payout reserve MUST exist for this payout_id with matching amount.
---   - Payout must NOT have already reached a terminal state.
+--   - Rejects duplicate terminal outcomes under different keys.
 --   - Releases pending_payout_amount back to available_withdrawable_balance.
 CREATE OR REPLACE FUNCTION public.post_payout_failed_release_event(
     p_organization_id UUID,
@@ -1400,14 +1499,17 @@ BEGIN
             (v_reserve_record.metadata->>'amount'), p_amount;
     END IF;
 
-    -- Lifecycle Enforcement: Verify payout is not already terminal
-    SELECT id, transaction_type INTO v_terminal_tx
+    -- Concurrency-Safe Lifecycle Guard: Check terminal status
+    SELECT id, transaction_type, idempotency_key INTO v_terminal_tx
     FROM public.financial_transactions
     WHERE reference_id = p_payout_id
       AND transaction_type IN ('payout_disbursement', 'payout_failed_release');
 
     IF FOUND THEN
-        NULL;
+        IF v_terminal_tx.idempotency_key != trim(p_idempotency_key) OR v_terminal_tx.transaction_type != 'payout_failed_release' THEN
+            RAISE EXCEPTION 'Payout lifecycle conflict: Payout ID % has already reached terminal status "%". Duplicate or conflicting terminal outcome rejected.',
+                p_payout_id, v_terminal_tx.transaction_type;
+        END IF;
     END IF;
 
     -- Double-Entry Ledger Lines:
@@ -1490,10 +1592,11 @@ $$;
 -- ==============================================================================
 -- 4. Privilege Hardening: Strict Revocation & Service Role Delegation
 -- ==============================================================================
--- All financial routines are strictly REVOKED from PUBLIC, anon, and authenticated.
--- EXECUTE is granted strictly to service_role (trusted backend execution only).
+-- The low-level journal engine is PRIVATE: REVOKED from ALL roles including service_role.
+-- It can ONLY be called internally by authorized SECURITY DEFINER functions.
+REVOKE ALL ON FUNCTION public.post_journal_entry_internal(UUID, UUID, VARCHAR, TEXT, UUID, TEXT, JSONB, JSONB) FROM PUBLIC, anon, authenticated, service_role;
 
-REVOKE ALL ON FUNCTION public.post_journal_entry_internal(UUID, UUID, VARCHAR, TEXT, UUID, TEXT, JSONB, JSONB) FROM PUBLIC, anon, authenticated;
+-- Specialized business routines: REVOKED from PUBLIC, anon, and authenticated.
 REVOKE ALL ON FUNCTION public.post_booking_settlement_event(UUID, UUID, UUID, NUMERIC, NUMERIC, TEXT, JSONB) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.post_funds_cleared_event(UUID, UUID, NUMERIC, TEXT, TEXT, JSONB) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.post_refund_reversal_event(UUID, UUID, UUID, NUMERIC, NUMERIC, TEXT, JSONB) FROM PUBLIC, anon, authenticated;
@@ -1504,7 +1607,7 @@ REVOKE ALL ON FUNCTION public.post_payout_disbursement_event(UUID, UUID, NUMERIC
 REVOKE ALL ON FUNCTION public.post_payout_failed_release_event(UUID, UUID, NUMERIC, TEXT, JSONB) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.post_excess_or_late_payment_event(UUID, UUID, UUID, NUMERIC, BOOLEAN, TEXT, JSONB) FROM PUBLIC, anon, authenticated;
 
-GRANT EXECUTE ON FUNCTION public.post_journal_entry_internal(UUID, UUID, VARCHAR, TEXT, UUID, TEXT, JSONB, JSONB) TO service_role;
+-- Specialized business routines: GRANTED strictly to service_role for trusted backend execution
 GRANT EXECUTE ON FUNCTION public.post_booking_settlement_event(UUID, UUID, UUID, NUMERIC, NUMERIC, TEXT, JSONB) TO service_role;
 GRANT EXECUTE ON FUNCTION public.post_funds_cleared_event(UUID, UUID, NUMERIC, TEXT, TEXT, JSONB) TO service_role;
 GRANT EXECUTE ON FUNCTION public.post_refund_reversal_event(UUID, UUID, UUID, NUMERIC, NUMERIC, TEXT, JSONB) TO service_role;
