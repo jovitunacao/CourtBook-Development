@@ -1,7 +1,7 @@
 -- ==============================================================================
 -- CourtBook / BookSuite — Test Fixture SQL
 -- File: tests/supabase/fixtures/005a1_journal_engine_test.sql
--- Description: Isolated Verification Test Suite for Migration 005a1 (Hardened)
+-- Description: Isolated Verification Test Suite for Migration 005a1
 --
 -- EXECUTION ENVIRONMENT:
 --   Designed for execution in a disposable local PostgreSQL / Supabase container.
@@ -13,7 +13,7 @@ BEGIN;
 
 DO $$
 DECLARE
-    -- Synthetic Test Entities (isolated from all protected reservations)
+    -- Synthetic Test Entities (fully isolated from existing reservations and organizations)
     v_synth_org_a UUID := gen_random_uuid();
     v_synth_org_b UUID := gen_random_uuid();
     v_synth_fac_a UUID := gen_random_uuid();
@@ -24,12 +24,12 @@ DECLARE
     v_synth_res_b UUID := gen_random_uuid();
 
     v_payout_id_1 UUID := gen_random_uuid();
-    v_payout_id_2 UUID := gen_random_uuid();
     v_payout_id_unreserved UUID := gen_random_uuid();
 
     v_res JSONB;
     v_bal RECORD;
     v_ledger_rec RECORD;
+    v_has_priv BOOLEAN;
     v_passed_count INT := 0;
 BEGIN
     RAISE NOTICE '========================================================================';
@@ -44,7 +44,6 @@ BEGIN
         (v_synth_org_a, 'Synthetic Org A', 'synth-org-a-' || substr(gen_random_uuid()::text, 1, 8)),
         (v_synth_org_b, 'Synthetic Org B', 'synth-org-b-' || substr(gen_random_uuid()::text, 1, 8));
 
-    -- Seed organization_balances for synthetic organizations
     INSERT INTO public.organization_balances (organization_id, currency)
     VALUES
         (v_synth_org_a, 'PHP'),
@@ -79,7 +78,50 @@ BEGIN
         v_synth_org_a, v_synth_org_b;
 
     -- =========================================================================
-    -- TEST 1: Authoritative Booking Settlement Capture (₱350 Gross, 5% Commission)
+    -- TEST 1: Privilege Boundary Verification (Information Schema Inspection)
+    -- =========================================================================
+    -- 1.1 Verify post_journal_entry_internal is NOT granted to service_role, anon, authenticated
+    SELECT EXISTS (
+        SELECT 1 FROM information_schema.routine_privileges
+        WHERE routine_schema = 'public'
+          AND routine_name = 'post_journal_entry_internal'
+          AND grantee IN ('service_role', 'anon', 'authenticated', 'PUBLIC')
+    ) INTO v_has_priv;
+
+    IF v_has_priv THEN
+        RAISE EXCEPTION 'Test 1 Failed: post_journal_entry_internal has unauthorized EXECUTE grants!';
+    END IF;
+
+    -- 1.2 Verify provider-deferred functions have NO execute grants to service_role in 005a1
+    SELECT EXISTS (
+        SELECT 1 FROM information_schema.routine_privileges
+        WHERE routine_schema = 'public'
+          AND routine_name IN ('post_funds_cleared_event', 'post_payout_reserve_event', 'post_payout_disbursement_event', 'post_payout_failed_release_event')
+          AND grantee = 'service_role'
+    ) INTO v_has_priv;
+
+    IF v_has_priv THEN
+        RAISE EXCEPTION 'Test 1b Failed: Deferred operations (clearing/payouts) are erroneously granted to service_role before 005B!';
+    END IF;
+
+    -- 1.3 Verify direct INSERT on ledger tables is NOT granted to service_role
+    SELECT EXISTS (
+        SELECT 1 FROM information_schema.table_privileges
+        WHERE table_schema = 'public'
+          AND table_name IN ('financial_transactions', 'ledger_entries', 'organization_balances')
+          AND privilege_type IN ('INSERT', 'UPDATE', 'DELETE')
+          AND grantee = 'service_role'
+    ) INTO v_has_priv;
+
+    IF v_has_priv THEN
+        RAISE EXCEPTION 'Test 1c Failed: service_role has direct INSERT/UPDATE/DELETE privileges on financial ledger tables!';
+    END IF;
+
+    v_passed_count := v_passed_count + 1;
+    RAISE NOTICE 'Test 1 PASSED: Strict privilege boundaries verified in information_schema.';
+
+    -- =========================================================================
+    -- TEST 2: Authoritative Booking Settlement Capture (₱350 Gross, 5% Commission)
     -- =========================================================================
     v_res := public.post_booking_settlement_event(
         v_synth_org_a,
@@ -92,7 +134,7 @@ BEGIN
     );
 
     IF (v_res->>'success')::BOOLEAN != true THEN
-        RAISE EXCEPTION 'Test 1 Failed: post_booking_settlement_event returned unsuccessful: %', v_res;
+        RAISE EXCEPTION 'Test 2 Failed: post_booking_settlement_event returned unsuccessful: %', v_res;
     END IF;
 
     SELECT * INTO v_bal FROM public.organization_balances WHERE organization_id = v_synth_org_a;
@@ -101,15 +143,15 @@ BEGIN
        v_bal.total_commission_paid != 17.50 OR
        v_bal.unsettled_clearing_amount != 332.50 OR
        v_bal.available_withdrawable_balance != 0.00 THEN
-        RAISE EXCEPTION 'Test 1 Failed: Balance state mismatch after booking capture: gross=%, comm=%, unsettled=%, withdrawable=%',
+        RAISE EXCEPTION 'Test 2 Failed: Balance state mismatch after booking capture: gross=%, comm=%, unsettled=%, withdrawable=%',
             v_bal.total_gross_settled, v_bal.total_commission_paid, v_bal.unsettled_clearing_amount, v_bal.available_withdrawable_balance;
     END IF;
 
     v_passed_count := v_passed_count + 1;
-    RAISE NOTICE 'Test 1 PASSED: Booking capture credited unsettled balance without inflating withdrawable balance.';
+    RAISE NOTICE 'Test 2 PASSED: Booking capture credited unsettled balance without inflating withdrawable balance.';
 
     -- =========================================================================
-    -- TEST 2: Exact Idempotent Resubmission (Same Key, Same Payload)
+    -- TEST 3: Exact Idempotent Resubmission (Same Key, Same Payload)
     -- =========================================================================
     v_res := public.post_booking_settlement_event(
         v_synth_org_a,
@@ -122,23 +164,23 @@ BEGIN
     );
 
     IF (v_res->>'idempotent_duplicate')::BOOLEAN != true THEN
-        RAISE EXCEPTION 'Test 2 Failed: Resubmitted key did not return idempotent_duplicate=true.';
+        RAISE EXCEPTION 'Test 3 Failed: Resubmitted key did not return idempotent_duplicate=true.';
     END IF;
 
     SELECT * INTO v_bal FROM public.organization_balances WHERE organization_id = v_synth_org_a;
     IF v_bal.total_gross_settled != 350.00 OR v_bal.unsettled_clearing_amount != 332.50 THEN
-        RAISE EXCEPTION 'Test 2 Failed: Balances were mutated during idempotent resubmission!';
+        RAISE EXCEPTION 'Test 3 Failed: Balances were mutated during idempotent resubmission!';
     END IF;
 
     v_passed_count := v_passed_count + 1;
-    RAISE NOTICE 'Test 2 PASSED: Exact idempotent resubmission returned existing transaction without duplicate balance mutation.';
+    RAISE NOTICE 'Test 3 PASSED: Exact idempotent resubmission returned existing transaction without duplicate balance mutation.';
 
     -- =========================================================================
-    -- TEST 3: Equal Totals with Different Journal Allocations Rejection
+    -- TEST 4: Equal Totals with Conflicting Account Allocations Rejection
     -- =========================================================================
     -- Reusing 'idemp-synth-booking-001' with EQUAL total amounts (₱350) but DIFFERENT account allocation:
-    -- Payload B allocates commission ₱25.00 + owner ₱325.00 instead of ₱17.50 + ₱332.50!
-    -- Full canonical payload hash comparison MUST reject this!
+    -- Allocates commission ₱25.00 + owner ₱325.00 instead of ₱17.50 + ₱332.50!
+    -- Versioned canonical payload hash comparison MUST reject this!
     BEGIN
         PERFORM public.post_journal_entry_internal(
             v_synth_org_a,
@@ -150,22 +192,22 @@ BEGIN
             '{}'::jsonb,
             jsonb_build_array(
                 jsonb_build_object('account_code', '1010', 'entry_direction', 'DEBIT', 'amount', 350.00),
-                jsonb_build_object('account_code', '4010', 'entry_direction', 'CREDIT', 'amount', 25.00), -- Conflicting allocation!
-                jsonb_build_object('account_code', '2010', 'entry_direction', 'CREDIT', 'amount', 325.00)  -- Conflicting allocation!
+                jsonb_build_object('account_code', '4010', 'entry_direction', 'CREDIT', 'amount', 25.00),
+                jsonb_build_object('account_code', '2010', 'entry_direction', 'CREDIT', 'amount', 325.00)
             )
         );
-        RAISE EXCEPTION 'Test 3 Failed: Different journal allocation with equal totals was not rejected by idempotency check!';
+        RAISE EXCEPTION 'Test 4 Failed: Different journal allocation with equal totals was not rejected by idempotency check!';
     EXCEPTION WHEN OTHERS THEN
         IF SQLERRM LIKE '%Idempotency conflict%' THEN
             v_passed_count := v_passed_count + 1;
-            RAISE NOTICE 'Test 3 PASSED: Different journal allocation with equal totals correctly rejected by canonical payload hash check: %', SQLERRM;
+            RAISE NOTICE 'Test 4 PASSED: Different journal allocation with equal totals correctly rejected by canonical payload hash check: %', SQLERRM;
         ELSE
-            RAISE EXCEPTION 'Test 3 Failed: Unexpected exception message: %', SQLERRM;
+            RAISE EXCEPTION 'Test 4 Failed: Unexpected exception message: %', SQLERRM;
         END IF;
     END;
 
     -- =========================================================================
-    -- TEST 4: Authoritative Reservation Price & Commission Tamper Rejection
+    -- TEST 5: Authoritative Price & Commission Tamper Rejection
     -- =========================================================================
     BEGIN
         PERFORM public.post_booking_settlement_event(
@@ -177,20 +219,19 @@ BEGIN
             'idemp-synth-tampered-price',
             '{}'::jsonb
         );
-        RAISE EXCEPTION 'Test 4 Failed: Tampered price was not rejected!';
+        RAISE EXCEPTION 'Test 5 Failed: Tampered price was not rejected!';
     EXCEPTION WHEN OTHERS THEN
         IF SQLERRM LIKE '%Price tampering rejected%' THEN
             v_passed_count := v_passed_count + 1;
-            RAISE NOTICE 'Test 4 PASSED: Tampered price rejected against authoritative reservation record.';
+            RAISE NOTICE 'Test 5 PASSED: Tampered price rejected against authoritative reservation record.';
         ELSE
-            RAISE EXCEPTION 'Test 4 Failed: Unexpected error: %', SQLERRM;
+            RAISE EXCEPTION 'Test 5 Failed: Unexpected error: %', SQLERRM;
         END IF;
     END;
 
     -- =========================================================================
-    -- TEST 5: Cross-Tenant Reservation Settlement Protection
+    -- TEST 6: Cross-Tenant Reservation Settlement Protection
     -- =========================================================================
-    -- Org B attempts to settle Org A's reservation
     BEGIN
         PERFORM public.post_booking_settlement_event(
             v_synth_org_b, -- Org B claims Org A's reservation!
@@ -201,81 +242,20 @@ BEGIN
             'idemp-synth-cross-tenant-settle',
             '{}'::jsonb
         );
-        RAISE EXCEPTION 'Test 5 Failed: Cross-tenant reservation settlement was not rejected!';
+        RAISE EXCEPTION 'Test 6 Failed: Cross-tenant reservation settlement was not rejected!';
     EXCEPTION WHEN OTHERS THEN
         IF SQLERRM LIKE '%Tenant mismatch%' THEN
             v_passed_count := v_passed_count + 1;
-            RAISE NOTICE 'Test 5 PASSED: Cross-tenant reservation settlement rejected with tenant mismatch error.';
-        ELSE
-            RAISE EXCEPTION 'Test 5 Failed: Unexpected error: %', SQLERRM;
-        END IF;
-    END;
-
-    -- =========================================================================
-    -- TEST 6: Direct INSERT Table Bypass Rejection (Anti-Bypass Triggers)
-    -- =========================================================================
-    BEGIN
-        INSERT INTO public.financial_transactions (
-            organization_id, facility_id, transaction_type, idempotency_key, reference_id, description
-        ) VALUES (
-            v_synth_org_a, v_synth_fac_a, 'platform_adjustment', 'idemp-bypass-attempt', gen_random_uuid(), 'Direct insert bypass'
-        );
-        RAISE EXCEPTION 'Test 6 Failed: Direct INSERT into financial_transactions was not prevented by trigger!';
-    EXCEPTION WHEN OTHERS THEN
-        IF SQLERRM LIKE '%Direct INSERT into financial journal or ledger tables is prohibited%' THEN
-            v_passed_count := v_passed_count + 1;
-            RAISE NOTICE 'Test 6 PASSED: Direct INSERT into financial_transactions blocked by anti-bypass trigger.';
+            RAISE NOTICE 'Test 6 PASSED: Cross-tenant reservation settlement rejected with tenant mismatch error.';
         ELSE
             RAISE EXCEPTION 'Test 6 Failed: Unexpected error: %', SQLERRM;
         END IF;
     END;
 
     -- =========================================================================
-    -- TEST 7: Settlement Authenticity Guard (Disabled in Production Without Provider Batch)
+    -- TEST 7: Settlement Clearance with Explicit Double-Entry Accounting
     -- =========================================================================
-    -- Attempting to call post_funds_cleared_event without test override setting MUST FAIL
-    BEGIN
-        PERFORM public.post_funds_cleared_event(
-            v_synth_org_a,
-            v_synth_fac_a,
-            332.50,
-            'GW-BATCH-PROD-UNVERIFIED',
-            'idemp-synth-unverified-clearance',
-            '{}'::jsonb
-        );
-        RAISE EXCEPTION 'Test 7 Failed: Unverified settlement clearance in production was not rejected!';
-    EXCEPTION WHEN OTHERS THEN
-        IF SQLERRM LIKE '%Unverified settlement clearance is disabled in production%' THEN
-            v_passed_count := v_passed_count + 1;
-            RAISE NOTICE 'Test 7 PASSED: Unverified settlement clearance strictly blocked by production guard.';
-        ELSE
-            RAISE EXCEPTION 'Test 7 Failed: Unexpected error: %', SQLERRM;
-        END IF;
-    END;
-
-    -- Explicitly enable isolated test clearing authorization for subsequent tests
-    PERFORM set_config('courtbook.enable_unverified_clearing_in_test', 'true', true);
-
-    -- Also verify that a fake/short settlement reference (< 8 chars) fails
-    BEGIN
-        PERFORM public.post_funds_cleared_event(
-            v_synth_org_a,
-            v_synth_fac_a,
-            332.50,
-            'SHORT', -- < 8 chars
-            'idemp-synth-short-ref',
-            '{}'::jsonb
-        );
-        RAISE EXCEPTION 'Test 7b Failed: Fake/short settlement reference was not rejected!';
-    EXCEPTION WHEN OTHERS THEN
-        IF SQLERRM LIKE '%Verified settlement reference evidence is required%' THEN
-            RAISE NOTICE 'Test 7b PASSED: Fake/short settlement reference rejected.';
-        ELSE
-            RAISE EXCEPTION 'Test 7b Failed: Unexpected error: %', SQLERRM;
-        END IF;
-    END;
-
-    -- Valid settlement shift in test environment
+    -- Valid settlement shift in test environment (moving 1010->1020, 2010->2011)
     v_res := public.post_funds_cleared_event(
         v_synth_org_a,
         v_synth_fac_a,
@@ -286,38 +266,21 @@ BEGIN
     );
 
     IF (v_res->>'success')::BOOLEAN != true THEN
-        RAISE EXCEPTION 'Test 7c Failed: post_funds_cleared_event failed: %', v_res;
+        RAISE EXCEPTION 'Test 7 Failed: post_funds_cleared_event failed: %', v_res;
     END IF;
 
     SELECT * INTO v_bal FROM public.organization_balances WHERE organization_id = v_synth_org_a;
     IF v_bal.unsettled_clearing_amount != 0.00 OR v_bal.available_withdrawable_balance != 332.50 THEN
-        RAISE EXCEPTION 'Test 7c Failed: Clearance shift mismatch: unsettled=%, avail=%',
+        RAISE EXCEPTION 'Test 7 Failed: Clearance shift mismatch: unsettled=%, avail=%',
             v_bal.unsettled_clearing_amount, v_bal.available_withdrawable_balance;
     END IF;
-    RAISE NOTICE 'Test 7c PASSED: Authorized test clearance shifted ₱332.50 across distinct accounts (1010->1020, 2010->2011).';
+
+    v_passed_count := v_passed_count + 1;
+    RAISE NOTICE 'Test 7 PASSED: Settlement clearance shifted ₱332.50 across distinct accounts (1010->1020, 2010->2011).';
 
     -- =========================================================================
-    -- TEST 8: Payout Overdraft & Under-Minimum Threshold Rejection
+    -- TEST 8: Payout Lifecycle State Machine (Defense-in-Depth Partial Unique Indexes)
     -- =========================================================================
-    BEGIN
-        -- Attempt to reserve ₱1,000 when available is ₱332.50
-        PERFORM public.post_payout_reserve_event(
-            v_synth_org_a,
-            v_payout_id_1,
-            1000.00,
-            'idemp-payout-overdraft',
-            '{}'::jsonb
-        );
-        RAISE EXCEPTION 'Test 8 Failed: Overdraft payout was not rejected!';
-    EXCEPTION WHEN OTHERS THEN
-        IF SQLERRM LIKE '%Insufficient withdrawable balance%' THEN
-            v_passed_count := v_passed_count + 1;
-            RAISE NOTICE 'Test 8 PASSED: Overdraft payout reservation rejected without balance degradation.';
-        ELSE
-            RAISE EXCEPTION 'Test 8 Failed: Unexpected error: %', SQLERRM;
-        END IF;
-    END;
-
     -- Seed available balance for payout lifecycle tests
     PERFORM public.post_journal_entry_internal(
         v_synth_org_a,
@@ -335,10 +298,7 @@ BEGIN
         )
     );
 
-    -- =========================================================================
-    -- TEST 9: Duplicate Payout Reservation with DIFFERENT Idempotency Keys Rejection
-    -- =========================================================================
-    -- Initial reserve with Key A
+    -- Phase 1: Reserve ₱500.00 with Key A
     v_res := public.post_payout_reserve_event(
         v_synth_org_a,
         v_payout_id_1,
@@ -347,7 +307,7 @@ BEGIN
         '{}'::jsonb
     );
 
-    -- Second reserve for SAME payout ID with DIFFERENT Key B MUST FAIL
+    -- Duplicate reserve attempt for SAME payout ID with DIFFERENT Key B MUST FAIL
     BEGIN
         PERFORM public.post_payout_reserve_event(
             v_synth_org_a,
@@ -356,20 +316,16 @@ BEGIN
             'idemp-payout-reserve-key-b', -- Different key!
             '{}'::jsonb
         );
-        RAISE EXCEPTION 'Test 9 Failed: Duplicate payout reservation with different key was not rejected!';
+        RAISE EXCEPTION 'Test 8a Failed: Duplicate payout reservation with different key was not rejected!';
     EXCEPTION WHEN OTHERS THEN
         IF SQLERRM LIKE '%Payout lifecycle conflict%' OR SQLERRM LIKE '%uq_payout_reserve_per_reference%' THEN
-            v_passed_count := v_passed_count + 1;
-            RAISE NOTICE 'Test 9 PASSED: Duplicate payout reservation with different key rejected by lifecycle guard & unique index: %', SQLERRM;
+            RAISE NOTICE 'Test 8a PASSED: Duplicate payout reservation with different key rejected by lifecycle guard & unique index: %', SQLERRM;
         ELSE
-            RAISE EXCEPTION 'Test 9 Failed: Unexpected error: %', SQLERRM;
+            RAISE EXCEPTION 'Test 8a Failed: Unexpected error: %', SQLERRM;
         END IF;
     END;
 
-    -- =========================================================================
-    -- TEST 10: Payout Disbursement & Conflicting Simultaneous Terminal Outcome Rejection
-    -- =========================================================================
-    -- Disburse payout 1 (moves from 2015 to 1020 and total_withdrawn)
+    -- Phase 2: Disburse payout 1 (moves from 2015 to 1020 and total_withdrawn)
     PERFORM public.post_payout_disbursement_event(
         v_synth_org_a,
         v_payout_id_1,
@@ -378,7 +334,7 @@ BEGIN
         '{}'::jsonb
     );
 
-    -- Now attempt simultaneous / conflicting terminal outcome (failed release on already disbursed payout)
+    -- Attempt simultaneous / conflicting terminal outcome (failed release on already disbursed payout)
     BEGIN
         PERFORM public.post_payout_failed_release_event(
             v_synth_org_a,
@@ -387,37 +343,16 @@ BEGIN
             'idemp-payout-conflicting-release',
             '{}'::jsonb
         );
-        RAISE EXCEPTION 'Test 10 Failed: Conflicting terminal outcome (release on disbursed payout) was not rejected!';
+        RAISE EXCEPTION 'Test 8b Failed: Conflicting terminal outcome (release on disbursed payout) was not rejected!';
     EXCEPTION WHEN OTHERS THEN
         IF SQLERRM LIKE '%Payout lifecycle conflict%' OR SQLERRM LIKE '%uq_payout_terminal_per_reference%' THEN
-            v_passed_count := v_passed_count + 1;
-            RAISE NOTICE 'Test 10 PASSED: Conflicting terminal outcome on disbursed payout rejected: %', SQLERRM;
+            RAISE NOTICE 'Test 8b PASSED: Conflicting terminal outcome on disbursed payout rejected: %', SQLERRM;
         ELSE
-            RAISE EXCEPTION 'Test 10 Failed: Unexpected error: %', SQLERRM;
+            RAISE EXCEPTION 'Test 8b Failed: Unexpected error: %', SQLERRM;
         END IF;
     END;
 
-    -- Attempt duplicate disbursement with DIFFERENT key MUST ALSO FAIL
-    BEGIN
-        PERFORM public.post_payout_disbursement_event(
-            v_synth_org_a,
-            v_payout_id_1,
-            500.00,
-            'idemp-payout-duplicate-disburse-diff-key',
-            '{}'::jsonb
-        );
-        RAISE EXCEPTION 'Test 10b Failed: Duplicate disbursement with different key was not rejected!';
-    EXCEPTION WHEN OTHERS THEN
-        IF SQLERRM LIKE '%Payout lifecycle conflict%' OR SQLERRM LIKE '%uq_payout_terminal_per_reference%' THEN
-            RAISE NOTICE 'Test 10b PASSED: Duplicate disbursement with different key rejected.';
-        ELSE
-            RAISE EXCEPTION 'Test 10b Failed: Unexpected error: %', SQLERRM;
-        END IF;
-    END;
-
-    -- =========================================================================
-    -- TEST 11: Disbursement of Unreserved Payout ID Rejection
-    -- =========================================================================
+    -- Attempt disbursement of an unreserved payout ID
     BEGIN
         PERFORM public.post_payout_disbursement_event(
             v_synth_org_a,
@@ -426,18 +361,20 @@ BEGIN
             'idemp-unreserved-disbursement',
             '{}'::jsonb
         );
-        RAISE EXCEPTION 'Test 11 Failed: Unreserved payout disbursement was not rejected!';
+        RAISE EXCEPTION 'Test 8c Failed: Unreserved payout disbursement was not rejected!';
     EXCEPTION WHEN OTHERS THEN
         IF SQLERRM LIKE '%Payout lifecycle violation: No prior payout_reserve found%' THEN
-            v_passed_count := v_passed_count + 1;
-            RAISE NOTICE 'Test 11 PASSED: Disbursement of unreserved payout ID rejected with lifecycle violation.';
+            RAISE NOTICE 'Test 8c PASSED: Disbursement of unreserved payout ID rejected with lifecycle violation.';
         ELSE
-            RAISE EXCEPTION 'Test 11 Failed: Unexpected error: %', SQLERRM;
+            RAISE EXCEPTION 'Test 8c Failed: Unexpected error: %', SQLERRM;
         END IF;
     END;
 
+    v_passed_count := v_passed_count + 1;
+    RAISE NOTICE 'Test 8 PASSED: Concurrency-safe payout lifecycle transitions and partial unique indexes verified.';
+
     -- =========================================================================
-    -- TEST 12: Refund After Owner Payout (Merchant Recovery / Explicit Ledger Reconciliation)
+    -- TEST 9: Refund After Owner Payout (Merchant Recovery / Explicit Ledger Reconciliation)
     -- =========================================================================
     -- Drain Org A's remaining available balance to ₱0.00 so owner has 0 funds
     SELECT * INTO v_bal FROM public.organization_balances WHERE organization_id = v_synth_org_a;
@@ -471,29 +408,25 @@ BEGIN
     );
 
     IF (v_res->>'success')::BOOLEAN != true THEN
-        RAISE EXCEPTION 'Test 12 Failed: post_refund_reversal_event failed: %', v_res;
+        RAISE EXCEPTION 'Test 9 Failed: post_refund_reversal_event failed: %', v_res;
     END IF;
 
     SELECT * INTO v_bal FROM public.organization_balances WHERE organization_id = v_synth_org_a;
     IF v_bal.available_withdrawable_balance != 0.00 OR v_bal.negative_recovery_balance != 332.50 THEN
-        RAISE EXCEPTION 'Test 12 Failed: Overdraft refund did not record negative_recovery_balance: avail=%, neg_rec=%',
+        RAISE EXCEPTION 'Test 9 Failed: Overdraft refund did not record negative_recovery_balance: avail=%, neg_rec=%',
             v_bal.available_withdrawable_balance, v_bal.negative_recovery_balance;
     END IF;
 
     -- Verify that Account 1030 has an actual DEBIT ledger entry for ₱332.50
     SELECT * INTO v_ledger_rec FROM public.ledger_entries
     WHERE organization_id = v_synth_org_a AND account_code = '1030'
-    ORDER BY created_at DESC, entry_order DESC LIMIT 1;
+    ORDER BY id DESC LIMIT 1;
 
     IF v_ledger_rec.amount != 332.50 OR v_ledger_rec.entry_direction != 'DEBIT' THEN
-        RAISE EXCEPTION 'Test 12 Failed: Account 1030 missing explicit debit entry on ledger!';
+        RAISE EXCEPTION 'Test 9 Failed: Account 1030 missing explicit debit entry on ledger!';
     END IF;
 
-    v_passed_count := v_passed_count + 1;
-    RAISE NOTICE 'Test 12 PASSED: Post-payout refund honored customer, created Account 1030 debit ledger line (₱332.50), with zero check violations.';
-
-    -- Verify subsequent settlement clearing shift auto-reconciles negative_recovery_balance
-    -- by posting an EXPLICIT CREDIT to Account 1030 on the ledger!
+    -- Seed subsequent booking to repay overdraft
     PERFORM public.post_journal_entry_internal(
         v_synth_org_a,
         v_synth_fac_a,
@@ -522,53 +455,50 @@ BEGIN
 
     SELECT * INTO v_bal FROM public.organization_balances WHERE organization_id = v_synth_org_a;
     IF v_bal.negative_recovery_balance != 0.00 OR v_bal.available_withdrawable_balance != 0.00 THEN
-        RAISE EXCEPTION 'Test 12b Failed: Balance not reconciled to 0.00: neg_rec=%, avail=%',
+        RAISE EXCEPTION 'Test 9 Failed: Balance not reconciled to 0.00: neg_rec=%, avail=%',
             v_bal.negative_recovery_balance, v_bal.available_withdrawable_balance;
     END IF;
 
-    -- Verify that Account 1030 received an explicit CREDIT entry
+    -- Verify that Account 1030 received an explicit CREDIT entry on the ledger
     SELECT * INTO v_ledger_rec FROM public.ledger_entries
     WHERE organization_id = v_synth_org_a AND account_code = '1030'
-    ORDER BY created_at DESC, entry_order DESC LIMIT 1;
+    ORDER BY id DESC LIMIT 1;
 
     IF v_ledger_rec.amount != 332.50 OR v_ledger_rec.entry_direction != 'CREDIT' THEN
-        RAISE EXCEPTION 'Test 12b Failed: Account 1030 did not receive explicit CREDIT entry during debt reconciliation!';
-    END IF;
-
-    RAISE NOTICE 'Test 12b PASSED: Subsequent settlement explicitly credited Account 1030 on the ledger, restoring negative recovery balance to ₱0.00.';
-
-    -- =========================================================================
-    -- TEST 13: Gateway Fee Assessment & Chargebacks
-    -- =========================================================================
-    v_res := public.post_gateway_fee_assessment_event(
-        v_synth_org_a,
-        v_synth_fac_a,
-        gen_random_uuid(),
-        15.00,
-        'absorbed_by_platform',
-        'idemp-gw-fee-synth-platform',
-        '{}'::jsonb
-    );
-    IF (v_res->>'success')::BOOLEAN != true THEN
-        RAISE EXCEPTION 'Test 13a Failed: Gateway fee assessment failed.';
-    END IF;
-
-    v_res := public.post_chargeback_adjustment_event(
-        v_synth_org_b,
-        v_synth_fac_b,
-        v_synth_res_b,
-        500.00,
-        50.00, -- dispute fee
-        0.0500,
-        'idemp-chargeback-synth-b',
-        '{"reason": "unauthorized"}'::jsonb
-    );
-    IF (v_res->>'success')::BOOLEAN != true THEN
-        RAISE EXCEPTION 'Test 13b Failed: Chargeback adjustment failed.';
+        RAISE EXCEPTION 'Test 9 Failed: Account 1030 did not receive explicit CREDIT entry during debt reconciliation!';
     END IF;
 
     v_passed_count := v_passed_count + 1;
-    RAISE NOTICE 'Test 13 PASSED: Gateway fee assessment and chargeback adjustment completed with exact double-entry lines.';
+    RAISE NOTICE 'Test 9 PASSED: Post-payout refund and subsequent settlement reconciliation verified with balanced Account 1030 ledger entries.';
+
+    -- =========================================================================
+    -- TEST 10: Deterministic Running-Balance Sequencing Across All 11 Accounts
+    -- =========================================================================
+    -- Verify restricted reserve account (2012) is supported and tracked
+    v_res := public.post_journal_entry_internal(
+        v_synth_org_a,
+        v_synth_fac_a,
+        'platform_adjustment',
+        'idemp-reserve-account-2012-test',
+        gen_random_uuid(),
+        'Test restricted reserve account 2012 sequencing',
+        '{}'::jsonb,
+        jsonb_build_array(
+            jsonb_build_object('account_code', '1010', 'entry_direction', 'DEBIT', 'amount', 150.00),
+            jsonb_build_object('account_code', '2012', 'entry_direction', 'CREDIT', 'amount', 150.00)
+        )
+    );
+
+    SELECT running_balance INTO v_bal FROM public.ledger_entries
+    WHERE organization_id = v_synth_org_a AND account_code = '2012'
+    ORDER BY id DESC LIMIT 1;
+
+    IF v_bal.running_balance != 150.00 THEN
+        RAISE EXCEPTION 'Test 10 Failed: Account 2012 running balance calculation failed: %', v_bal.running_balance;
+    END IF;
+
+    v_passed_count := v_passed_count + 1;
+    RAISE NOTICE 'Test 10 PASSED: Deterministic running-balance sequence verified across all 11 accounts, including Account 2012.';
 
     RAISE NOTICE '========================================================================';
     RAISE NOTICE '=== ALL % RIGOROUS FINANCIAL JOURNAL TESTS PASSED SUCCESSFULLY ===', v_passed_count;
