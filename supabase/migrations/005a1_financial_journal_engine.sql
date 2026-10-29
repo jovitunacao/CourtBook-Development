@@ -12,29 +12,40 @@
 --   - public.ledger_entries
 --   - public.organization_balances
 --
+-- ARCHITECTURAL BOUNDARY & ZERO-TRUST GOVERNANCE:
+--   - An existing reservation and matching price is NOT proof of payment.
+--   - In Phase 4.2.2, public.payments and webhook reconciliation records DO NOT EXIST YET.
+--   - Therefore, ALL provider-dependent financial procedures have EXECUTE REVOKED from
+--     service_role, authenticated, anon, and PUBLIC in this migration.
+--   - NO application role or external caller can create financial transactions or alter
+--     balances until Migration 005B delivers authoritative payments and webhook reconciliation.
+--
 -- DEPLOYABLE ACCOUNTING INFRASTRUCTURE IN 005a1:
---   1. Comprehensive Chart of Accounts & lifecycle transaction types.
+--   1. Comprehensive Chart of Accounts (11 accounts) & lifecycle transaction types.
 --   2. Storage-level uniqueness guards on payout states (defense-in-depth indexes).
 --   3. Private, atomic double-entry engine (post_journal_entry_internal) with
 --      deterministic transaction-number sequence ordering across all 11 accounts.
 --   4. Versioned canonical payload serialization and hashing for full idempotency.
 --   5. Native PostgreSQL table privilege hardening (REVOKE direct INSERT from service_role).
---   6. Authoritative booking capture (post_booking_settlement_event).
+--   6. Immutable ledger line constraints and composite tenant isolation foreign keys.
 --   7. Full refund reversal & merchant overdraft accounting (Account 1030).
---   8. Dispute/chargeback adjustments and undecided gateway fee assessment.
---   9. Excess and late payment liabilities (Account 2030).
+--   8. Dispute/chargeback adjustments and undecided gateway fee accounting logic.
 --
 -- EXPLICIT DEFERRED DEPENDENCIES (Deferred to Migration 005B):
---   - public.payments table (provider transaction IDs, checkout sessions, webhook reconciliation)
+--   - public.payments table (provider transaction IDs, checkout sessions, state machine)
 --   - public.payouts table (payout request state machine, disbursement batch IDs)
 --   - public.organization_payout_methods table (bank accounts, e-wallets, verified KYC state)
 --   - Authoritative gateway settlement batch reconciliation records
 --
 -- EXPLICITLY DISABLED OPERATIONS IN 005a1 (EXECUTE Revoked from service_role):
---   - post_funds_cleared_event (settlement clearance to withdrawable): DISABLED in production
---     until 005B deploys authoritative provider settlement reconciliation records.
+--   - post_booking_settlement_event: DISABLED for service_role until 005B payments table exists.
+--   - post_funds_cleared_event: DISABLED for service_role until 005B settlement batch tables exist.
+--   - post_refund_reversal_event: DISABLED for service_role until 005B verified refund records exist.
+--   - post_chargeback_adjustment_event: DISABLED for service_role until 005B dispute records exist.
+--   - post_gateway_fee_assessment_event: DISABLED for service_role until 005B fee records exist.
 --   - post_payout_reserve_event, post_payout_disbursement_event, post_payout_failed_release_event:
---     DISABLED in production until 005B deploys the authoritative payouts table.
+--     DISABLED for service_role until 005B payouts table exists.
+--   - post_excess_or_late_payment_event: DISABLED for service_role until 005B payments table exists.
 --   - post_journal_entry_internal: PRIVATE internal procedure; uncallable via external RPC.
 -- ==============================================================================
 
@@ -92,7 +103,7 @@ BEGIN
         ));
 
     -- 1.3 Versioned Canonical Financial Payload Hash Column
-    -- Stores SHA-256/MD5 cryptographic digest of canonical financial payload.
+    -- Stores cryptographic hash of canonical financial payload.
     -- Enforces that reused keys with different account allocations or terms FAIL.
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
@@ -785,10 +796,14 @@ $$;
 
 
 -- ==============================================================================
--- 3. Business-Validated Financial Operations
+-- 3. Business Financial Procedures
 -- ==============================================================================
 
--- 3.1 Booking Payment Settlement Capture (Authoritative Source Validated)
+-- 3.1 Booking Payment Settlement Capture
+-- Architectural Guard: An existing reservation and matching price is NOT proof of payment.
+-- In Phase 4.2.2, public.payments does not exist yet. This procedure validates the
+-- server-authoritative reservation price and platform commission rate, but EXECUTE is
+-- strictly REVOKED from service_role until Migration 005B delivers verified payment records.
 CREATE OR REPLACE FUNCTION public.post_booking_settlement_event(
     p_organization_id UUID,
     p_facility_id UUID,
@@ -883,10 +898,6 @@ $$;
 
 
 -- 3.2 Gateway Clearance & Settlement Shift
--- Moves funds from Gateway Clearing (1010) to Platform Settled Cash (1020),
--- and Owner Unsettled (2010) to Owner Available (2011) or Merchant Debt Recovery (1030).
--- NOTE: In 005a1, EXECUTE is strictly REVOKED from service_role. Production execution
--- remains disabled until Migration 005B provider settlement batch reconciliation.
 CREATE OR REPLACE FUNCTION public.post_funds_cleared_event(
     p_organization_id UUID,
     p_facility_id UUID,
@@ -1047,9 +1058,6 @@ BEGIN
         END IF;
     END IF;
 
-    -- Customer Cash Outflow: CREDIT 1020
-    -- Commission Reversal:   DEBIT 4010
-    -- Owner Deductions:      DEBIT 2011, DEBIT 2010, DEBIT 1030 (overdraft receivable)
     v_entries := jsonb_build_array(
         jsonb_build_object('account_code', '1020', 'entry_direction', 'CREDIT', 'amount', p_refund_gross_amount),
         jsonb_build_object('account_code', '4010', 'entry_direction', 'DEBIT', 'amount', v_commission_reversal)
@@ -1276,8 +1284,6 @@ $$;
 
 
 -- 3.6 Payout Hold Reservation (Two-Phase Payout Phase 1)
--- NOTE: In 005a1, EXECUTE is strictly REVOKED from service_role. Production execution
--- remains disabled until Migration 005B deploys the authoritative payouts table.
 CREATE OR REPLACE FUNCTION public.post_payout_reserve_event(
     p_organization_id UUID,
     p_payout_id UUID,
@@ -1357,8 +1363,6 @@ $$;
 
 
 -- 3.7 Payout Disbursement (Two-Phase Payout Phase 2: Success)
--- NOTE: In 005a1, EXECUTE is strictly REVOKED from service_role. Production execution
--- remains disabled until Migration 005B deploys the authoritative payouts table.
 CREATE OR REPLACE FUNCTION public.post_payout_disbursement_event(
     p_organization_id UUID,
     p_payout_id UUID,
@@ -1432,8 +1436,6 @@ $$;
 
 
 -- 3.8 Payout Failed Release (Two-Phase Payout Phase 2: Failure)
--- NOTE: In 005a1, EXECUTE is strictly REVOKED from service_role. Production execution
--- remains disabled until Migration 005B deploys the authoritative payouts table.
 CREATE OR REPLACE FUNCTION public.post_payout_failed_release_event(
     p_organization_id UUID,
     p_payout_id UUID,
@@ -1560,44 +1562,38 @@ $$;
 -- ==============================================================================
 -- 4. Privilege Hardening & Production Boundary Separation
 -- ==============================================================================
+-- ZERO TRUST PRINCIPLE:
+-- In Migration 005a1, EXECUTE is strictly REVOKED from service_role, authenticated,
+-- anon, and PUBLIC for ALL financial mutation procedures.
+-- No client or application role can invoke financial mutations until Migration 005B
+-- deploys authoritative payment records, payout requests, and webhook intake handlers.
 
--- 4.1 Private Internal Engine: REVOKED from ALL roles including service_role.
--- Uncallable as an external RPC by any client.
 REVOKE ALL ON FUNCTION public.post_journal_entry_internal(UUID, UUID, VARCHAR, TEXT, UUID, TEXT, JSONB, JSONB)
     FROM PUBLIC, anon, authenticated, service_role;
 
--- 4.2 Production-Disabled Provider Operations: REVOKED from service_role.
--- Kept disabled in production until Migration 005B provider settlement batch
--- and payouts tables exist.
+REVOKE ALL ON FUNCTION public.post_booking_settlement_event(UUID, UUID, UUID, NUMERIC, NUMERIC, TEXT, JSONB)
+    FROM PUBLIC, anon, authenticated, service_role;
+
 REVOKE ALL ON FUNCTION public.post_funds_cleared_event(UUID, UUID, NUMERIC, TEXT, TEXT, JSONB)
     FROM PUBLIC, anon, authenticated, service_role;
+
+REVOKE ALL ON FUNCTION public.post_refund_reversal_event(UUID, UUID, UUID, NUMERIC, NUMERIC, TEXT, JSONB)
+    FROM PUBLIC, anon, authenticated, service_role;
+
+REVOKE ALL ON FUNCTION public.post_chargeback_adjustment_event(UUID, UUID, UUID, NUMERIC, NUMERIC, NUMERIC, TEXT, JSONB)
+    FROM PUBLIC, anon, authenticated, service_role;
+
+REVOKE ALL ON FUNCTION public.post_gateway_fee_assessment_event(UUID, UUID, UUID, NUMERIC, TEXT, TEXT, JSONB)
+    FROM PUBLIC, anon, authenticated, service_role;
+
 REVOKE ALL ON FUNCTION public.post_payout_reserve_event(UUID, UUID, NUMERIC, TEXT, JSONB)
     FROM PUBLIC, anon, authenticated, service_role;
+
 REVOKE ALL ON FUNCTION public.post_payout_disbursement_event(UUID, UUID, NUMERIC, TEXT, JSONB)
     FROM PUBLIC, anon, authenticated, service_role;
+
 REVOKE ALL ON FUNCTION public.post_payout_failed_release_event(UUID, UUID, NUMERIC, TEXT, JSONB)
     FROM PUBLIC, anon, authenticated, service_role;
 
--- 4.3 Active Production Accounting Routines: REVOKED from PUBLIC, anon, authenticated.
-REVOKE ALL ON FUNCTION public.post_booking_settlement_event(UUID, UUID, UUID, NUMERIC, NUMERIC, TEXT, JSONB)
-    FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.post_refund_reversal_event(UUID, UUID, UUID, NUMERIC, NUMERIC, TEXT, JSONB)
-    FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.post_chargeback_adjustment_event(UUID, UUID, UUID, NUMERIC, NUMERIC, NUMERIC, TEXT, JSONB)
-    FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.post_gateway_fee_assessment_event(UUID, UUID, UUID, NUMERIC, TEXT, TEXT, JSONB)
-    FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.post_excess_or_late_payment_event(UUID, UUID, UUID, NUMERIC, BOOLEAN, TEXT, JSONB)
-    FROM PUBLIC, anon, authenticated;
-
--- 4.4 Active Production Accounting Routines: GRANTED strictly to service_role for backend workers.
-GRANT EXECUTE ON FUNCTION public.post_booking_settlement_event(UUID, UUID, UUID, NUMERIC, NUMERIC, TEXT, JSONB)
-    TO service_role;
-GRANT EXECUTE ON FUNCTION public.post_refund_reversal_event(UUID, UUID, UUID, NUMERIC, NUMERIC, TEXT, JSONB)
-    TO service_role;
-GRANT EXECUTE ON FUNCTION public.post_chargeback_adjustment_event(UUID, UUID, UUID, NUMERIC, NUMERIC, NUMERIC, TEXT, JSONB)
-    TO service_role;
-GRANT EXECUTE ON FUNCTION public.post_gateway_fee_assessment_event(UUID, UUID, UUID, NUMERIC, TEXT, TEXT, JSONB)
-    TO service_role;
-GRANT EXECUTE ON FUNCTION public.post_excess_or_late_payment_event(UUID, UUID, UUID, NUMERIC, BOOLEAN, TEXT, JSONB)
-    TO service_role;
+    FROM PUBLIC, anon, authenticated, service_role;

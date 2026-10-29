@@ -3,6 +3,10 @@
 -- File: tests/supabase/fixtures/005a1_journal_engine_test.sql
 -- Description: Isolated Verification Test Suite for Migration 005a1
 --
+-- STRUCTURE:
+--   PART A: Accounting & Ledger Invariant Tests (Executed as Database Owner / Superuser)
+--   PART B: Role Authorization & Privilege Boundary Tests (Executed as anon, authenticated, service_role)
+--
 -- EXECUTION ENVIRONMENT:
 --   Designed for execution in a disposable local PostgreSQL / Supabase container.
 --   Enclosed entirely within a BEGIN ... ROLLBACK transaction block to guarantee
@@ -11,9 +15,13 @@
 
 BEGIN;
 
+-- ==============================================================================
+-- PART A: Accounting & Ledger Invariant Tests (Database Owner Execution)
+-- ==============================================================================
+
 DO $$
 DECLARE
-    -- Synthetic Test Entities (fully isolated from existing reservations and organizations)
+    -- Synthetic Test Entities conforming strictly to Migrations 001 through 005A schemas
     v_synth_org_a UUID := gen_random_uuid();
     v_synth_org_b UUID := gen_random_uuid();
     v_synth_fac_a UUID := gen_random_uuid();
@@ -33,92 +41,49 @@ DECLARE
     v_passed_count INT := 0;
 BEGIN
     RAISE NOTICE '========================================================================';
-    RAISE NOTICE '=== Starting Phase 4.2.2 Hardened Financial Journal Engine Test Suite ===';
+    RAISE NOTICE '=== PART A: Accounting & Ledger Invariant Tests (Database Owner)      ===';
     RAISE NOTICE '========================================================================';
 
     -- -------------------------------------------------------------------------
-    -- Setup: Provision Synthetic Test Organizations, Facilities, and Reservations
+    -- 1. Provision Synthetic Test Entities (Validating 001-005A Schema Constraints)
     -- -------------------------------------------------------------------------
-    INSERT INTO public.organizations (id, name, slug)
+    -- Organizations: Validates slug regex, length, name length, billing_email
+    INSERT INTO public.organizations (id, name, slug, billing_email)
     VALUES
-        (v_synth_org_a, 'Synthetic Org A', 'synth-org-a-' || substr(gen_random_uuid()::text, 1, 8)),
-        (v_synth_org_b, 'Synthetic Org B', 'synth-org-b-' || substr(gen_random_uuid()::text, 1, 8));
+        (v_synth_org_a, 'Synthetic Pickleball Org A', 'synth-pickle-a-' || substr(gen_random_uuid()::text, 1, 8), 'billing-a@example.com'),
+        (v_synth_org_b, 'Synthetic Badminton Org B', 'synth-badminton-b-' || substr(gen_random_uuid()::text, 1, 8), 'billing-b@example.com');
 
-    INSERT INTO public.organization_balances (organization_id, currency)
+    -- Note: organization_balances row is automatically created by seed_organization_balance_on_create() trigger!
+
+    -- Facilities: Validates slug, default_hourly_rate > 0, currency, booking_confirmation_mode, composite uniqueness
+    INSERT INTO public.facilities (id, organization_id, name, slug, currency, default_hourly_rate, booking_confirmation_mode)
     VALUES
-        (v_synth_org_a, 'PHP'),
-        (v_synth_org_b, 'PHP')
-    ON CONFLICT (organization_id) DO NOTHING;
+        (v_synth_fac_a, v_synth_org_a, 'Synthetic Facility A', 'synth-fac-a-' || substr(gen_random_uuid()::text, 1, 8), '₱', 350.00, 'instant'),
+        (v_synth_fac_b, v_synth_org_b, 'Synthetic Facility B', 'synth-fac-b-' || substr(gen_random_uuid()::text, 1, 8), '₱', 500.00, 'instant');
 
-    INSERT INTO public.facilities (id, organization_id, name, slug, currency, default_hourly_rate)
-    VALUES
-        (v_synth_fac_a, v_synth_org_a, 'Synthetic Facility A', 'synth-fac-a-' || substr(gen_random_uuid()::text, 1, 8), '₱', 350.00),
-        (v_synth_fac_b, v_synth_org_b, 'Synthetic Facility B', 'synth-fac-b-' || substr(gen_random_uuid()::text, 1, 8), '₱', 500.00);
-
+    -- Courts: Validates hourly_rate > 0, sport_type, composite uniqueness (id, facility_id)
     INSERT INTO public.courts (id, facility_id, name, sport_type, hourly_rate)
     VALUES
-        (v_synth_court_a, v_synth_fac_a, 'Synthetic Court A', 'pickleball', 350.00),
-        (v_synth_court_b, v_synth_fac_b, 'Synthetic Court B', 'badminton', 500.00);
+        (v_synth_court_a, v_synth_fac_a, 'Court 1 Pickle', 'pickleball', 350.00),
+        (v_synth_court_b, v_synth_fac_b, 'Court 1 Badminton', 'badminton', 500.00);
 
+    -- Reservations: Validates reference_code (5-20 chars), customer email regex, duration 30-480, chk_reservation_time_order
     INSERT INTO public.reservations (
         id, facility_id, court_id, reference_code, customer_name, customer_email,
         booking_date, start_time, end_time, time_slot_label, duration_minutes,
         price, currency, status
     ) VALUES (
-        v_synth_res_a, v_synth_fac_a, v_synth_court_a, 'SYNTH-RES-A-01', 'Test Guest A', 'guest.a@example.com',
+        v_synth_res_a, v_synth_fac_a, v_synth_court_a, 'SYNTH-RES-A-01', 'Test Customer A', 'customer.a@example.com',
         CURRENT_DATE, now() + interval '1 hour', now() + interval '2 hours', '08:00 - 09:00', 60,
         350.00, '₱', 'confirmed'
     ), (
-        v_synth_res_b, v_synth_fac_b, v_synth_court_b, 'SYNTH-RES-B-01', 'Test Guest B', 'guest.b@example.com',
+        v_synth_res_b, v_synth_fac_b, v_synth_court_b, 'SYNTH-RES-B-01', 'Test Customer B', 'customer.b@example.com',
         CURRENT_DATE, now() + interval '3 hours', now() + interval '4 hours', '10:00 - 11:00', 60,
         500.00, '₱', 'confirmed'
     );
 
-    RAISE NOTICE 'Synthetic fixtures provisioned. Org A: %, Res A: ₱350. Org B: %, Res B: ₱500.',
-        v_synth_org_a, v_synth_org_b;
-
-    -- =========================================================================
-    -- TEST 1: Privilege Boundary Verification (Information Schema Inspection)
-    -- =========================================================================
-    -- 1.1 Verify post_journal_entry_internal is NOT granted to service_role, anon, authenticated
-    SELECT EXISTS (
-        SELECT 1 FROM information_schema.routine_privileges
-        WHERE routine_schema = 'public'
-          AND routine_name = 'post_journal_entry_internal'
-          AND grantee IN ('service_role', 'anon', 'authenticated', 'PUBLIC')
-    ) INTO v_has_priv;
-
-    IF v_has_priv THEN
-        RAISE EXCEPTION 'Test 1 Failed: post_journal_entry_internal has unauthorized EXECUTE grants!';
-    END IF;
-
-    -- 1.2 Verify provider-deferred functions have NO execute grants to service_role in 005a1
-    SELECT EXISTS (
-        SELECT 1 FROM information_schema.routine_privileges
-        WHERE routine_schema = 'public'
-          AND routine_name IN ('post_funds_cleared_event', 'post_payout_reserve_event', 'post_payout_disbursement_event', 'post_payout_failed_release_event')
-          AND grantee = 'service_role'
-    ) INTO v_has_priv;
-
-    IF v_has_priv THEN
-        RAISE EXCEPTION 'Test 1b Failed: Deferred operations (clearing/payouts) are erroneously granted to service_role before 005B!';
-    END IF;
-
-    -- 1.3 Verify direct INSERT on ledger tables is NOT granted to service_role
-    SELECT EXISTS (
-        SELECT 1 FROM information_schema.table_privileges
-        WHERE table_schema = 'public'
-          AND table_name IN ('financial_transactions', 'ledger_entries', 'organization_balances')
-          AND privilege_type IN ('INSERT', 'UPDATE', 'DELETE')
-          AND grantee = 'service_role'
-    ) INTO v_has_priv;
-
-    IF v_has_priv THEN
-        RAISE EXCEPTION 'Test 1c Failed: service_role has direct INSERT/UPDATE/DELETE privileges on financial ledger tables!';
-    END IF;
-
     v_passed_count := v_passed_count + 1;
-    RAISE NOTICE 'Test 1 PASSED: Strict privilege boundaries verified in information_schema.';
+    RAISE NOTICE 'Test 1 PASSED: Synthetic fixtures provisioned satisfying 001-005A schema constraints.';
 
     -- =========================================================================
     -- TEST 2: Authoritative Booking Settlement Capture (₱350 Gross, 5% Commission)
@@ -178,7 +143,7 @@ BEGIN
     -- =========================================================================
     -- TEST 4: Equal Totals with Conflicting Account Allocations Rejection
     -- =========================================================================
-    -- Reusing 'idemp-synth-booking-001' with EQUAL total amounts (₱350) but DIFFERENT account allocation:
+    -- Attempt to reuse 'idemp-synth-booking-001' with EQUAL total amounts (₱350) but DIFFERENT account allocation:
     -- Allocates commission ₱25.00 + owner ₱325.00 instead of ₱17.50 + ₱332.50!
     -- Versioned canonical payload hash comparison MUST reject this!
     BEGIN
@@ -255,7 +220,6 @@ BEGIN
     -- =========================================================================
     -- TEST 7: Settlement Clearance with Explicit Double-Entry Accounting
     -- =========================================================================
-    -- Valid settlement shift in test environment (moving 1010->1020, 2010->2011)
     v_res := public.post_funds_cleared_event(
         v_synth_org_a,
         v_synth_fac_a,
@@ -442,7 +406,7 @@ BEGIN
         )
     );
 
-    -- Now clear the ₱332.50 unsettled funds:
+    -- Clear the ₱332.50 unsettled funds:
     -- Engine MUST post an explicit CREDIT to Account 1030 on the ledger!
     v_res := public.post_funds_cleared_event(
         v_synth_org_a,
@@ -500,10 +464,168 @@ BEGIN
     v_passed_count := v_passed_count + 1;
     RAISE NOTICE 'Test 10 PASSED: Deterministic running-balance sequence verified across all 11 accounts, including Account 2012.';
 
-    RAISE NOTICE '========================================================================';
-    RAISE NOTICE '=== ALL % RIGOROUS FINANCIAL JOURNAL TESTS PASSED SUCCESSFULLY ===', v_passed_count;
-    RAISE NOTICE '========================================================================';
+    RAISE NOTICE '=== ALL % ACCOUNTING INVARIANT TESTS PASSED SUCCESSFULLY ===', v_passed_count;
 END $$;
 
--- Unconditionally roll back entire transaction: zero persistent changes
+
+-- ==============================================================================
+-- PART B: Role Authorization & Privilege Boundary Tests
+-- (Executed with actual anon, authenticated, and service_role privileges)
+-- ==============================================================================
+
+-- ------------------------------------------------------------------------------
+-- B.1 Anonymous Role Authorization Tests (SET ROLE anon)
+-- ------------------------------------------------------------------------------
+SET LOCAL ROLE anon;
+
+DO $$
+BEGIN
+    -- Attempt direct INSERT into financial_transactions
+    BEGIN
+        INSERT INTO public.financial_transactions (
+            organization_id, facility_id, transaction_type, idempotency_key, reference_id, description
+        ) VALUES (
+            gen_random_uuid(), gen_random_uuid(), 'booking_settlement', 'anon-direct-insert', gen_random_uuid(), 'Unauthorized'
+        );
+        RAISE EXCEPTION 'Security Breach: anon was able to INSERT directly into financial_transactions!';
+    EXCEPTION WHEN insufficient_privilege THEN
+        RAISE NOTICE 'Test B.1a PASSED: Direct INSERT by anon denied (SQLSTATE 42501).';
+    END;
+
+    -- Attempt to execute post_booking_settlement_event
+    BEGIN
+        PERFORM public.post_booking_settlement_event(
+            gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), 350.00, 0.0500, 'anon-rpc-call'
+        );
+        RAISE EXCEPTION 'Security Breach: anon was able to call post_booking_settlement_event!';
+    EXCEPTION WHEN insufficient_privilege THEN
+        RAISE NOTICE 'Test B.1b PASSED: post_booking_settlement_event execution by anon denied (SQLSTATE 42501).';
+    END;
+
+    -- Attempt to execute private post_journal_entry_internal
+    BEGIN
+        PERFORM public.post_journal_entry_internal(
+            gen_random_uuid(), gen_random_uuid(), 'booking_settlement', 'anon-internal-call', gen_random_uuid(), 'Test', '{}'::jsonb, '[]'::jsonb
+        );
+        RAISE EXCEPTION 'Security Breach: anon was able to call post_journal_entry_internal!';
+    EXCEPTION WHEN insufficient_privilege THEN
+        RAISE NOTICE 'Test B.1c PASSED: post_journal_entry_internal execution by anon denied (SQLSTATE 42501).';
+    END;
+END $$;
+
+RESET ROLE;
+
+
+-- ------------------------------------------------------------------------------
+-- B.2 Authenticated Role Authorization Tests (SET ROLE authenticated)
+-- ------------------------------------------------------------------------------
+SET LOCAL ROLE authenticated;
+
+DO $$
+BEGIN
+    -- Attempt direct INSERT into financial_transactions
+    BEGIN
+        INSERT INTO public.financial_transactions (
+            organization_id, facility_id, transaction_type, idempotency_key, reference_id, description
+        ) VALUES (
+            gen_random_uuid(), gen_random_uuid(), 'booking_settlement', 'auth-direct-insert', gen_random_uuid(), 'Unauthorized'
+        );
+        RAISE EXCEPTION 'Security Breach: authenticated was able to INSERT directly into financial_transactions!';
+    EXCEPTION WHEN insufficient_privilege THEN
+        RAISE NOTICE 'Test B.2a PASSED: Direct INSERT by authenticated denied (SQLSTATE 42501).';
+    END;
+
+    -- Attempt direct UPDATE on organization_balances
+    BEGIN
+        UPDATE public.organization_balances
+        SET available_withdrawable_balance = 99999.00
+        WHERE organization_id = gen_random_uuid();
+        RAISE EXCEPTION 'Security Breach: authenticated was able to UPDATE organization_balances directly!';
+    EXCEPTION WHEN insufficient_privilege THEN
+        RAISE NOTICE 'Test B.2b PASSED: Direct UPDATE on organization_balances by authenticated denied (SQLSTATE 42501).';
+    END;
+
+    -- Attempt to execute post_booking_settlement_event
+    BEGIN
+        PERFORM public.post_booking_settlement_event(
+            gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), 350.00, 0.0500, 'auth-rpc-call'
+        );
+        RAISE EXCEPTION 'Security Breach: authenticated was able to call post_booking_settlement_event!';
+    EXCEPTION WHEN insufficient_privilege THEN
+        RAISE NOTICE 'Test B.2c PASSED: post_booking_settlement_event execution by authenticated denied (SQLSTATE 42501).';
+    END;
+END $$;
+
+RESET ROLE;
+
+
+-- ------------------------------------------------------------------------------
+-- B.3 Service Role Authorization Tests (SET ROLE service_role)
+-- Verifies zero-trust boundary: service_role has NO execute on financial mutation
+-- procedures and NO direct insert privileges in Phase 4.2.2.
+-- ------------------------------------------------------------------------------
+SET LOCAL ROLE service_role;
+
+DO $$
+BEGIN
+    -- Attempt direct INSERT into financial_transactions as service_role
+    BEGIN
+        INSERT INTO public.financial_transactions (
+            organization_id, facility_id, transaction_type, idempotency_key, reference_id, description
+        ) VALUES (
+            gen_random_uuid(), gen_random_uuid(), 'booking_settlement', 'service-direct-insert', gen_random_uuid(), 'Unauthorized'
+        );
+        RAISE EXCEPTION 'Security Breach: service_role was able to INSERT directly into financial_transactions!';
+    EXCEPTION WHEN insufficient_privilege THEN
+        RAISE NOTICE 'Test B.3a PASSED: Direct INSERT by service_role denied (SQLSTATE 42501).';
+    END;
+
+    -- Attempt direct INSERT into ledger_entries as service_role
+    BEGIN
+        INSERT INTO public.ledger_entries (
+            transaction_id, organization_id, account_code, entry_direction, amount, entry_order, running_balance
+        ) VALUES (
+            gen_random_uuid(), gen_random_uuid(), '1010', 'DEBIT', 100.00, 1, 100.00
+        );
+        RAISE EXCEPTION 'Security Breach: service_role was able to INSERT directly into ledger_entries!';
+    EXCEPTION WHEN insufficient_privilege THEN
+        RAISE NOTICE 'Test B.3b PASSED: Direct INSERT into ledger_entries by service_role denied (SQLSTATE 42501).';
+    END;
+
+    -- Attempt direct UPDATE on organization_balances as service_role
+    BEGIN
+        UPDATE public.organization_balances
+        SET available_withdrawable_balance = 99999.00
+        WHERE organization_id = gen_random_uuid();
+        RAISE EXCEPTION 'Security Breach: service_role was able to UPDATE organization_balances directly!';
+    EXCEPTION WHEN insufficient_privilege THEN
+        RAISE NOTICE 'Test B.3c PASSED: Direct UPDATE on organization_balances by service_role denied (SQLSTATE 42501).';
+    END;
+
+    -- Attempt to execute post_booking_settlement_event as service_role (revoked until 005B)
+    BEGIN
+        PERFORM public.post_booking_settlement_event(
+            gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), 350.00, 0.0500, 'service-rpc-call'
+        );
+        RAISE EXCEPTION 'Security Breach: service_role was able to call post_booking_settlement_event before 005B!';
+    EXCEPTION WHEN insufficient_privilege THEN
+        RAISE NOTICE 'Test B.3d PASSED: post_booking_settlement_event execution by service_role denied (SQLSTATE 42501).';
+    END;
+
+    -- Attempt to execute post_journal_entry_internal as service_role (private internal procedure)
+    BEGIN
+        PERFORM public.post_journal_entry_internal(
+            gen_random_uuid(), gen_random_uuid(), 'booking_settlement', 'service-internal-call', gen_random_uuid(), 'Test', '{}'::jsonb, '[]'::jsonb
+        );
+        RAISE EXCEPTION 'Security Breach: service_role was able to call post_journal_entry_internal!';
+    EXCEPTION WHEN insufficient_privilege THEN
+        RAISE NOTICE 'Test B.3e PASSED: post_journal_entry_internal execution by service_role denied (SQLSTATE 42501).';
+    END;
+
+    RAISE NOTICE '=== ALL ROLE AUTHORIZATION TESTS PASSED SUCCESSFULLY ===';
+END $$;
+
+RESET ROLE;
+
+-- Unconditionally roll back entire test transaction: zero persistent changes
 ROLLBACK;
