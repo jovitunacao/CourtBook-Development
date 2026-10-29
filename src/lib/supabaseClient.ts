@@ -515,7 +515,8 @@ export async function fetchStaffMembershipLookup(
       chosenFacility = availableFacilities[0];
     }
 
-    // If user has organization memberships but no facilities exist, report incomplete workspace error
+    // If user has organization memberships but no facilities exist, return data with null activeFacility
+    // (incomplete onboarding state, not an authentication failure)
     if (allFacilities.length === 0 || !chosenFacility) {
       return {
         data: {
@@ -527,7 +528,7 @@ export async function fetchStaffMembershipLookup(
           courts: [],
         },
         hasMemberships: true,
-        error: `Organization "${activeOrg.name}" has no registered facilities. Facility configuration is required.`,
+        error: null,
       };
     }
 
@@ -1148,6 +1149,23 @@ export async function submitPublicBookingViaFunction(
     };
   }
 }
+// Re-export slug utilities
+export { slugify, isValidSlug, validateSlug } from '../utils/slugify';
 
-
-
+// Re-export owner onboarding service helpers & types (Phase 3 Stage 3.3)
+export {
+  createOrganizationWithOwnerViaRpc,
+  createFacilityForOwner,
+  createCourtsForFacility,
+  getOwnerOnboardingRecoveryState,
+  validateOrganizationInput,
+  validateFacilityInput,
+  validateCourtsInput,
+  type CreateOrgResult,
+  type CreateFacilityInput,
+  type CreateFacilityResult,
+  type CreateCourtItemInput,
+  type CreateCourtsResult,
+  type OwnerOnboardingRecoveryState,
+  type OnboardingStepStatus,
+} from './ownerOnboarding';

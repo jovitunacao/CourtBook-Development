@@ -239,14 +239,13 @@ export const SupabaseAuthProvider: React.FC<{ children: React.ReactNode }> = ({ 
           return;
         }
 
-        // Validate that required facility exists (incomplete workspace must not be treated as ready)
-        if (!lookup.data.activeFacility) {
+        // Requirement 7: Treat an organization with no facility or a facility with no courts as an incomplete
+        // onboarding state (needs_onboarding), not an authentication failure or database error.
+        if (!lookup.data.activeFacility || lookup.data.courts.length === 0) {
           setStaffData(lookup.data);
           setSupabaseReservations([]);
-          setMembershipLookupError(
-            `Organization "${lookup.data.activeOrganization?.name || 'Selected'}" has no active facility configured.`
-          );
-          setOnboardingState('error');
+          setMembershipLookupError(null);
+          setOnboardingState('needs_onboarding');
           return;
         }
 
