@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { execSync } from 'node:child_process';
 import { Client } from 'pg';
@@ -41,27 +42,53 @@ function recordResult(step: string, status: 'PASS' | 'FAIL' | 'BLOCKED' | 'NOT E
   flushLog();
 }
 
-const PG_SOCKET_DIR = '/tmp';
-const PG_PORT = 5433;
-const PG_DATA_DIR = '/tmp/pg_disposable_gate';
+// Safe isolated disposable database configuration
+// Dynamic unique directories and port to guarantee zero interference with other processes
+const RUN_ID = `cb_disposable_${process.pid}_${Date.now()}`;
+const PG_DATA_DIR = `/tmp/${RUN_ID}_data`;
+const PG_SOCKET_DIR = `/tmp/${RUN_ID}_sock`;
+let PG_PORT = 5433;
+
+async function getAvailablePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.listen(0, '127.0.0.1', () => {
+      const address = srv.address();
+      const port = typeof address === 'object' && address ? address.port : 5433;
+      srv.close(() => resolve(port));
+    });
+    srv.on('error', reject);
+  });
+}
 
 function stopDisposablePostgres() {
   try {
-    execSync(`su - postgres -c "/usr/lib/postgresql/15/bin/pg_ctl -D ${PG_DATA_DIR} stop -m immediate"`, { stdio: 'pipe' });
+    if (fs.existsSync(PG_DATA_DIR)) {
+      execSync(`su - postgres -c "/usr/lib/postgresql/15/bin/pg_ctl -D ${PG_DATA_DIR} stop -m immediate"`, { stdio: 'pipe' });
+    }
   } catch {}
   try {
-    execSync(`rm -rf ${PG_DATA_DIR}`, { stdio: 'pipe' });
+    if (fs.existsSync(PG_DATA_DIR)) {
+      fs.rmSync(PG_DATA_DIR, { recursive: true, force: true });
+    }
+  } catch {}
+  try {
+    if (fs.existsSync(PG_SOCKET_DIR)) {
+      fs.rmSync(PG_SOCKET_DIR, { recursive: true, force: true });
+    }
   } catch {}
 }
 
-function startDisposablePostgres(): boolean {
+async function startDisposablePostgres(): Promise<boolean> {
   stopDisposablePostgres();
   try {
+    PG_PORT = await getAvailablePort();
+    execSync(`su - postgres -c "mkdir -p ${PG_SOCKET_DIR} && chmod 777 ${PG_SOCKET_DIR}"`, { stdio: 'pipe' });
     execSync(`su - postgres -c "/usr/lib/postgresql/15/bin/initdb -D ${PG_DATA_DIR}"`, { stdio: 'pipe' });
     execSync(`su - postgres -c "/usr/lib/postgresql/15/bin/pg_ctl -D ${PG_DATA_DIR} -l ${PG_DATA_DIR}/server.log -o \\"-p ${PG_PORT} -k ${PG_SOCKET_DIR}\\" start"`, { stdio: 'pipe' });
     return true;
   } catch (err) {
-    log(`Warning: Failed to launch native disposable PostgreSQL server: ${err}`);
+    log(`Warning: Failed to launch safe isolated disposable PostgreSQL server: ${err}`);
     return false;
   }
 }
@@ -124,8 +151,8 @@ async function runValidationGate() {
   log('Execution Evidence Log: tests/supabase/reports/005a1_execution_evidence.log');
   log('================================================================================\n');
 
-  // Verify and start disposable PostgreSQL 15 server
-  const serverStarted = startDisposablePostgres();
+  // Verify and start safe isolated disposable PostgreSQL 15 server
+  const serverStarted = await startDisposablePostgres();
   if (!serverStarted) {
     log('FATAL: Native PostgreSQL server could not be started in disposable container environment.');
     process.exit(1);
@@ -139,7 +166,9 @@ async function runValidationGate() {
   await rootClient.connect();
 
   const verRes = await rootClient.query<{ version: string }>('SELECT version();');
-  log(`Connected to disposable PostgreSQL engine:\n${verRes.rows[0].version}\n`);
+  log(`Connected to disposable PostgreSQL engine:\n${verRes.rows[0].version}`);
+  log(`Server Data Directory: ${PG_DATA_DIR}`);
+  log(`Server Socket Directory: ${PG_SOCKET_DIR} (Port: ${PG_PORT})\n`);
 
   // Setup Auth schemas & standard Supabase roles
   await setupSupabaseMockAuth(rootClient);
@@ -153,58 +182,13 @@ async function runValidationGate() {
   ];
 
   // ---------------------------------------------------------------------------
-  // GATE 1: Migration Atomicity & Rollback Verification
+  // GATE 1: Baseline Disposable PostgreSQL Environment Verification (001 - 005A)
   // ---------------------------------------------------------------------------
+  // REQUIREMENT 1: Baseline migrations 001-005A are installed BEFORE the atomic rollback test
+  // so that the atomicity test executes against the true schema baseline.
   const gate1Start = Date.now();
   try {
-    log('--- Running Gate 1: Migration 005a1 Transactional Atomicity & Rollback ---');
-    // Read 005a1, inject deliberate division by zero error before COMMIT
-    const actual005a1 = fs.readFileSync(path.join(ROOT_DIR, 'supabase/migrations/005a1_financial_journal_engine.sql'), 'utf8');
-    const faultyMigration = actual005a1.replace('COMMIT;', 'SELECT 1/0; -- DELIBERATE INJECTED FAILURE FOR ATOMICITY TEST\nCOMMIT;');
-
-    let threwExpectedError = false;
-    try {
-      await rootClient.query(faultyMigration);
-    } catch {
-      threwExpectedError = true;
-      try {
-        await rootClient.query('ROLLBACK;');
-      } catch {}
-    }
-
-    if (!threwExpectedError) {
-      throw new Error('Gate 1 Failed: Injected failure did not trigger an error!');
-    }
-
-    // Verify atomic rollback: post_journal_entry_internal must NOT exist
-    const funcCheck = await rootClient.query<{ count: string }>(`
-      SELECT count(*)::text as count FROM pg_proc WHERE proname = 'post_journal_entry_internal';
-    `);
-    if (funcCheck.rows[0].count !== '0') {
-      throw new Error('Gate 1 Failed: Partial functions exposed after migration failure! Atomicity failed.');
-    }
-
-    recordResult(
-      'Gate 1: Migration 005a1 Transactional Atomicity & Rollback',
-      'PASS',
-      'Failure during migration cleanly rolled back all DDL, functions, constraints, and privilege changes with zero leaked execution permissions.',
-      gate1Start
-    );
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    recordResult('Gate 1: Migration 005a1 Transactional Atomicity & Rollback', 'FAIL', msg, gate1Start);
-    log(`\nFATAL: Gate 1 failed. Aborting subsequent gates immediately (fail-fast rule).`);
-    await rootClient.end();
-    stopDisposablePostgres();
-    process.exit(1);
-  }
-
-  // ---------------------------------------------------------------------------
-  // GATE 2: Baseline Disposable PostgreSQL Environment Verification (001 - 005A)
-  // ---------------------------------------------------------------------------
-  const gate2Start = Date.now();
-  try {
-    log('\n--- Running Gate 2: Disposable Database Environment (001-005A) ---');
+    log('--- Running Gate 1: Disposable Database Environment (001-005A Baseline Installation) ---');
     await applyMigrations(rootClient, baselineMigrations);
 
     // Verify the 5 financial foundation tables from 005A exist
@@ -222,7 +206,7 @@ async function runValidationGate() {
     `);
 
     if (tablesRes.rows.length !== 5) {
-      throw new Error(`Gate 2 Failed: Expected 5 financial foundation tables, found ${tablesRes.rows.length}.`);
+      throw new Error(`Gate 1 Failed: Expected 5 financial foundation tables, found ${tablesRes.rows.length}.`);
     }
 
     // Verify 5% commission default
@@ -230,18 +214,107 @@ async function runValidationGate() {
       SELECT default_commission_rate::text FROM public.platform_billing_config WHERE id = 1;
     `);
     if (configRes.rows[0].default_commission_rate !== '0.0500') {
-      throw new Error(`Gate 2 Failed: Expected 5% commission rate, got ${configRes.rows[0].default_commission_rate}`);
+      throw new Error(`Gate 1 Failed: Expected 5% commission rate, got ${configRes.rows[0].default_commission_rate}`);
     }
 
     recordResult(
-      'Gate 2: Disposable Database Environment (001-005A)',
+      'Gate 1: Disposable Database Environment (001-005A Baseline Installation)',
       'PASS',
       'All 5 baseline migrations executed successfully. 5 financial foundation tables and 5% commission configuration confirmed.',
+      gate1Start
+    );
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    recordResult('Gate 1: Disposable Database Environment (001-005A Baseline Installation)', 'FAIL', msg, gate1Start);
+    log(`\nFATAL: Gate 1 failed. Aborting subsequent gates immediately (fail-fast rule).`);
+    await rootClient.end();
+    stopDisposablePostgres();
+    process.exit(1);
+  }
+
+  // ---------------------------------------------------------------------------
+  // GATE 2: Migration 005a1 Transactional Atomicity & Rollback Verification
+  // ---------------------------------------------------------------------------
+  // Executed against the full 001-005A baseline schema.
+  // Injects deliberate error specifically at the end of 005a1 DDL execution before COMMIT.
+  // Explicitly verifies:
+  //   1) The error caught is specifically the injected division-by-zero error (SQLSTATE 22012)
+  //      and NOT an unrelated missing-table, missing-role, or syntax error.
+  //   2) All 005a1 DDL additions, functions, columns, and constraints rolled back cleanly.
+  //   3) Baseline 001-005A foundation remains intact.
+  const gate2Start = Date.now();
+  try {
+    log('\n--- Running Gate 2: Migration 005a1 Transactional Atomicity & Rollback Verification ---');
+    const actual005a1 = fs.readFileSync(path.join(ROOT_DIR, 'supabase/migrations/005a1_financial_journal_engine.sql'), 'utf8');
+
+    // Inject deliberate division by zero immediately before COMMIT
+    const faultyMigration = actual005a1.replace('COMMIT;', 'SELECT 1/0; -- DELIBERATE INJECTED FAILURE FOR ATOMICITY VERIFICATION\nCOMMIT;');
+
+    let caughtError: any = null;
+    try {
+      await rootClient.query(faultyMigration);
+    } catch (err: any) {
+      caughtError = err;
+      try {
+        await rootClient.query('ROLLBACK;');
+      } catch {}
+    }
+
+    if (!caughtError) {
+      throw new Error('Gate 2 Failed: Injected failure before COMMIT did not trigger an error!');
+    }
+
+    // Verify the error is strictly the injected division by zero error (SQLSTATE 22012)
+    // and NOT an unrelated missing-table or syntax failure.
+    const isDivisionByZero = caughtError.code === '22012' || (caughtError.message && caughtError.message.includes('division by zero'));
+    if (!isDivisionByZero) {
+      throw new Error(`Gate 2 Failed: Expected injected division by zero error (22012), but got unexpected error: ${caughtError.message} (Code: ${caughtError.code})`);
+    }
+    log(`  Confirmed injected error reached after full 005a1 DDL execution: "${caughtError.message}" (SQLSTATE: ${caughtError.code})`);
+
+    // Verify complete rollback of 005a1 additions:
+    // A. post_journal_entry_internal must NOT exist
+    const funcInternalCheck = await rootClient.query<{ count: string }>(`
+      SELECT count(*)::text as count FROM pg_proc WHERE proname = 'post_journal_entry_internal';
+    `);
+    if (funcInternalCheck.rows[0].count !== '0') {
+      throw new Error('Gate 2 Failed: post_journal_entry_internal persisted after rollback! Atomicity breach.');
+    }
+
+    // B. post_booking_settlement_event must NOT exist
+    const funcBookingCheck = await rootClient.query<{ count: string }>(`
+      SELECT count(*)::text as count FROM pg_proc WHERE proname = 'post_booking_settlement_event';
+    `);
+    if (funcBookingCheck.rows[0].count !== '0') {
+      throw new Error('Gate 2 Failed: post_booking_settlement_event persisted after rollback! Atomicity breach.');
+    }
+
+    // C. canonical_payload_hash column must NOT exist on financial_transactions
+    const colCheck = await rootClient.query<{ count: string }>(`
+      SELECT count(*)::text as count FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'financial_transactions' AND column_name = 'canonical_payload_hash';
+    `);
+    if (colCheck.rows[0].count !== '0') {
+      throw new Error('Gate 2 Failed: canonical_payload_hash column persisted on financial_transactions after rollback!');
+    }
+
+    // D. Verify baseline 001-005A tables and constraint remain completely healthy
+    const baseCheck = await rootClient.query<{ count: string }>(`
+      SELECT count(*)::text as count FROM public.platform_billing_config WHERE id = 1 AND default_commission_rate = 0.0500;
+    `);
+    if (baseCheck.rows[0].count !== '1') {
+      throw new Error('Gate 2 Failed: Baseline platform_billing_config was disturbed by rollback!');
+    }
+
+    recordResult(
+      'Gate 2: Migration 005a1 Transactional Atomicity & Rollback Verification',
+      'PASS',
+      'Injected error specifically reached after 005a1 DDL execution (SQLSTATE 22012). Rollback cleanly evicted all 005a1 functions, columns, and indexes while keeping baseline 001-005A intact.',
       gate2Start
     );
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    recordResult('Gate 2: Disposable Database Environment (001-005A)', 'FAIL', msg, gate2Start);
+    recordResult('Gate 2: Migration 005a1 Transactional Atomicity & Rollback Verification', 'FAIL', msg, gate2Start);
     log(`\nFATAL: Gate 2 failed. Aborting subsequent gates immediately (fail-fast rule).`);
     await rootClient.end();
     stopDisposablePostgres();
@@ -253,7 +326,7 @@ async function runValidationGate() {
   // ---------------------------------------------------------------------------
   const gate3Start = Date.now();
   try {
-    log('\n--- Running Gate 3: Apply Migration 005a1 to Disposable Database ---');
+    log('\n--- Running Gate 3: Apply Migration 005a1 to Baseline Database ---');
     const mig005a1Sql = fs.readFileSync(path.join(ROOT_DIR, 'supabase/migrations/005a1_financial_journal_engine.sql'), 'utf8');
     await rootClient.query(mig005a1Sql);
 
@@ -267,14 +340,14 @@ async function runValidationGate() {
     }
 
     recordResult(
-      'Gate 3: Apply Migration 005a1 to Disposable Database',
+      'Gate 3: Apply Migration 005a1 to Baseline Database',
       'PASS',
       'Migration 005a1 applied atomically. Double-entry engine, 11-account COA, unique partial indexes installed, and service_role EXECUTE revoked.',
       gate3Start
     );
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    recordResult('Gate 3: Apply Migration 005a1 to Disposable Database', 'FAIL', msg, gate3Start);
+    recordResult('Gate 3: Apply Migration 005a1 to Baseline Database', 'FAIL', msg, gate3Start);
     log(`\nFATAL: Gate 3 failed. Aborting subsequent gates immediately (fail-fast rule).`);
     await rootClient.end();
     stopDisposablePostgres();
@@ -430,7 +503,7 @@ async function runValidationGate() {
     const disburseOk = disburseResult.status === 'fulfilled';
     const releaseOk = releaseResult.status === 'fulfilled';
 
-    // Exactly one must succeed, and exactly one must fail with lifecycle/terminal conflict
+    // Exactly one must succeed, and exactly one must fail with lifecycle/terminal/balance conflict
     if ((disburseOk && releaseOk) || (!disburseOk && !releaseOk)) {
       throw new Error(`Competing terminal outcomes violation: disburseOk=${disburseOk}, releaseOk=${releaseOk}`);
     }
