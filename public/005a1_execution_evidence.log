@@ -1,0 +1,34 @@
+================================================================================
+CourtBook / BookSuite — Phase 4.2.2 PostgreSQL Execution Validation Gate
+Runtime Environment: Node.js v22.23.4 on Debian GNU/Linux 12 (bookworm)
+Target Migration: supabase/migrations/005a1_financial_journal_engine.sql
+Test Fixture: tests/supabase/fixtures/005a1_journal_engine_test.sql
+Execution Evidence Log: tests/supabase/reports/005a1_execution_evidence.log
+================================================================================
+
+Connected to disposable PostgreSQL engine:
+PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit
+Server Data Directory: /tmp/cb_disposable_2257_1793363796358_data
+Server Socket Directory: /tmp/cb_disposable_2257_1793363796358_sock (Port: 31152)
+
+--- Running Gate 1: Disposable Database Environment (001-005A Baseline Installation) ---
+[PASS] Gate 1: Disposable Database Environment (001-005A Baseline Installation) (117ms): All 5 baseline migrations executed successfully. 5 financial foundation tables and 5% commission configuration confirmed.
+
+--- Running Gate 2: Migration 005a1 Transactional Atomicity & Rollback Verification ---
+  Confirmed injected error reached after full 005a1 DDL execution: "division by zero" (SQLSTATE: 22012)
+[PASS] Gate 2: Migration 005a1 Transactional Atomicity & Rollback Verification (38ms): Injected error specifically reached after 005a1 DDL execution (SQLSTATE 22012). Rollback cleanly evicted all 005a1 functions, columns, and indexes while keeping baseline 001-005A intact.
+
+--- Running Gate 3: Apply Migration 005a1 to Baseline Database ---
+[PASS] Gate 3: Apply Migration 005a1 to Baseline Database (27ms): Migration 005a1 applied atomically. Double-entry engine, 11-account COA, unique partial indexes installed, and service_role EXECUTE revoked.
+
+--- Running Gate 4: Synthetic Accounting (Part A) & Role Authorization (Part B) Test Suite ---
+[PASS] Gate 4: Synthetic Accounting (Part A) & Role Authorization (Part B) Test Suite (55ms): All 10 accounting invariant tests and role privilege boundaries (anon, authenticated, service_role) passed without error.
+
+--- Running Gate 5: Genuine Concurrent-Session Concurrency Tests ---
+  Verified 2 independent concurrent PostgreSQL sessions: Session 1 PID=2318, Session 2 PID=2319
+  5A PASSED: 2 simultaneous booking postings with same key created exactly 1 financial transaction (9b476732-e3d5-4968-a64d-4f8e0b3152ca).
+  5B PASSED: Competing payout terminal outcomes (disbursement vs failed-release) safely resolved with exactly 1 winner and 1 rejected conflict.
+[PASS] Gate 5: Genuine Concurrent-Session Concurrency Tests (59ms): Duplicate booking settlement safely serialized across 2 independent PostgreSQL sessions (PIDs 2318, 2319). Competing payout outcomes safely resolved with exactly 1 winner and 1 rejected conflict.
+
+--- Running Gate 6: Global & Per-Transaction Ledger Debit/Credit Reconciliation ---
+[PASS] Gate 6: Global & Per-Transaction Ledger Debit/Credit Reconciliation (4ms): Global debits (₱2740.00) equal credits (₱2740.00). All individual transactions balanced. All organization balances reconcile 100% against ledger subaccounts (2010, 2011, 2015, 1030).
