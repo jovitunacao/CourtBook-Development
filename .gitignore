@@ -4,5 +4,7 @@ dist/
 coverage/
 .DS_Store
 *.log
+!tests/supabase/reports/*.log
 .env*
 !.env.example
+
