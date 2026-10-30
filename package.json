@@ -10,6 +10,7 @@
     "test:supabase": "tsx tests/supabase/run-all.ts",
     "test:isolation": "tsx tests/supabase/run-isolation.ts",
     "test:write-isolation": "tsx tests/supabase/run-write-isolation.ts",
+    "test:005a1": "tsx tests/supabase/run-005a1-validation-gate.ts",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit"
   },
@@ -27,6 +28,8 @@
     "vite": "^8.3.0"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.5.13",
+    "@types/express": "^4.17.21",
     "@types/node": "^22.14.0",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
@@ -34,7 +37,6 @@
     "esbuild": "^0.28.0",
     "tailwindcss": "^4.3.3",
     "tsx": "^4.21.0",
-    "typescript": "^7.0.2",
-    "@types/express": "^4.17.21"
+    "typescript": "^7.0.2"
   }
 }

@@ -48,6 +48,7 @@
 --   - post_excess_or_late_payment_event: DISABLED for service_role until 005B payments table exists.
 --   - post_journal_entry_internal: PRIVATE internal procedure; uncallable via external RPC.
 -- ==============================================================================
+BEGIN;
 
 -- ==============================================================================
 -- 1. Schema Refinements & Storage Constraints on Foundation Tables
@@ -538,6 +539,27 @@ BEGIN
         ELSIF v_clean_type IN ('excess_payment_liability', 'late_payment_liability') THEN
             IF v_entry_account NOT IN ('1010', '2030') THEN
                 RAISE EXCEPTION 'Account % not permitted for excess/late payment liabilities.', v_entry_account;
+            END IF;
+
+        ELSIF v_clean_type = 'platform_adjustment' THEN
+            IF v_entry_account = '2011' THEN
+                IF v_entry_direction = 'CREDIT' THEN
+                    v_delta_available_withdrawable := v_delta_available_withdrawable + v_entry_amount;
+                ELSE
+                    v_delta_available_withdrawable := v_delta_available_withdrawable - v_entry_amount;
+                END IF;
+            ELSIF v_entry_account = '2010' THEN
+                IF v_entry_direction = 'CREDIT' THEN
+                    v_delta_unsettled_clearing := v_delta_unsettled_clearing + v_entry_amount;
+                ELSE
+                    v_delta_unsettled_clearing := v_delta_unsettled_clearing - v_entry_amount;
+                END IF;
+            ELSIF v_entry_account = '1030' THEN
+                IF v_entry_direction = 'DEBIT' THEN
+                    v_delta_negative_recovery := v_delta_negative_recovery + v_entry_amount;
+                ELSE
+                    v_delta_negative_recovery := v_delta_negative_recovery - v_entry_amount;
+                END IF;
             END IF;
 
         END IF;
@@ -1597,3 +1619,5 @@ REVOKE ALL ON FUNCTION public.post_payout_failed_release_event(UUID, UUID, NUMER
 
 REVOKE ALL ON FUNCTION public.post_excess_or_late_payment_event(UUID, UUID, UUID, NUMERIC, BOOLEAN, TEXT, JSONB)
     FROM PUBLIC, anon, authenticated, service_role;
+
+COMMIT;
