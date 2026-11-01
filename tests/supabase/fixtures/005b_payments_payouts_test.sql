@@ -15,7 +15,7 @@
 --   9. Payout State Machine Transitions & Audit Trail
 --   10. Settlement Reconciliation Discrepancies & Safeguards
 --   11. Gateway & Payout Fee Policy Undecided Status Preservation
---   12. Application-Role Authorization & Security Hardening
+--   12. Gateway and Payout Fee Policies Confirmed Undecided
 --   13. Preservation of Existing Booking System
 --   14. SECURITY REVIEW 1: Cross-Tenant Payout Method Rejection (fk_payouts_method_org)
 --   15. SECURITY REVIEW 2: Cross-Tenant Settlement Payment Reference Rejection (fk_settlement_items_payment_org_fac)
@@ -23,7 +23,8 @@
 --   17. SECURITY REVIEW 4: Duplicate Capture Attempt After Refund & Dispute Rejection (uq_captured_payment_lifecycle_per_reservation)
 --   18. SECURITY REVIEW 5: Unauthorized Changes to Payout Amount / Destination Rejection
 --   19. SECURITY REVIEW 6: Webhook Signature Evidence Tampering Rejection
---   20. SECURITY REVIEW 7: Payout-Method Sensitive-Data Protection from Staff Roles
+--   20. SECURITY REVIEW 7: Payout Token Confidentiality, Access Control & Token Denial
+--   21. SECURITY REVIEW 8: Null-Safe Identifier Immutability (IS DISTINCT FROM)
 -- ==============================================================================
 
 BEGIN;
@@ -83,6 +84,9 @@ BEGIN
         v_synth_res_c, v_synth_fac_a, v_synth_court_a, 'SYNTH-RES-05B-C', 'Customer C', 'customer.c@example.com',
         CURRENT_DATE, now() + interval '3 hours', now() + interval '4 hours', '11:00 - 12:00', 60, 350.00, '₱', 'confirmed'
     );
+
+    PERFORM set_config('app.test_org_a', v_synth_org_a::text, false);
+    PERFORM set_config('app.test_org_b', v_synth_org_b::text, false);
 
     -- -------------------------------------------------------------------------
     -- TEST 1: Cross-Tenant Payment Isolation & Composite Foreign Key Rejection
@@ -289,6 +293,25 @@ BEGIN
     EXCEPTION WHEN check_violation THEN
         v_test_count := v_test_count + 1;
         RAISE NOTICE 'Test 6b PASSED: Unsupported currency rejected by currency CHECK constraint.';
+    END;
+
+    -- -------------------------------------------------------------------------
+    -- TEST 7: Incorrect Reservation Ownership Checks (fk_payments_reservation_facility)
+    -- -------------------------------------------------------------------------
+    BEGIN
+        INSERT INTO public.payments (
+            organization_id, facility_id, reservation_id, expected_amount,
+            commission_rate, commission_amount, owner_gross_share, status
+        ) VALUES (
+            v_synth_org_b,
+            v_synth_fac_b,
+            v_synth_res_a, -- Belongs to Facility A!
+            350.00, 0.0500, 17.50, 332.50, 'pending'
+        );
+        RAISE EXCEPTION 'Test 7 Failed: Cross-facility reservation mismatch was not rejected!';
+    EXCEPTION WHEN foreign_key_violation THEN
+        v_test_count := v_test_count + 1;
+        RAISE NOTICE 'Test 7 PASSED: Reservation facility mismatch rejected by fk_payments_reservation_facility.';
     END;
 
     -- -------------------------------------------------------------------------
@@ -600,71 +623,224 @@ BEGIN
         END IF;
     END;
 
+    -- -------------------------------------------------------------------------
+    -- TEST 21: Null-Safe Identifier Immutability (IS DISTINCT FROM)
+    -- -------------------------------------------------------------------------
+    -- Setup payment with established provider identifiers
+    INSERT INTO public.payments (
+        id, organization_id, facility_id, reservation_id, expected_amount,
+        commission_rate, commission_amount, owner_gross_share, status,
+        provider_name, provider_payment_id, checkout_session_id, capture_idempotency_key
+    ) VALUES (
+        gen_random_uuid(), v_synth_org_a, v_synth_fac_a, v_synth_res_c,
+        350.00, 0.0500, 17.50, 332.50, 'pending',
+        'paymongo', 'pay_est_ident_123', 'cs_est_ident_456', 'idem_est_ident_789'
+    ) RETURNING id INTO v_payment_id;
+
+    -- 21a: Attempt to clear provider_payment_id to NULL
+    BEGIN
+        UPDATE public.payments
+        SET provider_payment_id = NULL
+        WHERE id = v_payment_id;
+        RAISE EXCEPTION 'Test 21a Failed: Established provider_payment_id was cleared to NULL!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Financial snapshot, ownership, and established provider identity fields in payments table are strictly immutable%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 21a PASSED: Clearing established provider_payment_id to NULL rejected by IS DISTINCT FROM immutability check.';
+        ELSE
+            RAISE EXCEPTION 'Test 21a Failed: Unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    -- 21b: Attempt to overwrite provider_payment_id
+    BEGIN
+        UPDATE public.payments
+        SET provider_payment_id = 'pay_overwritten_id'
+        WHERE id = v_payment_id;
+        RAISE EXCEPTION 'Test 21b Failed: Established provider_payment_id was overwritten!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Financial snapshot, ownership, and established provider identity fields in payments table are strictly immutable%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 21b PASSED: Overwriting established provider_payment_id rejected by IS DISTINCT FROM immutability check.';
+        ELSE
+            RAISE EXCEPTION 'Test 21b Failed: Unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    -- 21c: Attempt to clear checkout_session_id to NULL
+    BEGIN
+        UPDATE public.payments
+        SET checkout_session_id = NULL
+        WHERE id = v_payment_id;
+        RAISE EXCEPTION 'Test 21c Failed: Established checkout_session_id was cleared to NULL!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Financial snapshot, ownership, and established provider identity fields in payments table are strictly immutable%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 21c PASSED: Clearing established checkout_session_id to NULL rejected by IS DISTINCT FROM immutability check.';
+        ELSE
+            RAISE EXCEPTION 'Test 21c Failed: Unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    -- 21d: Attempt to clear capture_idempotency_key to NULL
+    BEGIN
+        UPDATE public.payments
+        SET capture_idempotency_key = NULL
+        WHERE id = v_payment_id;
+        RAISE EXCEPTION 'Test 21d Failed: Established capture_idempotency_key was cleared to NULL!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Financial snapshot, ownership, and established provider identity fields in payments table are strictly immutable%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 21d PASSED: Clearing established capture_idempotency_key to NULL rejected by IS DISTINCT FROM immutability check.';
+        ELSE
+            RAISE EXCEPTION 'Test 21d Failed: Unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    -- 21e: Attempt to clear provider_payout_id to NULL on payouts
+    BEGIN
+        UPDATE public.payouts
+        SET provider_payout_id = NULL
+        WHERE id = v_payout_id;
+        RAISE EXCEPTION 'Test 21e Failed: Established provider_payout_id was cleared to NULL!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Payout amount, currency, organization, and destination method are strictly immutable%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 21e PASSED: Clearing established provider_payout_id to NULL rejected by IS DISTINCT FROM immutability check.';
+        ELSE
+            RAISE EXCEPTION 'Test 21e Failed: Unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
     RAISE NOTICE '=== ALL % DATABASE TESTS COMPLETED SUCCESSFULLY ===', v_test_count;
 END $$;
 
 -- ------------------------------------------------------------------------------
--- TEST 20: SECURITY REVIEW 7: Payout-Method Sensitive-Data Protection from Staff
+-- TEST 20: Payout Token Confidentiality, Access Control & Token Denial
 -- ------------------------------------------------------------------------------
--- Provision test users: Owner User and Staff User
+-- Provision test users: Owner User A, Staff User A, Owner User B
 DO $$
 DECLARE
-    v_owner_user_id UUID := gen_random_uuid();
-    v_staff_user_id UUID := gen_random_uuid();
-    v_test_org_id UUID;
+    v_owner_a UUID := gen_random_uuid();
+    v_staff_a UUID := gen_random_uuid();
+    v_owner_b UUID := gen_random_uuid();
+    v_org_a UUID := current_setting('app.test_org_a', true)::UUID;
+    v_org_b UUID := current_setting('app.test_org_b', true)::UUID;
 BEGIN
-    SELECT id INTO v_test_org_id FROM public.organizations LIMIT 1;
-
     -- Insert mock auth users
     INSERT INTO auth.users (id, email) VALUES
-        (v_owner_user_id, 'owner@example.com'),
-        (v_staff_user_id, 'staff@example.com')
+        (v_owner_a, 'owner.a@example.com'),
+        (v_staff_a, 'staff.a@example.com'),
+        (v_owner_b, 'owner.b@example.com')
     ON CONFLICT DO NOTHING;
 
-    -- Map roles in organization_members
+    -- Map roles in organization_members:
+    -- Org A: Owner A and Staff A
+    -- Org B: Owner B
     INSERT INTO public.organization_members (organization_id, user_id, role) VALUES
-        (v_test_org_id, v_owner_user_id, 'owner'),
-        (v_test_org_id, v_staff_user_id, 'staff')
+        (v_org_a, v_owner_a, 'owner'),
+        (v_org_a, v_staff_a, 'staff'),
+        (v_org_b, v_owner_b, 'owner')
     ON CONFLICT DO NOTHING;
 
-    PERFORM set_config('app.test_staff_uid', v_staff_user_id::text, false);
-    PERFORM set_config('app.test_owner_uid', v_owner_user_id::text, false);
+    PERFORM set_config('app.test_owner_a_uid', v_owner_a::text, false);
+    PERFORM set_config('app.test_staff_a_uid', v_staff_a::text, false);
+    PERFORM set_config('app.test_owner_b_uid', v_owner_b::text, false);
 END $$;
 
--- Test Staff User: Cannot SELECT from public.payout_methods table
+-- 20a: Staff User cannot query public.payout_methods table (RLS returns 0 rows)
 SET LOCAL ROLE authenticated;
-
 DO $$
 DECLARE
-    v_staff_uid UUID := current_setting('app.test_staff_uid', true)::UUID;
+    v_staff_uid UUID := current_setting('app.test_staff_a_uid', true)::UUID;
     v_count INT;
 BEGIN
     PERFORM set_config('request.jwt.claim.sub', v_staff_uid::text, true);
 
-    -- RLS policy filters out payout_methods for staff (only owner and admin allowed)
     SELECT count(*) INTO v_count FROM public.payout_methods;
     IF v_count != 0 THEN
         RAISE EXCEPTION 'Security Breach: staff role was able to view % records in payout_methods!', v_count;
     END IF;
     RAISE NOTICE 'Test 20a PASSED: RLS blocked staff role from querying payout_methods table (0 rows returned).';
 END $$;
-
 RESET ROLE;
 
--- Test Owner User: Can SELECT from safe projection public.v_masked_payout_methods
+-- 20b: Staff User cannot query public.v_masked_payout_methods view (RLS returns 0 rows)
 SET LOCAL ROLE authenticated;
-
 DO $$
 DECLARE
-    v_owner_uid UUID := current_setting('app.test_owner_uid', true)::UUID;
+    v_staff_uid UUID := current_setting('app.test_staff_a_uid', true)::UUID;
     v_count INT;
 BEGIN
-    PERFORM set_config('request.jwt.claim.sub', v_owner_uid::text, true);
+    PERFORM set_config('request.jwt.claim.sub', v_staff_uid::text, true);
 
     SELECT count(*) INTO v_count FROM public.v_masked_payout_methods;
-    RAISE NOTICE 'Test 20b PASSED: Authenticated owner successfully queried safe projection v_masked_payout_methods (rows: %).', v_count;
+    IF v_count != 0 THEN
+        RAISE EXCEPTION 'Security Breach: staff role was able to view % records in v_masked_payout_methods!', v_count;
+    END IF;
+    RAISE NOTICE 'Test 20b PASSED: Security-invoker view blocked staff role from querying v_masked_payout_methods (0 rows returned).';
 END $$;
+RESET ROLE;
 
+-- 20c: Authenticated Owner of Org A can retrieve expected masked payout details
+SET LOCAL ROLE authenticated;
+DO $$
+DECLARE
+    v_owner_a_uid UUID := current_setting('app.test_owner_a_uid', true)::UUID;
+    v_count INT;
+    v_masked_acc TEXT;
+BEGIN
+    PERFORM set_config('request.jwt.claim.sub', v_owner_a_uid::text, true);
+
+    SELECT count(*), max(masked_account_number) INTO v_count, v_masked_acc
+    FROM public.v_masked_payout_methods;
+
+    IF v_count < 1 THEN
+        RAISE EXCEPTION 'Access Failure: Owner was unable to view own payout methods in v_masked_payout_methods!';
+    END IF;
+    IF v_masked_acc NOT LIKE '****%' THEN
+        RAISE EXCEPTION 'Data Masking Failure: Account number (%) is not properly masked!', v_masked_acc;
+    END IF;
+    RAISE NOTICE 'Test 20c PASSED: Authenticated owner successfully retrieved masked payout methods (% rows, masked: %).', v_count, v_masked_acc;
+END $$;
+RESET ROLE;
+
+-- 20d: Authenticated Owner of Org A CANNOT retrieve provider_recipient_token directly (column permission denied)
+SET LOCAL ROLE authenticated;
+DO $$
+DECLARE
+    v_owner_a_uid UUID := current_setting('app.test_owner_a_uid', true)::UUID;
+BEGIN
+    PERFORM set_config('request.jwt.claim.sub', v_owner_a_uid::text, true);
+
+    BEGIN
+        EXECUTE 'SELECT provider_recipient_token FROM public.payout_methods LIMIT 1';
+        RAISE EXCEPTION 'Security Breach: Authenticated owner was able to SELECT provider_recipient_token directly!';
+    EXCEPTION WHEN insufficient_privilege THEN
+        RAISE NOTICE 'Test 20d PASSED: Direct SELECT on provider_recipient_token column strictly denied by PostgreSQL column privileges.';
+    END;
+END $$;
+RESET ROLE;
+
+-- 20e: Cross-Tenant Owner (Owner B) cannot read Org A's payout methods
+SET LOCAL ROLE authenticated;
+DO $$
+DECLARE
+    v_owner_b_uid UUID := current_setting('app.test_owner_b_uid', true)::UUID;
+    v_org_a UUID := current_setting('app.test_org_a', true)::UUID;
+    v_count INT;
+BEGIN
+    PERFORM set_config('request.jwt.claim.sub', v_owner_b_uid::text, true);
+
+    SELECT count(*) INTO v_count
+    FROM public.v_masked_payout_methods
+    WHERE organization_id = v_org_a;
+
+    IF v_count != 0 THEN
+        RAISE EXCEPTION 'Cross-Tenant Breach: Owner B was able to view % payout methods belonging to Org A!', v_count;
+    END IF;
+    RAISE NOTICE 'Test 20e PASSED: Cross-tenant owner blocked by RLS from viewing another organization payout methods (0 rows).';
+END $$;
 RESET ROLE;
 
 -- Rollback entire synthetic test fixture: leaves persistent database pristine

@@ -169,19 +169,19 @@ AS $$
 BEGIN
     -- 1. Strictly enforce immutability of financial snapshot, tenant ownership, and established provider IDs on EVERY update
     IF TG_OP = 'UPDATE' THEN
-        IF OLD.organization_id != NEW.organization_id OR
-           OLD.facility_id != NEW.facility_id OR
-           OLD.reservation_id != NEW.reservation_id OR
-           OLD.expected_amount != NEW.expected_amount OR
-           OLD.commission_rate != NEW.commission_rate OR
-           OLD.commission_amount != NEW.commission_amount OR
-           OLD.owner_gross_share != NEW.owner_gross_share OR
-           OLD.currency != NEW.currency OR
-           OLD.provider_name != NEW.provider_name OR
-           OLD.created_at != NEW.created_at OR
-           (OLD.provider_payment_id IS NOT NULL AND OLD.provider_payment_id != NEW.provider_payment_id) OR
-           (OLD.checkout_session_id IS NOT NULL AND OLD.checkout_session_id != NEW.checkout_session_id) OR
-           (OLD.capture_idempotency_key IS NOT NULL AND OLD.capture_idempotency_key != NEW.capture_idempotency_key) THEN
+        IF OLD.organization_id IS DISTINCT FROM NEW.organization_id OR
+           OLD.facility_id IS DISTINCT FROM NEW.facility_id OR
+           OLD.reservation_id IS DISTINCT FROM NEW.reservation_id OR
+           OLD.expected_amount IS DISTINCT FROM NEW.expected_amount OR
+           OLD.commission_rate IS DISTINCT FROM NEW.commission_rate OR
+           OLD.commission_amount IS DISTINCT FROM NEW.commission_amount OR
+           OLD.owner_gross_share IS DISTINCT FROM NEW.owner_gross_share OR
+           OLD.currency IS DISTINCT FROM NEW.currency OR
+           OLD.provider_name IS DISTINCT FROM NEW.provider_name OR
+           OLD.created_at IS DISTINCT FROM NEW.created_at OR
+           (OLD.provider_payment_id IS NOT NULL AND OLD.provider_payment_id IS DISTINCT FROM NEW.provider_payment_id) OR
+           (OLD.checkout_session_id IS NOT NULL AND OLD.checkout_session_id IS DISTINCT FROM NEW.checkout_session_id) OR
+           (OLD.capture_idempotency_key IS NOT NULL AND OLD.capture_idempotency_key IS DISTINCT FROM NEW.capture_idempotency_key) THEN
             RAISE EXCEPTION 'Financial snapshot, ownership, and established provider identity fields in payments table are strictly immutable.';
         END IF;
     END IF;
@@ -292,14 +292,14 @@ BEGIN
     IF TG_OP = 'DELETE' THEN
         RAISE EXCEPTION 'Webhook event inbox is append-only. DELETE operations are prohibited.';
     ELSIF TG_OP = 'UPDATE' THEN
-        IF OLD.provider_name != NEW.provider_name OR
-           OLD.provider_event_id != NEW.provider_event_id OR
-           OLD.received_at != NEW.received_at OR
+        IF OLD.provider_name IS DISTINCT FROM NEW.provider_name OR
+           OLD.provider_event_id IS DISTINCT FROM NEW.provider_event_id OR
+           OLD.received_at IS DISTINCT FROM NEW.received_at OR
            OLD.event_timestamp IS DISTINCT FROM NEW.event_timestamp OR
            OLD.signature_header IS DISTINCT FROM NEW.signature_header OR
            OLD.payload_hash IS DISTINCT FROM NEW.payload_hash OR
-           OLD.payload != NEW.payload OR
-           (OLD.signature_verification_status = 'verified' AND NEW.signature_verification_status != 'verified') THEN
+           OLD.payload IS DISTINCT FROM NEW.payload OR
+           (OLD.signature_verification_status = 'verified' AND NEW.signature_verification_status IS DISTINCT FROM 'verified') THEN
             RAISE EXCEPTION 'Webhook event identity, payload, timestamp, and signature evidence are strictly immutable.';
         END IF;
     END IF;
@@ -494,12 +494,13 @@ LANGUAGE plpgsql
 AS $$
 BEGIN
     -- 1. Enforce immutability of amount, currency, organization_id, and destination method on EVERY update
-    IF OLD.organization_id != NEW.organization_id OR
-       OLD.payout_method_id != NEW.payout_method_id OR
-       OLD.amount != NEW.amount OR
-       OLD.currency != NEW.currency OR
-       OLD.created_at != NEW.created_at OR
-       (OLD.provider_payout_id IS NOT NULL AND OLD.provider_payout_id != NEW.provider_payout_id) THEN
+    IF OLD.organization_id IS DISTINCT FROM NEW.organization_id OR
+       OLD.payout_method_id IS DISTINCT FROM NEW.payout_method_id OR
+       OLD.amount IS DISTINCT FROM NEW.amount OR
+       OLD.currency IS DISTINCT FROM NEW.currency OR
+       OLD.created_at IS DISTINCT FROM NEW.created_at OR
+       (OLD.provider_payout_id IS NOT NULL AND OLD.provider_payout_id IS DISTINCT FROM NEW.provider_payout_id) OR
+       (OLD.provider_reference IS NOT NULL AND OLD.provider_reference IS DISTINCT FROM NEW.provider_reference) THEN
         RAISE EXCEPTION 'Payout amount, currency, organization, and destination method are strictly immutable once created.';
     END IF;
 
@@ -638,14 +639,33 @@ REVOKE SELECT ON public.provider_webhook_events FROM anon, authenticated, PUBLIC
 REVOKE SELECT ON public.settlement_batches FROM anon, authenticated, PUBLIC;
 REVOKE SELECT ON public.settlement_items FROM anon, authenticated, PUBLIC;
 
--- Revoke column-level SELECT on provider_recipient_token from authenticated
-REVOKE SELECT (provider_recipient_token) ON public.payout_methods FROM authenticated;
+-- Payout Token Confidentiality:
+-- Remove unrestricted table-level SELECT on public.payout_methods
+REVOKE SELECT ON public.payout_methods FROM anon, authenticated, PUBLIC;
 
--- Grant selective SELECT permissions
+-- Grant column-level SELECT ONLY on safe, non-sensitive columns
+GRANT SELECT (
+    id,
+    organization_id,
+    method_type,
+    provider_name,
+    account_holder_name,
+    masked_account_number,
+    bank_code,
+    bank_name,
+    is_active,
+    is_default,
+    verification_status,
+    created_at,
+    updated_at
+) ON public.payout_methods TO authenticated;
+
+-- Grant SELECT on safe masked projection view
+GRANT SELECT ON public.v_masked_payout_methods TO authenticated;
+
+-- Grant selective SELECT permissions on remaining client-accessible tables
 GRANT SELECT ON public.platform_fee_policy_controls TO authenticated;
 GRANT SELECT ON public.payments TO authenticated;
-GRANT SELECT ON public.payout_methods TO authenticated;
-GRANT SELECT ON public.v_masked_payout_methods TO authenticated;
 GRANT SELECT ON public.payouts TO authenticated;
 GRANT SELECT ON public.payout_lifecycle_logs TO authenticated;
 

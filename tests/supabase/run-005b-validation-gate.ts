@@ -174,6 +174,12 @@ async function runValidationGate() {
   const rootClient = getPostgresClient();
   await rootClient.connect();
 
+  rootClient.on('notice', (msg) => {
+    if (msg && msg.message) {
+      log(`  ${msg.message}`);
+    }
+  });
+
   const verRes = await rootClient.query<{ version: string }>('SELECT version();');
   log(`Connected to disposable PostgreSQL engine:\n${verRes.rows[0].version}`);
   log(`Server Data Directory: ${PG_DATA_DIR}`);
@@ -277,24 +283,24 @@ async function runValidationGate() {
   }
 
   // ---------------------------------------------------------------------------
-  // GATE 3: SQL Fixture Execution (Tests 1 through 14)
+  // GATE 3: SQL Test Fixture Execution (Tests 1 through 21 — Comprehensive Suite)
   // ---------------------------------------------------------------------------
   const gate3Start = Date.now();
   try {
-    log('\n--- Running Gate 3: SQL Test Fixture Execution (Tests 1 through 14) ---');
+    log('\n--- Running Gate 3: SQL Test Fixture Execution (Tests 1 through 21 — Comprehensive Suite) ---');
     const fixtureSql = fs.readFileSync(path.join(ROOT_DIR, 'tests/supabase/fixtures/005b_payments_payouts_test.sql'), 'utf8');
     await rootClient.query(fixtureSql);
 
     recordResult(
-      'Gate 3: SQL Test Fixture Execution (Tests 1-14)',
+      'Gate 3: SQL Test Fixture Execution (Tests 1-21)',
       'PASS',
-      'All 14 unit and integration tests passed: cross-tenant isolation, duplicate prevention, state machine transitions, fee preservation, and security boundaries.',
+      'All 21 unit and integration tests passed: cross-tenant isolation, duplicate prevention, state machine transitions, fee preservation, security boundaries, staff RLS denial, owner masked retrieval, recipient token denial, cross-tenant payout isolation, and null-safe identifier immutability.',
       gate3Start
     );
   } catch (err: unknown) {
     try { await rootClient.query('ROLLBACK;'); } catch {}
     const msg = err instanceof Error ? err.message : String(err);
-    recordResult('Gate 3: SQL Test Fixture Execution (Tests 1-14)', 'FAIL', msg, gate3Start);
+    recordResult('Gate 3: SQL Test Fixture Execution (Tests 1-21)', 'FAIL', msg, gate3Start);
     log(`\nFATAL: Gate 3 failed. Aborting.`);
     await rootClient.end();
     stopDisposablePostgres();
@@ -302,13 +308,13 @@ async function runValidationGate() {
   }
 
   // ---------------------------------------------------------------------------
-  // GATE 4: Test 15 — Genuine Concurrent-Session Concurrency Tests
+  // GATE 4: Test 22 — Genuine Concurrent-Session Concurrency Tests
   // ---------------------------------------------------------------------------
   const gate4Start = Date.now();
   let client1: Client | null = null;
   let client2: Client | null = null;
   try {
-    log('\n--- Running Gate 4: Test 15 — Genuine Concurrent-Session Concurrency Tests ---');
+    log('\n--- Running Gate 4: Test 22 — Genuine Concurrent-Session Concurrency Tests ---');
 
     client1 = getPostgresClient();
     client2 = getPostgresClient();
@@ -353,9 +359,9 @@ async function runValidationGate() {
       ) ON CONFLICT DO NOTHING;
     `);
 
-    // 15A. Concurrent Duplicate Captured Payment Recognition Race:
+    // 22A. Concurrent Duplicate Captured Payment Recognition Race:
     // Two simultaneous workers attempt to record payment capture for the SAME reservation.
-    // Partial unique index uq_single_captured_payment_per_reservation ensures exactly ONE succeeds!
+    // Partial unique index uq_captured_payment_lifecycle_per_reservation ensures exactly ONE succeeds!
     const [capture1, capture2] = await Promise.allSettled([
       client1.query(`
         INSERT INTO public.payments (
@@ -392,9 +398,9 @@ async function runValidationGate() {
     if (!String(failedCapture).includes('uq_captured_payment_lifecycle_per_reservation')) {
       throw new Error(`Expected uq_captured_payment_lifecycle_per_reservation error, got: ${failedCapture}`);
     }
-    log('  15A PASSED: Concurrent duplicate captured payment recognition safely rejected by uq_captured_payment_lifecycle_per_reservation.');
+    log('  22A PASSED: Concurrent duplicate captured payment recognition safely rejected by uq_captured_payment_lifecycle_per_reservation.');
 
-    // 15B. Concurrent Competing Payout Terminal Outcomes:
+    // 22B. Concurrent Competing Payout Terminal Outcomes:
     // Setup a payout in 'submitted_to_provider' state
     const payoutMethodId = 'e2000000-0000-0000-0000-000000000001';
     const concurPayoutId = 'e3000000-0000-0000-0000-000000000001';
@@ -436,17 +442,17 @@ async function runValidationGate() {
     if (!String(failedPayout).includes('is in terminal status')) {
       throw new Error(`Expected terminal status conflict, got: ${failedPayout}`);
     }
-    log('  15B PASSED: Concurrent competing payout terminal outcomes safely resolved with exactly 1 winner and 1 conflict rejection.');
+    log('  22B PASSED: Concurrent competing payout terminal outcomes safely resolved with exactly 1 winner and 1 conflict rejection.');
 
     recordResult(
-      'Gate 4: Test 15 — Genuine Concurrent-Session Concurrency Tests',
+      'Gate 4: Test 22 — Genuine Concurrent-Session Concurrency Tests',
       'PASS',
       `Duplicate captured payment race safely serialized (1 winner). Competing payout terminal transitions safely resolved across 2 independent PostgreSQL sessions (PIDs ${pid1}, ${pid2}).`,
       gate4Start
     );
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    recordResult('Gate 4: Test 15 — Genuine Concurrent-Session Concurrency Tests', 'FAIL', msg, gate4Start);
+    recordResult('Gate 4: Test 22 — Genuine Concurrent-Session Concurrency Tests', 'FAIL', msg, gate4Start);
     log(`\nFATAL: Gate 4 failed. Aborting.`);
     if (client1) try { await client1.end(); } catch {}
     if (client2) try { await client2.end(); } catch {}
@@ -474,6 +480,7 @@ async function runValidationGate() {
   log('================================================================================');
   log(`TOTAL GATES: ${results.length} | PASS: ${passCount} | FAIL: ${failCount}`);
   log('================================================================================\n');
+  flushLog();
 
   await rootClient.end();
   stopDisposablePostgres();
