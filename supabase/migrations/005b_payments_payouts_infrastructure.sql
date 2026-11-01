@@ -98,6 +98,8 @@ CREATE TABLE IF NOT EXISTS public.payments (
         CHECK (captured_amount >= 0.00),
     refunded_amount NUMERIC(10, 2) NOT NULL DEFAULT 0.00
         CHECK (refunded_amount >= 0.00),
+    CONSTRAINT chk_payments_refunded_le_captured
+        CHECK (refunded_amount <= captured_amount),
     
     -- Immutable Financial Snapshot
     commission_rate NUMERIC(5, 4) NOT NULL DEFAULT 0.0500
@@ -161,38 +163,89 @@ CREATE INDEX IF NOT EXISTS idx_payments_org_status ON public.payments (organizat
 CREATE INDEX IF NOT EXISTS idx_payments_checkout_session ON public.payments (checkout_session_id);
 
 
--- Hardened Payment Validation & Immutability Trigger
+-- Hardened Payment Validation & Immutability Trigger (Runs BEFORE INSERT OR UPDATE)
 CREATE OR REPLACE FUNCTION public.fn_validate_payment_status_transition()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    -- 1. Strictly enforce immutability of financial snapshot, tenant ownership, and established provider IDs on EVERY update
-    IF TG_OP = 'UPDATE' THEN
-        IF OLD.organization_id IS DISTINCT FROM NEW.organization_id OR
-           OLD.facility_id IS DISTINCT FROM NEW.facility_id OR
-           OLD.reservation_id IS DISTINCT FROM NEW.reservation_id OR
-           OLD.expected_amount IS DISTINCT FROM NEW.expected_amount OR
-           OLD.commission_rate IS DISTINCT FROM NEW.commission_rate OR
-           OLD.commission_amount IS DISTINCT FROM NEW.commission_amount OR
-           OLD.owner_gross_share IS DISTINCT FROM NEW.owner_gross_share OR
-           OLD.currency IS DISTINCT FROM NEW.currency OR
-           OLD.provider_name IS DISTINCT FROM NEW.provider_name OR
-           OLD.created_at IS DISTINCT FROM NEW.created_at OR
-           (OLD.provider_payment_id IS NOT NULL AND OLD.provider_payment_id IS DISTINCT FROM NEW.provider_payment_id) OR
-           (OLD.checkout_session_id IS NOT NULL AND OLD.checkout_session_id IS DISTINCT FROM NEW.checkout_session_id) OR
-           (OLD.capture_idempotency_key IS NOT NULL AND OLD.capture_idempotency_key IS DISTINCT FROM NEW.capture_idempotency_key) THEN
-            RAISE EXCEPTION 'Financial snapshot, ownership, and established provider identity fields in payments table are strictly immutable.';
+    -- 1. INSERT-TIME STATUS & FINANCIAL INTEGRITY VALIDATION
+    IF TG_OP = 'INSERT' THEN
+        -- Payments can only be inserted in safe initial states: 'pending' or 'requires_action'
+        IF NEW.status NOT IN ('pending', 'requires_action') THEN
+            RAISE EXCEPTION 'Invalid initial payment status: payment records cannot be inserted directly into "%". Must be initialized as "pending".', NEW.status;
+        END IF;
+
+        -- Initial amounts must be strictly zero (capture & refund require authorized state transitions)
+        IF NEW.captured_amount IS DISTINCT FROM 0.00 THEN
+            RAISE EXCEPTION 'Initial payment record cannot have positive captured_amount (attempted ₱%). Capture requires an authorized state transition.', NEW.captured_amount;
+        END IF;
+
+        IF NEW.refunded_amount IS DISTINCT FROM 0.00 THEN
+            RAISE EXCEPTION 'Initial payment record cannot have positive refunded_amount (attempted ₱%). Refund requires an authorized state transition.', NEW.refunded_amount;
+        END IF;
+
+        IF NEW.captured_at IS NOT NULL THEN
+            RAISE EXCEPTION 'captured_at timestamp cannot be set at payment creation time.';
+        END IF;
+
+        RETURN NEW;
+    END IF;
+
+    -- 2. UPDATE-TIME IMMUTABILITY CHECKS
+    -- Financial snapshot, tenant ownership, and established provider IDs are strictly immutable on EVERY update
+    IF OLD.organization_id IS DISTINCT FROM NEW.organization_id OR
+       OLD.facility_id IS DISTINCT FROM NEW.facility_id OR
+       OLD.reservation_id IS DISTINCT FROM NEW.reservation_id OR
+       OLD.expected_amount IS DISTINCT FROM NEW.expected_amount OR
+       OLD.commission_rate IS DISTINCT FROM NEW.commission_rate OR
+       OLD.commission_amount IS DISTINCT FROM NEW.commission_amount OR
+       OLD.owner_gross_share IS DISTINCT FROM NEW.owner_gross_share OR
+       OLD.currency IS DISTINCT FROM NEW.currency OR
+       OLD.provider_name IS DISTINCT FROM NEW.provider_name OR
+       OLD.created_at IS DISTINCT FROM NEW.created_at OR
+       (OLD.provider_payment_id IS NOT NULL AND OLD.provider_payment_id IS DISTINCT FROM NEW.provider_payment_id) OR
+       (OLD.checkout_session_id IS NOT NULL AND OLD.checkout_session_id IS DISTINCT FROM NEW.checkout_session_id) OR
+       (OLD.capture_idempotency_key IS NOT NULL AND OLD.capture_idempotency_key IS DISTINCT FROM NEW.capture_idempotency_key) THEN
+        RAISE EXCEPTION 'Financial snapshot, ownership, and established provider identity fields in payments table are strictly immutable.';
+    END IF;
+
+    -- Captured amount is strictly immutable once captured (including same-status updates)
+    IF (OLD.status IN ('captured', 'partially_refunded', 'refunded', 'disputed') OR OLD.captured_amount > 0.00) THEN
+        IF NEW.captured_amount IS DISTINCT FROM OLD.captured_amount THEN
+            RAISE EXCEPTION 'Captured amount (₱%) is strictly immutable once captured.', OLD.captured_amount;
         END IF;
     END IF;
 
-    -- If status unchanged, update timestamp and exit
+    -- Refunded amount invariants on UPDATE:
+    -- Cannot decrease under any circumstances
+    IF NEW.refunded_amount < OLD.refunded_amount THEN
+        RAISE EXCEPTION 'Refunded amount cannot decrease (attempted reduction from ₱% to ₱%).', OLD.refunded_amount, NEW.refunded_amount;
+    END IF;
+
+    -- Cannot exceed captured funds
+    IF NEW.refunded_amount > NEW.captured_amount THEN
+        RAISE EXCEPTION 'Refunded amount (₱%) cannot exceed captured amount (₱%).', NEW.refunded_amount, NEW.captured_amount;
+    END IF;
+
+    -- 3. If status unchanged, validate same-status constraints and exit
     IF OLD.status = NEW.status THEN
+        -- If refunded_amount changed while status remains unchanged:
+        IF NEW.refunded_amount IS DISTINCT FROM OLD.refunded_amount THEN
+            IF OLD.status != 'partially_refunded' THEN
+                RAISE EXCEPTION 'Refunded amount can only be modified when transitioning to partially_refunded or refunded status.';
+            END IF;
+            IF NEW.refunded_amount >= NEW.captured_amount THEN
+                RAISE EXCEPTION 'Partial refund amount (₱%) cannot reach or exceed captured amount (₱%). Full refund requires status "refunded".',
+                    NEW.refunded_amount, NEW.captured_amount;
+            END IF;
+        END IF;
+
         NEW.updated_at = now();
         RETURN NEW;
     END IF;
 
-    -- 2. Valid state transition rules
+    -- 4. Valid state transition rules
     IF OLD.status = 'pending' THEN
         IF NEW.status NOT IN ('requires_action', 'processing', 'captured', 'failed', 'cancelled') THEN
             RAISE EXCEPTION 'Invalid payment transition: cannot move from pending to %.', NEW.status;
@@ -221,7 +274,7 @@ BEGIN
         END IF;
     END IF;
 
-    -- 3. Hardened Captured Evidence Invariants (do NOT silently default captured_amount)
+    -- 5. Hardened Captured Evidence Invariants (do NOT silently default captured_amount)
     IF NEW.status = 'captured' THEN
         IF NEW.captured_amount IS NULL OR NEW.captured_amount <= 0.00 THEN
             RAISE EXCEPTION 'Explicit verified captured_amount is required when marking payment captured.';
@@ -238,6 +291,29 @@ BEGIN
         END IF;
     END IF;
 
+    -- 6. Hardened Refund Transition Invariants
+    IF NEW.status = 'refunded' THEN
+        IF NEW.refunded_amount IS NULL OR NEW.refunded_amount <= 0.00 THEN
+            NEW.refunded_amount := NEW.captured_amount;
+        END IF;
+        IF NEW.refunded_amount != NEW.captured_amount THEN
+            RAISE EXCEPTION 'Full refund requires refunded_amount (₱%) to equal captured_amount (₱%).',
+                NEW.refunded_amount, NEW.captured_amount;
+        END IF;
+    ELSIF NEW.status = 'partially_refunded' THEN
+        IF NEW.refunded_amount IS NULL OR NEW.refunded_amount <= 0.00 THEN
+            RAISE EXCEPTION 'Partial refund requires positive refunded_amount.';
+        END IF;
+        IF NEW.refunded_amount >= NEW.captured_amount THEN
+            RAISE EXCEPTION 'Partial refund amount (₱%) must be strictly less than captured_amount (₱%). For full refund, status must be "refunded".',
+                NEW.refunded_amount, NEW.captured_amount;
+        END IF;
+    ELSIF NEW.status NOT IN ('partially_refunded', 'refunded') THEN
+        IF NEW.refunded_amount IS DISTINCT FROM OLD.refunded_amount THEN
+            RAISE EXCEPTION 'Refunded amount can only change when transitioning to partially_refunded or refunded status.';
+        END IF;
+    END IF;
+
     NEW.updated_at = now();
     RETURN NEW;
 END;
@@ -245,7 +321,7 @@ $$;
 
 DROP TRIGGER IF EXISTS trg_validate_payment_status_transition ON public.payments;
 CREATE TRIGGER trg_validate_payment_status_transition
-    BEFORE UPDATE ON public.payments
+    BEFORE INSERT OR UPDATE ON public.payments
     FOR EACH ROW
     EXECUTE FUNCTION public.fn_validate_payment_status_transition();
 
@@ -487,13 +563,28 @@ CREATE TABLE IF NOT EXISTS public.payout_lifecycle_logs (
 COMMENT ON TABLE public.payout_lifecycle_logs IS 'Immutable audit log of all payout status transitions.';
 
 
--- Payout State Machine & Immutability Trigger (Runs BEFORE UPDATE)
+-- Payout State Machine & Immutability Trigger (Runs BEFORE INSERT OR UPDATE)
 CREATE OR REPLACE FUNCTION public.fn_validate_payout_status_transition()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    -- 1. Enforce immutability of amount, currency, organization_id, and destination method on EVERY update
+    -- 1. INSERT-TIME STATUS & LIFECYCLE INITIALIZATION
+    IF TG_OP = 'INSERT' THEN
+        -- Payouts must strictly begin in pending_request status
+        IF NEW.status != 'pending_request' THEN
+            RAISE EXCEPTION 'Invalid initial payout status: payout records must be initialized in "pending_request" status (attempted "%"). Direct creation in later lifecycle states is prohibited.', NEW.status;
+        END IF;
+
+        IF NEW.reserved_at IS NOT NULL OR NEW.submitted_at IS NOT NULL OR NEW.completed_at IS NOT NULL OR NEW.failed_at IS NOT NULL THEN
+            RAISE EXCEPTION 'Lifecycle timestamps cannot be set at payout creation time.';
+        END IF;
+
+        RETURN NEW;
+    END IF;
+
+    -- 2. UPDATE-TIME IMMUTABILITY CHECKS
+    -- Enforce immutability of amount, currency, organization_id, and destination method on EVERY update
     IF OLD.organization_id IS DISTINCT FROM NEW.organization_id OR
        OLD.payout_method_id IS DISTINCT FROM NEW.payout_method_id OR
        OLD.amount IS DISTINCT FROM NEW.amount OR
@@ -510,13 +601,13 @@ BEGIN
         RETURN NEW;
     END IF;
 
-    -- 2. Terminal State Protection: paid, failed, and cancelled are terminal and immutable
+    -- 3. Terminal State Protection: paid, failed, and cancelled are terminal and immutable
     IF OLD.status IN ('paid', 'failed', 'cancelled') THEN
         RAISE EXCEPTION 'Payout lifecycle violation: Payout % is in terminal status "%" and cannot be modified.',
             OLD.id, OLD.status;
     END IF;
 
-    -- 3. Valid state transition rules
+    -- 4. Valid state transition rules
     IF OLD.status = 'pending_request' THEN
         IF NEW.status NOT IN ('approved_reserved', 'cancelled', 'failed') THEN
             RAISE EXCEPTION 'Invalid payout transition: cannot move from pending_request to %.', NEW.status;
@@ -549,7 +640,7 @@ $$;
 
 DROP TRIGGER IF EXISTS trg_validate_payout_status_transition ON public.payouts;
 CREATE TRIGGER trg_validate_payout_status_transition
-    BEFORE UPDATE ON public.payouts
+    BEFORE INSERT OR UPDATE ON public.payouts
     FOR EACH ROW
     EXECUTE FUNCTION public.fn_validate_payout_status_transition();
 

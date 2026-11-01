@@ -8,8 +8,8 @@ Execution Evidence Log: tests/supabase/reports/005b_execution_evidence.log
 
 Connected to disposable PostgreSQL engine:
 PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit
-Server Data Directory: /tmp/cb_005b_2198_1793492937643_data
-Server Socket Directory: /tmp/cb_005b_2198_1793492937643_sock (Port: 47842)
+Server Data Directory: /tmp/cb_005b_2484_1793494691741_data
+Server Socket Directory: /tmp/cb_005b_2484_1793494691741_sock (Port: 37998)
 
 --- Running Gate 1: Baseline Migrations 001-005a1 & Migration 005B Application ---
   extension "pgcrypto" already exists, skipping
@@ -41,12 +41,12 @@ Server Socket Directory: /tmp/cb_005b_2198_1793492937643_sock (Port: 47842)
   trigger "trg_protect_webhook_inbox_immutability" for relation "public.provider_webhook_events" does not exist, skipping
   trigger "trg_validate_payout_status_transition" for relation "public.payouts" does not exist, skipping
   trigger "trg_audit_payout_lifecycle" for relation "public.payouts" does not exist, skipping
-[PASS] Gate 1: Baseline 001-005a1 Application & Migration 005B Execution (241ms): All baseline migrations and Migration 005B applied atomically within safe isolated disposable database.
+[PASS] Gate 1: Baseline 001-005a1 Application & Migration 005B Execution (172ms): All baseline migrations and Migration 005B applied atomically within safe isolated disposable database.
 
 --- Running Gate 2: Schema & Table Constraints Verification ---
-[PASS] Gate 2: Schema & Table Constraints Verification (7ms): All 8 new tables verified with composite foreign keys, unique constraints, and undecided fee configuration.
+[PASS] Gate 2: Schema & Table Constraints Verification (5ms): All 8 new tables verified with composite foreign keys, unique constraints, and undecided fee configuration.
 
---- Running Gate 3: SQL Test Fixture Execution (Tests 1 through 21 — Comprehensive Suite) ---
+--- Running Gate 3: SQL Test Fixture Execution (Tests 1 through 22 — Comprehensive Suite) ---
   ========================================================================
   === Migration 005B: Hardened Payments & Payouts Test Suite           ===
   ========================================================================
@@ -84,27 +84,35 @@ Server Socket Directory: /tmp/cb_005b_2198_1793492937643_sock (Port: 47842)
   Test 21c PASSED: Clearing established checkout_session_id to NULL rejected by IS DISTINCT FROM immutability check.
   Test 21d PASSED: Clearing established capture_idempotency_key to NULL rejected by IS DISTINCT FROM immutability check.
   Test 21e PASSED: Clearing established provider_payout_id to NULL rejected by IS DISTINCT FROM immutability check.
-  === ALL 34 DATABASE TESTS COMPLETED SUCCESSFULLY ===
+  Test 22a PASSED: Direct INSERT into captured payment status strictly rejected.
+  Test 22b PASSED: Direct INSERT into refunded payment status strictly rejected.
+  Test 22c PASSED: Direct INSERT into paid payout status strictly rejected.
+  Test 22d PASSED: Direct INSERT into approved_reserved payout status strictly rejected.
+  Test 22e PASSED: Same-status captured_amount tampering strictly rejected.
+  Test 22f PASSED: Refunded amount exceeding captured funds strictly rejected.
+  Test 22g PASSED: Refunded amount reduction after partial refund strictly rejected.
+  Test 22h PASSED: Legitimate partial refund followed by full refund completed successfully.
+  === ALL 42 DATABASE TESTS COMPLETED SUCCESSFULLY ===
   Test 20a PASSED: RLS blocked staff role from querying payout_methods table (0 rows returned).
   Test 20b PASSED: Security-invoker view blocked staff role from querying v_masked_payout_methods (0 rows returned).
   Test 20c PASSED: Authenticated owner successfully retrieved masked payout methods (1 rows, masked: ****9012).
   Test 20d PASSED: Direct SELECT on provider_recipient_token column strictly denied by PostgreSQL column privileges.
   Test 20e PASSED: Cross-tenant owner blocked by RLS from viewing another organization payout methods (0 rows).
-[PASS] Gate 3: SQL Test Fixture Execution (Tests 1-21) (63ms): All 21 unit and integration tests passed: cross-tenant isolation, duplicate prevention, state machine transitions, fee preservation, security boundaries, staff RLS denial, owner masked retrieval, recipient token denial, cross-tenant payout isolation, and null-safe identifier immutability.
+[PASS] Gate 3: SQL Test Fixture Execution (Tests 1-22) (50ms): All 22 unit and integration tests passed: cross-tenant isolation, duplicate prevention, state machine transitions, fee preservation, security boundaries, staff RLS denial, owner masked retrieval, recipient token denial, cross-tenant payout isolation, null-safe identifier immutability, insert-time lifecycle validation, and financial amount integrity.
 
---- Running Gate 4: Test 22 — Genuine Concurrent-Session Concurrency Tests ---
-  Verified 2 independent concurrent PostgreSQL sessions: Session 1 PID=2261, Session 2 PID=2262
-  22A PASSED: Concurrent duplicate captured payment recognition safely rejected by uq_captured_payment_lifecycle_per_reservation.
-  22B PASSED: Concurrent competing payout terminal outcomes safely resolved with exactly 1 winner and 1 conflict rejection.
-[PASS] Gate 4: Test 22 — Genuine Concurrent-Session Concurrency Tests (46ms): Duplicate captured payment race safely serialized (1 winner). Competing payout terminal transitions safely resolved across 2 independent PostgreSQL sessions (PIDs 2261, 2262).
+--- Running Gate 4: Test 23 — Genuine Concurrent-Session Concurrency Tests ---
+  Verified 2 independent concurrent PostgreSQL sessions: Session 1 PID=2537, Session 2 PID=2538
+  23A PASSED: Concurrent duplicate captured payment recognition safely rejected by uq_captured_payment_lifecycle_per_reservation.
+  23B PASSED: Concurrent competing payout terminal outcomes safely resolved with exactly 1 winner and 1 conflict rejection.
+[PASS] Gate 4: Test 23 — Genuine Concurrent-Session Concurrency Tests (30ms): Duplicate captured payment race safely serialized (1 winner). Competing payout terminal transitions safely resolved across 2 independent PostgreSQL sessions (PIDs 2537, 2538).
 
 ================================================================================
 COURTBOOK PHASE 4.2.3 VALIDATION GATE SUMMARY REPORT
 ================================================================================
-- [PASS] Gate 1: Baseline 001-005a1 Application & Migration 005B Execution (241ms)
-- [PASS] Gate 2: Schema & Table Constraints Verification (7ms)
-- [PASS] Gate 3: SQL Test Fixture Execution (Tests 1-21) (63ms)
-- [PASS] Gate 4: Test 22 — Genuine Concurrent-Session Concurrency Tests (46ms)
+- [PASS] Gate 1: Baseline 001-005a1 Application & Migration 005B Execution (172ms)
+- [PASS] Gate 2: Schema & Table Constraints Verification (5ms)
+- [PASS] Gate 3: SQL Test Fixture Execution (Tests 1-22) (50ms)
+- [PASS] Gate 4: Test 23 — Genuine Concurrent-Session Concurrency Tests (30ms)
 ================================================================================
 TOTAL GATES: 4 | PASS: 4 | FAIL: 0
 ================================================================================

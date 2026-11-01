@@ -283,24 +283,24 @@ async function runValidationGate() {
   }
 
   // ---------------------------------------------------------------------------
-  // GATE 3: SQL Test Fixture Execution (Tests 1 through 21 — Comprehensive Suite)
+  // GATE 3: SQL Test Fixture Execution (Tests 1 through 22 — Comprehensive Suite)
   // ---------------------------------------------------------------------------
   const gate3Start = Date.now();
   try {
-    log('\n--- Running Gate 3: SQL Test Fixture Execution (Tests 1 through 21 — Comprehensive Suite) ---');
+    log('\n--- Running Gate 3: SQL Test Fixture Execution (Tests 1 through 22 — Comprehensive Suite) ---');
     const fixtureSql = fs.readFileSync(path.join(ROOT_DIR, 'tests/supabase/fixtures/005b_payments_payouts_test.sql'), 'utf8');
     await rootClient.query(fixtureSql);
 
     recordResult(
-      'Gate 3: SQL Test Fixture Execution (Tests 1-21)',
+      'Gate 3: SQL Test Fixture Execution (Tests 1-22)',
       'PASS',
-      'All 21 unit and integration tests passed: cross-tenant isolation, duplicate prevention, state machine transitions, fee preservation, security boundaries, staff RLS denial, owner masked retrieval, recipient token denial, cross-tenant payout isolation, and null-safe identifier immutability.',
+      'All 22 unit and integration tests passed: cross-tenant isolation, duplicate prevention, state machine transitions, fee preservation, security boundaries, staff RLS denial, owner masked retrieval, recipient token denial, cross-tenant payout isolation, null-safe identifier immutability, insert-time lifecycle validation, and financial amount integrity.',
       gate3Start
     );
   } catch (err: unknown) {
     try { await rootClient.query('ROLLBACK;'); } catch {}
     const msg = err instanceof Error ? err.message : String(err);
-    recordResult('Gate 3: SQL Test Fixture Execution (Tests 1-21)', 'FAIL', msg, gate3Start);
+    recordResult('Gate 3: SQL Test Fixture Execution (Tests 1-22)', 'FAIL', msg, gate3Start);
     log(`\nFATAL: Gate 3 failed. Aborting.`);
     await rootClient.end();
     stopDisposablePostgres();
@@ -308,13 +308,13 @@ async function runValidationGate() {
   }
 
   // ---------------------------------------------------------------------------
-  // GATE 4: Test 22 — Genuine Concurrent-Session Concurrency Tests
+  // GATE 4: Test 23 — Genuine Concurrent-Session Concurrency Tests
   // ---------------------------------------------------------------------------
   const gate4Start = Date.now();
   let client1: Client | null = null;
   let client2: Client | null = null;
   try {
-    log('\n--- Running Gate 4: Test 22 — Genuine Concurrent-Session Concurrency Tests ---');
+    log('\n--- Running Gate 4: Test 23 — Genuine Concurrent-Session Concurrency Tests ---');
 
     client1 = getPostgresClient();
     client2 = getPostgresClient();
@@ -359,31 +359,35 @@ async function runValidationGate() {
       ) ON CONFLICT DO NOTHING;
     `);
 
-    // 22A. Concurrent Duplicate Captured Payment Recognition Race:
+    // 23A. Concurrent Duplicate Captured Payment Recognition Race:
     // Two simultaneous workers attempt to record payment capture for the SAME reservation.
+    // Under the new insert lifecycle rules, payments are initialized as 'pending'.
+    // Two pending payments exist for the reservation (e.g. from retried checkouts).
+    // Session 1 and Session 2 concurrently attempt to transition their respective payment to 'captured'.
     // Partial unique index uq_captured_payment_lifecycle_per_reservation ensures exactly ONE succeeds!
+    const concurPayId1 = 'e1000000-0000-0000-0000-000000000005';
+    const concurPayId2 = 'e1000000-0000-0000-0000-000000000006';
+
+    await rootClient.query(`
+      INSERT INTO public.payments (
+        id, organization_id, facility_id, reservation_id, expected_amount,
+        commission_rate, commission_amount, owner_gross_share, status
+      ) VALUES
+        ('${concurPayId1}', '${synthOrgId}', '${synthFacId}', '${synthResId}', 350.00, 0.0500, 17.50, 332.50, 'pending'),
+        ('${concurPayId2}', '${synthOrgId}', '${synthFacId}', '${synthResId}', 350.00, 0.0500, 17.50, 332.50, 'pending')
+      ON CONFLICT DO NOTHING;
+    `);
+
     const [capture1, capture2] = await Promise.allSettled([
       client1.query(`
-        INSERT INTO public.payments (
-          organization_id, facility_id, reservation_id, expected_amount,
-          commission_rate, commission_amount, owner_gross_share, status,
-          captured_amount, provider_name, provider_payment_id
-        ) VALUES (
-          '${synthOrgId}', '${synthFacId}', '${synthResId}',
-          350.00, 0.0500, 17.50, 332.50, 'captured',
-          350.00, 'paymongo', 'pay_concur_session_1'
-        );
+        UPDATE public.payments
+        SET status = 'captured', captured_amount = 350.00, provider_name = 'paymongo', provider_payment_id = 'pay_concur_session_1'
+        WHERE id = '${concurPayId1}';
       `),
       client2.query(`
-        INSERT INTO public.payments (
-          organization_id, facility_id, reservation_id, expected_amount,
-          commission_rate, commission_amount, owner_gross_share, status,
-          captured_amount, provider_name, provider_payment_id
-        ) VALUES (
-          '${synthOrgId}', '${synthFacId}', '${synthResId}',
-          350.00, 0.0500, 17.50, 332.50, 'captured',
-          350.00, 'paymongo', 'pay_concur_session_2'
-        );
+        UPDATE public.payments
+        SET status = 'captured', captured_amount = 350.00, provider_name = 'paymongo', provider_payment_id = 'pay_concur_session_2'
+        WHERE id = '${concurPayId2}';
       `)
     ]);
 
@@ -398,10 +402,11 @@ async function runValidationGate() {
     if (!String(failedCapture).includes('uq_captured_payment_lifecycle_per_reservation')) {
       throw new Error(`Expected uq_captured_payment_lifecycle_per_reservation error, got: ${failedCapture}`);
     }
-    log('  22A PASSED: Concurrent duplicate captured payment recognition safely rejected by uq_captured_payment_lifecycle_per_reservation.');
+    log('  23A PASSED: Concurrent duplicate captured payment recognition safely rejected by uq_captured_payment_lifecycle_per_reservation.');
 
-    // 22B. Concurrent Competing Payout Terminal Outcomes:
-    // Setup a payout in 'submitted_to_provider' state
+    // 23B. Concurrent Competing Payout Terminal Outcomes:
+    // Setup a payout in 'submitted_to_provider' state via required lifecycle steps:
+    // pending_request -> approved_reserved -> submitted_to_provider
     const payoutMethodId = 'e2000000-0000-0000-0000-000000000001';
     const concurPayoutId = 'e3000000-0000-0000-0000-000000000001';
 
@@ -414,11 +419,22 @@ async function runValidationGate() {
         '****8888', 'BPI', 'Bank of the Philippine Islands', true, true, 'verified'
       ) ON CONFLICT DO NOTHING;
 
+      -- Step 1: Initialize payout in pending_request (safe initial state)
       INSERT INTO public.payouts (
-        id, organization_id, payout_method_id, amount, status, provider_payout_id
+        id, organization_id, payout_method_id, amount, status
       ) VALUES (
-        '${concurPayoutId}', '${synthOrgId}', '${payoutMethodId}', 1000.00, 'submitted_to_provider', 'payout_concur_ref_01'
+        '${concurPayoutId}', '${synthOrgId}', '${payoutMethodId}', 1000.00, 'pending_request'
       ) ON CONFLICT DO NOTHING;
+
+      -- Step 2: Transition to approved_reserved
+      UPDATE public.payouts
+      SET status = 'approved_reserved'
+      WHERE id = '${concurPayoutId}';
+
+      -- Step 3: Transition to submitted_to_provider
+      UPDATE public.payouts
+      SET status = 'submitted_to_provider', provider_payout_id = 'payout_concur_ref_01'
+      WHERE id = '${concurPayoutId}';
     `);
 
     // Concurrently fire competing terminal updates:
@@ -442,17 +458,17 @@ async function runValidationGate() {
     if (!String(failedPayout).includes('is in terminal status')) {
       throw new Error(`Expected terminal status conflict, got: ${failedPayout}`);
     }
-    log('  22B PASSED: Concurrent competing payout terminal outcomes safely resolved with exactly 1 winner and 1 conflict rejection.');
+    log('  23B PASSED: Concurrent competing payout terminal outcomes safely resolved with exactly 1 winner and 1 conflict rejection.');
 
     recordResult(
-      'Gate 4: Test 22 — Genuine Concurrent-Session Concurrency Tests',
+      'Gate 4: Test 23 — Genuine Concurrent-Session Concurrency Tests',
       'PASS',
       `Duplicate captured payment race safely serialized (1 winner). Competing payout terminal transitions safely resolved across 2 independent PostgreSQL sessions (PIDs ${pid1}, ${pid2}).`,
       gate4Start
     );
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    recordResult('Gate 4: Test 22 — Genuine Concurrent-Session Concurrency Tests', 'FAIL', msg, gate4Start);
+    recordResult('Gate 4: Test 23 — Genuine Concurrent-Session Concurrency Tests', 'FAIL', msg, gate4Start);
     log(`\nFATAL: Gate 4 failed. Aborting.`);
     if (client1) try { await client1.end(); } catch {}
     if (client2) try { await client2.end(); } catch {}

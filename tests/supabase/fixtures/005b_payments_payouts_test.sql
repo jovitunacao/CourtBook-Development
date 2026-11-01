@@ -25,6 +25,7 @@
 --   19. SECURITY REVIEW 6: Webhook Signature Evidence Tampering Rejection
 --   20. SECURITY REVIEW 7: Payout Token Confidentiality, Access Control & Token Denial
 --   21. SECURITY REVIEW 8: Null-Safe Identifier Immutability (IS DISTINCT FROM)
+--   22. SECURITY REVIEW 9: Lifecycle Insert-Time Status Validation & Financial Amount Integrity
 -- ==============================================================================
 
 BEGIN;
@@ -40,6 +41,7 @@ DECLARE
     v_synth_res_a UUID := gen_random_uuid();
     v_synth_res_b UUID := gen_random_uuid();
     v_synth_res_c UUID := gen_random_uuid();
+    v_synth_res_d UUID := gen_random_uuid();
 
     v_payment_id UUID;
     v_payout_method_id_a UUID;
@@ -83,6 +85,9 @@ BEGIN
     ), (
         v_synth_res_c, v_synth_fac_a, v_synth_court_a, 'SYNTH-RES-05B-C', 'Customer C', 'customer.c@example.com',
         CURRENT_DATE, now() + interval '3 hours', now() + interval '4 hours', '11:00 - 12:00', 60, 350.00, '₱', 'confirmed'
+    ), (
+        v_synth_res_d, v_synth_fac_b, v_synth_court_b, 'SYNTH-RES-05B-D', 'Customer D', 'customer.d@example.com',
+        CURRENT_DATE, now() + interval '4 hours', now() + interval '5 hours', '12:00 - 13:00', 60, 400.00, '₱', 'confirmed'
     );
 
     PERFORM set_config('app.test_org_a', v_synth_org_a::text, false);
@@ -128,24 +133,31 @@ BEGIN
     -- -------------------------------------------------------------------------
     INSERT INTO public.payments (
         id, organization_id, facility_id, reservation_id, expected_amount,
-        commission_rate, commission_amount, owner_gross_share, status,
-        captured_amount, provider_name, provider_payment_id
+        commission_rate, commission_amount, owner_gross_share, status
     ) VALUES (
         gen_random_uuid(), v_synth_org_a, v_synth_fac_a, v_synth_res_a,
-        350.00, 0.0500, 17.50, 332.50, 'captured',
-        350.00, 'paymongo', 'pay_unique_test_12345'
+        350.00, 0.0500, 17.50, 332.50, 'pending'
     ) RETURNING id INTO v_payment_id;
 
+    UPDATE public.payments
+    SET status = 'captured', captured_amount = 350.00, provider_name = 'paymongo', provider_payment_id = 'pay_unique_test_12345'
+    WHERE id = v_payment_id;
+
+    DECLARE
+        v_pay_b_dup UUID;
     BEGIN
         INSERT INTO public.payments (
             organization_id, facility_id, reservation_id, expected_amount,
-            commission_rate, commission_amount, owner_gross_share, status,
-            captured_amount, provider_name, provider_payment_id
+            commission_rate, commission_amount, owner_gross_share, status
         ) VALUES (
             v_synth_org_b, v_synth_fac_b, v_synth_res_b,
-            400.00, 0.0500, 20.00, 380.00, 'captured',
-            400.00, 'paymongo', 'pay_unique_test_12345' -- DUPLICATE!
-        );
+            400.00, 0.0500, 20.00, 380.00, 'pending'
+        ) RETURNING id INTO v_pay_b_dup;
+
+        UPDATE public.payments
+        SET status = 'captured', captured_amount = 400.00, provider_name = 'paymongo', provider_payment_id = 'pay_unique_test_12345'
+        WHERE id = v_pay_b_dup;
+
         RAISE EXCEPTION 'Test 2 Failed: Duplicate provider_payment_id was not rejected!';
     EXCEPTION WHEN unique_violation THEN
         v_test_count := v_test_count + 1;
@@ -397,13 +409,15 @@ BEGIN
     -- Provision valid captured payment for Org B
     INSERT INTO public.payments (
         organization_id, facility_id, reservation_id, expected_amount,
-        commission_rate, commission_amount, owner_gross_share, status,
-        captured_amount, provider_name, provider_payment_id
+        commission_rate, commission_amount, owner_gross_share, status
     ) VALUES (
         v_synth_org_b, v_synth_fac_b, v_synth_res_b,
-        400.00, 0.0500, 20.00, 380.00, 'captured',
-        400.00, 'paymongo', 'pay_b_captured_settle_01'
+        400.00, 0.0500, 20.00, 380.00, 'pending'
     ) RETURNING id INTO v_payment_id;
+
+    UPDATE public.payments
+    SET status = 'captured', captured_amount = 400.00, provider_name = 'paymongo', provider_payment_id = 'pay_b_captured_settle_01'
+    WHERE id = v_payment_id;
 
     -- Valid item matched against payment (matching payment_id, organization_id, facility_id)
     INSERT INTO public.settlement_items (
@@ -543,16 +557,21 @@ BEGIN
     -- Reservation A has a payment that was captured and then refunded (from Test 2 & 5b).
     -- Attempt to insert another captured payment for Reservation A:
     -- uq_captured_payment_lifecycle_per_reservation MUST reject this!
+    DECLARE
+        v_pay_res_a_dup UUID;
     BEGIN
         INSERT INTO public.payments (
             organization_id, facility_id, reservation_id, expected_amount,
-            commission_rate, commission_amount, owner_gross_share, status,
-            captured_amount, provider_name, provider_payment_id
+            commission_rate, commission_amount, owner_gross_share, status
         ) VALUES (
             v_synth_org_a, v_synth_fac_a, v_synth_res_a, -- Same reservation!
-            350.00, 0.0500, 17.50, 332.50, 'captured',
-            350.00, 'paymongo', 'pay_second_capture_after_refund'
-        );
+            350.00, 0.0500, 17.50, 332.50, 'pending'
+        ) RETURNING id INTO v_pay_res_a_dup;
+
+        UPDATE public.payments
+        SET status = 'captured', captured_amount = 350.00, provider_name = 'paymongo', provider_payment_id = 'pay_second_capture_after_refund'
+        WHERE id = v_pay_res_a_dup;
+
         RAISE EXCEPTION 'Test 17 Failed: Duplicate capture after refund was not rejected!';
     EXCEPTION WHEN unique_violation THEN
         v_test_count := v_test_count + 1;
@@ -710,6 +729,158 @@ BEGIN
         ELSE
             RAISE EXCEPTION 'Test 21e Failed: Unexpected error: %', SQLERRM;
         END IF;
+    END;
+
+    -- -------------------------------------------------------------------------
+    -- TEST 22: Lifecycle Insert-Time Status Validation & Financial Amount Integrity
+    -- -------------------------------------------------------------------------
+    -- 22a: Direct INSERT into captured payment status must be rejected
+    BEGIN
+        INSERT INTO public.payments (
+            organization_id, facility_id, reservation_id, expected_amount,
+            commission_rate, commission_amount, owner_gross_share, status
+        ) VALUES (
+            v_synth_org_a, v_synth_fac_a, v_synth_res_c,
+            350.00, 0.0500, 17.50, 332.50, 'captured'
+        );
+        RAISE EXCEPTION 'Test 22a Failed: Direct INSERT into captured payment status was not rejected!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Invalid initial payment status: payment records cannot be inserted directly into "captured"%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 22a PASSED: Direct INSERT into captured payment status strictly rejected.';
+        ELSE
+            RAISE EXCEPTION 'Test 22a Failed: Unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    -- 22b: Direct INSERT into refunded payment status must be rejected
+    BEGIN
+        INSERT INTO public.payments (
+            organization_id, facility_id, reservation_id, expected_amount,
+            commission_rate, commission_amount, owner_gross_share, status
+        ) VALUES (
+            v_synth_org_a, v_synth_fac_a, v_synth_res_c,
+            350.00, 0.0500, 17.50, 332.50, 'refunded'
+        );
+        RAISE EXCEPTION 'Test 22b Failed: Direct INSERT into refunded payment status was not rejected!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Invalid initial payment status: payment records cannot be inserted directly into "refunded"%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 22b PASSED: Direct INSERT into refunded payment status strictly rejected.';
+        ELSE
+            RAISE EXCEPTION 'Test 22b Failed: Unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    -- 22c: Direct INSERT into paid payout status must be rejected
+    BEGIN
+        INSERT INTO public.payouts (
+            organization_id, payout_method_id, amount, status
+        ) VALUES (
+            v_synth_org_a, v_payout_method_id_a, 1000.00, 'paid'
+        );
+        RAISE EXCEPTION 'Test 22c Failed: Direct INSERT into paid payout status was not rejected!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Invalid initial payout status: payout records must be initialized in "pending_request"%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 22c PASSED: Direct INSERT into paid payout status strictly rejected.';
+        ELSE
+            RAISE EXCEPTION 'Test 22c Failed: Unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    -- 22d: Direct INSERT into approved_reserved payout status must be rejected
+    BEGIN
+        INSERT INTO public.payouts (
+            organization_id, payout_method_id, amount, status
+        ) VALUES (
+            v_synth_org_a, v_payout_method_id_a, 1000.00, 'approved_reserved'
+        );
+        RAISE EXCEPTION 'Test 22d Failed: Direct INSERT into approved_reserved payout status was not rejected!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Invalid initial payout status: payout records must be initialized in "pending_request"%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 22d PASSED: Direct INSERT into approved_reserved payout status strictly rejected.';
+        ELSE
+            RAISE EXCEPTION 'Test 22d Failed: Unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    -- Setup a fresh captured payment for financial amount testing
+    DECLARE
+        v_pay_amount_test UUID := gen_random_uuid();
+    BEGIN
+        INSERT INTO public.payments (
+            id, organization_id, facility_id, reservation_id, expected_amount,
+            commission_rate, commission_amount, owner_gross_share, status
+        ) VALUES (
+            v_pay_amount_test, v_synth_org_b, v_synth_fac_b, v_synth_res_d,
+            400.00, 0.0500, 20.00, 380.00, 'pending'
+        );
+
+        UPDATE public.payments
+        SET status = 'captured', captured_amount = 400.00, provider_name = 'paymongo', provider_payment_id = 'pay_amount_test_01'
+        WHERE id = v_pay_amount_test;
+
+        -- 22e: Same-status captured_amount tampering must fail
+        BEGIN
+            UPDATE public.payments
+            SET captured_amount = 999.00
+            WHERE id = v_pay_amount_test;
+            RAISE EXCEPTION 'Test 22e Failed: Same-status captured_amount alteration was not rejected!';
+        EXCEPTION WHEN OTHERS THEN
+            IF SQLERRM LIKE '%Captured amount (₱%) is strictly immutable once captured%' THEN
+                v_test_count := v_test_count + 1;
+                RAISE NOTICE 'Test 22e PASSED: Same-status captured_amount tampering strictly rejected.';
+            ELSE
+                RAISE EXCEPTION 'Test 22e Failed: Unexpected error: %', SQLERRM;
+            END IF;
+        END;
+
+        -- 22f: Refunded amount exceeding captured amount must fail
+        BEGIN
+            UPDATE public.payments
+            SET refunded_amount = 5000.00
+            WHERE id = v_pay_amount_test;
+            RAISE EXCEPTION 'Test 22f Failed: Refunded amount exceeding captured funds was not rejected!';
+        EXCEPTION WHEN OTHERS THEN
+            IF SQLERRM LIKE '%Refunded amount (₱%) cannot exceed captured amount%' OR SQLERRM LIKE '%chk_payments_refunded_le_captured%' THEN
+                v_test_count := v_test_count + 1;
+                RAISE NOTICE 'Test 22f PASSED: Refunded amount exceeding captured funds strictly rejected.';
+            ELSE
+                RAISE EXCEPTION 'Test 22f Failed: Unexpected error: %', SQLERRM;
+            END IF;
+        END;
+
+        -- 22g: Refunded amount decreasing after partial refund must fail
+        UPDATE public.payments
+        SET status = 'partially_refunded', refunded_amount = 100.00
+        WHERE id = v_pay_amount_test;
+
+        BEGIN
+            UPDATE public.payments
+            SET refunded_amount = 50.00
+            WHERE id = v_pay_amount_test;
+            RAISE EXCEPTION 'Test 22g Failed: Refunded amount reduction after partial refund was not rejected!';
+        EXCEPTION WHEN OTHERS THEN
+            IF SQLERRM LIKE '%Refunded amount cannot decrease%' THEN
+                v_test_count := v_test_count + 1;
+                RAISE NOTICE 'Test 22g PASSED: Refunded amount reduction after partial refund strictly rejected.';
+            ELSE
+                RAISE EXCEPTION 'Test 22g Failed: Unexpected error: %', SQLERRM;
+            END IF;
+        END;
+
+        -- 22h: Legitimate partial refund followed by full refund verified
+        UPDATE public.payments
+        SET refunded_amount = 200.00
+        WHERE id = v_pay_amount_test;
+
+        UPDATE public.payments
+        SET status = 'refunded', refunded_amount = 400.00
+        WHERE id = v_pay_amount_test;
+        v_test_count := v_test_count + 1;
+        RAISE NOTICE 'Test 22h PASSED: Legitimate partial refund followed by full refund completed successfully.';
     END;
 
     RAISE NOTICE '=== ALL % DATABASE TESTS COMPLETED SUCCESSFULLY ===', v_test_count;
