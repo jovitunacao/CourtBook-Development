@@ -8,20 +8,20 @@ Execution Evidence Log: tests/supabase/reports/005b_execution_evidence.log
 
 Connected to disposable PostgreSQL engine:
 PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit
-Server Data Directory: /tmp/cb_005b_1542_1793491613741_data
-Server Socket Directory: /tmp/cb_005b_1542_1793491613741_sock (Port: 30293)
+Server Data Directory: /tmp/cb_005b_1914_1793492323122_data
+Server Socket Directory: /tmp/cb_005b_1914_1793492323122_sock (Port: 37195)
 
 --- Running Gate 1: Baseline Migrations 001-005a1 & Migration 005B Application ---
-[PASS] Gate 1: Baseline 001-005a1 Application & Migration 005B Execution (190ms): All baseline migrations and Migration 005B applied atomically within safe isolated disposable database.
+[PASS] Gate 1: Baseline 001-005a1 Application & Migration 005B Execution (239ms): All baseline migrations and Migration 005B applied atomically within safe isolated disposable database.
 
 --- Running Gate 2: Schema & Table Constraints Verification ---
-[PASS] Gate 2: Schema & Table Constraints Verification (6ms): All 8 new tables verified with composite foreign keys, unique constraints, and undecided fee configuration.
+[PASS] Gate 2: Schema & Table Constraints Verification (7ms): All 8 new tables verified with composite foreign keys, unique constraints, and undecided fee configuration.
 
 --- Running Gate 3: SQL Test Fixture Execution (Tests 1 through 14) ---
-[PASS] Gate 3: SQL Test Fixture Execution (Tests 1-14) (33ms): All 14 unit and integration tests passed: cross-tenant isolation, duplicate prevention, state machine transitions, fee preservation, and security boundaries.
+[PASS] Gate 3: SQL Test Fixture Execution (Tests 1-14) (49ms): All 14 unit and integration tests passed: cross-tenant isolation, duplicate prevention, state machine transitions, fee preservation, and security boundaries.
 
 --- Running Gate 4: Test 15 — Genuine Concurrent-Session Concurrency Tests ---
-  Verified 2 independent concurrent PostgreSQL sessions: Session 1 PID=1595, Session 2 PID=1596
-  15A PASSED: Concurrent duplicate captured payment recognition safely rejected by uq_single_captured_payment_per_reservation.
+  Verified 2 independent concurrent PostgreSQL sessions: Session 1 PID=1977, Session 2 PID=1978
+  15A PASSED: Concurrent duplicate captured payment recognition safely rejected by uq_captured_payment_lifecycle_per_reservation.
   15B PASSED: Concurrent competing payout terminal outcomes safely resolved with exactly 1 winner and 1 conflict rejection.
-[PASS] Gate 4: Test 15 — Genuine Concurrent-Session Concurrency Tests (33ms): Duplicate captured payment race safely serialized (1 winner). Competing payout terminal transitions safely resolved across 2 independent PostgreSQL sessions (PIDs 1595, 1596).
+[PASS] Gate 4: Test 15 — Genuine Concurrent-Session Concurrency Tests (44ms): Duplicate captured payment race safely serialized (1 winner). Competing payout terminal transitions safely resolved across 2 independent PostgreSQL sessions (PIDs 1977, 1978).

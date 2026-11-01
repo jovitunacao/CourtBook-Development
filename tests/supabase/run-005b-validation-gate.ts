@@ -133,6 +133,14 @@ async function setupSupabaseMockAuth(client: Client) {
     CREATE OR REPLACE FUNCTION auth.uid() RETURNS UUID LANGUAGE sql STABLE AS $$
       SELECT NULLIF(current_setting('request.jwt.claim.sub', true), '')::UUID;
     $$;
+
+    GRANT USAGE ON SCHEMA auth TO anon, authenticated, service_role;
+    GRANT ALL ON TABLE auth.users TO anon, authenticated, service_role;
+    GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA auth TO anon, authenticated, service_role;
+    GRANT USAGE ON SCHEMA public TO anon, authenticated, service_role;
+    GRANT ALL ON ALL TABLES IN SCHEMA public TO authenticated, service_role;
+    GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO authenticated, service_role;
+    GRANT ALL ON ALL ROUTINES IN SCHEMA public TO authenticated, service_role;
   `);
 }
 
@@ -353,22 +361,22 @@ async function runValidationGate() {
         INSERT INTO public.payments (
           organization_id, facility_id, reservation_id, expected_amount,
           commission_rate, commission_amount, owner_gross_share, status,
-          provider_name, provider_payment_id
+          captured_amount, provider_name, provider_payment_id
         ) VALUES (
           '${synthOrgId}', '${synthFacId}', '${synthResId}',
           350.00, 0.0500, 17.50, 332.50, 'captured',
-          'paymongo', 'pay_concur_session_1'
+          350.00, 'paymongo', 'pay_concur_session_1'
         );
       `),
       client2.query(`
         INSERT INTO public.payments (
           organization_id, facility_id, reservation_id, expected_amount,
           commission_rate, commission_amount, owner_gross_share, status,
-          provider_name, provider_payment_id
+          captured_amount, provider_name, provider_payment_id
         ) VALUES (
           '${synthOrgId}', '${synthFacId}', '${synthResId}',
           350.00, 0.0500, 17.50, 332.50, 'captured',
-          'paymongo', 'pay_concur_session_2'
+          350.00, 'paymongo', 'pay_concur_session_2'
         );
       `)
     ]);
@@ -381,10 +389,10 @@ async function runValidationGate() {
     }
 
     const failedCapture = !cap1Ok ? (capture1 as PromiseRejectedResult).reason : (capture2 as PromiseRejectedResult).reason;
-    if (!String(failedCapture).includes('uq_single_captured_payment_per_reservation')) {
-      throw new Error(`Expected uq_single_captured_payment_per_reservation error, got: ${failedCapture}`);
+    if (!String(failedCapture).includes('uq_captured_payment_lifecycle_per_reservation')) {
+      throw new Error(`Expected uq_captured_payment_lifecycle_per_reservation error, got: ${failedCapture}`);
     }
-    log('  15A PASSED: Concurrent duplicate captured payment recognition safely rejected by uq_single_captured_payment_per_reservation.');
+    log('  15A PASSED: Concurrent duplicate captured payment recognition safely rejected by uq_captured_payment_lifecycle_per_reservation.');
 
     // 15B. Concurrent Competing Payout Terminal Outcomes:
     // Setup a payout in 'submitted_to_provider' state
