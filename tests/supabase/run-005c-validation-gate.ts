@@ -211,6 +211,7 @@ async function runValidationGate() {
 
     const expectedFunctions = [
       'create_booking_checkout_session',
+      'bind_provider_checkout_session',
       'process_verified_payment_event',
       'process_settlement_clearing',
       'process_verified_refund_event',
@@ -235,7 +236,7 @@ async function runValidationGate() {
     recordResult(
       'Gate 2: Stored Procedures & Authorization Boundary Verification',
       'PASS',
-      'All 7 005C integration procedures verified with SECURITY DEFINER and search_path hardening.',
+      'All 8 005C integration procedures verified with SECURITY DEFINER and search_path hardening.',
       gate2Start
     );
   } catch (err: unknown) {
@@ -253,7 +254,7 @@ async function runValidationGate() {
   const gate3Start = Date.now();
   try {
     log('\n--- Running Gate 3: Webhook Signature Verification & Provider Adapter Unit Tests ---');
-    const sigResults = runWebhookSignatureTests();
+    const sigResults = await runWebhookSignatureTests();
 
     if (sigResults.failed > 0) {
       throw new Error(`Webhook signature test failures: ${sigResults.errors.join('; ')}`);
@@ -362,7 +363,6 @@ async function runValidationGate() {
           '${dateStr}'::date,
           '${startTimeStr}'::timestamptz,
           60,
-          'cs_concur_001',
           'paymongo'
         );
       `),
@@ -377,7 +377,6 @@ async function runValidationGate() {
           '${dateStr}'::date,
           '${startTimeStr}'::timestamptz,
           60,
-          'cs_concur_002',
           'paymongo'
         );
       `),

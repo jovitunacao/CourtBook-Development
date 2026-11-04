@@ -56,9 +56,33 @@ export interface NormalizedWebhookEvent {
   rawPayload: Record<string, unknown>;
 }
 
+export interface ProviderCheckoutSessionParams {
+  amountCentavos: number;
+  currency: string;
+  description: string;
+  customerName: string;
+  customerPhone?: string;
+  customerEmail?: string;
+  referenceCode: string;
+  successUrl: string;
+  cancelUrl: string;
+  metadata?: Record<string, string>;
+}
+
+export interface ProviderCheckoutSessionResult {
+  providerCheckoutId: string;
+  checkoutUrl: string;
+  isSimulated: boolean;
+  rawResponse?: Record<string, unknown>;
+}
+
 export interface PaymentProviderAdapter {
   readonly providerName: PaymentProviderName;
   readonly isReady: boolean;
+  createCheckoutSession(
+    params: ProviderCheckoutSessionParams,
+    secretKey?: string
+  ): Promise<ProviderCheckoutSessionResult>;
   verifyWebhookSignature(
     rawBody: string,
     signatureHeader: string,

@@ -3,10 +3,11 @@
 // Endpoint: POST /create-checkout-session
 //
 // Description:
-//   Accepts client checkout requests, validates inputs, invokes the secure database
-//   procedure public.create_booking_checkout_session to lock the court slot,
-//   create the pending reservation hold, compute the server-authoritative price
-//   and 5% commission snapshot, and return payment session parameters.
+//   Accepts customer checkout requests, validates inputs and anti-abuse bounds,
+//   invokes the secure database procedure public.create_booking_checkout_session
+//   to lock the court slot and calculate server-authoritative rates and 5% commission,
+//   interacts with the trusted payment provider adapter to create a real checkout session,
+//   and securely binds the returned provider checkout ID to the payment record.
 // ==============================================================================
 
 import { serve } from 'https://deno.land/std@0.177.0/http/server.ts';
@@ -54,6 +55,17 @@ serve(async (req: Request) => {
       );
     }
 
+    const providerName = (body.provider_name || 'paymongo').toLowerCase().trim();
+    if (providerName === 'xendit') {
+      return new Response(
+        JSON.stringify({
+          error: 'Xendit payment provider adapter is marked NOT READY. Official production integration pending.',
+          is_ready: false,
+        }),
+        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
     const supabaseUrl = Deno.env.get('SUPABASE_URL') || '';
     const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') || '';
 
@@ -66,7 +78,7 @@ serve(async (req: Request) => {
 
     const supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey);
 
-    // Call the database function create_booking_checkout_session
+    // 1. Call database procedure to initialize hold and compute server-authoritative rates
     const { data, error } = await supabaseAdmin.rpc('create_booking_checkout_session', {
       p_idempotency_key: idempotencyKey,
       p_facility_id: body.facility_id,
@@ -77,8 +89,7 @@ serve(async (req: Request) => {
       p_booking_date: body.booking_date,
       p_start_time: body.start_time,
       p_duration_minutes: body.duration_minutes || 60,
-      p_checkout_session_id: null,
-      p_provider_name: body.provider_name || 'paymongo',
+      p_provider_name: providerName,
     });
 
     if (error) {
@@ -92,10 +103,110 @@ serve(async (req: Request) => {
       );
     }
 
-    return new Response(JSON.stringify(data), {
-      status: 200,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    // 2. If already bound and replayed idempotently, return existing session details
+    if (data.idempotent_replayed && data.checkout_url && !data.checkout_session_id.startsWith('cs_pending_')) {
+      return new Response(JSON.stringify(data), {
+        status: 200,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
+    // 3. Create Checkout Session via trusted Provider Adapter
+    const paymongoSecretKey = Deno.env.get('PAYMONGO_SECRET_KEY') || '';
+    const appBaseUrl = Deno.env.get('APP_BASE_URL') || 'https://courtbook.app';
+    const amountCentavos = Math.round(Number(data.expected_amount) * 100);
+
+    let providerCheckoutId: string;
+    let checkoutUrl: string;
+    let isSimulated = false;
+
+    if (paymongoSecretKey.startsWith('sk_live_') || paymongoSecretKey.startsWith('sk_test_')) {
+      // Official PayMongo API invocation using server-authoritative pricing
+      const authHeader = 'Basic ' + btoa(`${paymongoSecretKey}:`);
+      const pmRes = await fetch('https://api.paymongo.com/v1/checkout_sessions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': authHeader,
+        },
+        body: JSON.stringify({
+          data: {
+            attributes: {
+              send_email_receipt: true,
+              show_description: true,
+              show_line_items: true,
+              description: `CourtBook: ${data.court_name} (${data.time_slot_label})`,
+              line_items: [
+                {
+                  currency: data.currency,
+                  amount: amountCentavos,
+                  name: `Court Rental: ${data.court_name}`,
+                  quantity: 1,
+                },
+              ],
+              payment_method_types: ['card', 'gcash', 'paymaya', 'grab_pay'],
+              reference_number: data.reference_code,
+              success_url: `${appBaseUrl}/booking/success?ref=${data.reference_code}`,
+              cancel_url: `${appBaseUrl}/booking/cancelled?ref=${data.reference_code}`,
+              metadata: {
+                reservation_id: data.reservation_id,
+                payment_id: data.payment_id,
+                reference_code: data.reference_code,
+              },
+            },
+          },
+        }),
+      });
+
+      if (!pmRes.ok) {
+        const pmErr = await pmRes.text();
+        return new Response(
+          JSON.stringify({ error: `PayMongo API error: ${pmErr}` }),
+          { status: 502, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+
+      const pmJson = await pmRes.json();
+      providerCheckoutId = pmJson.data.id;
+      checkoutUrl = pmJson.data.attributes.checkout_url;
+    } else {
+      // Clearly separated sandbox / development simulation mode
+      // Explicitly marked is_simulated: true to prevent any claim of active live gateway
+      isSimulated = true;
+      providerCheckoutId = `cs_sandbox_${data.reference_code}`;
+      checkoutUrl = `${appBaseUrl}/sandbox/checkout?cs=${providerCheckoutId}&ref=${data.reference_code}`;
+    }
+
+    // 4. Securely bind the returned provider checkout ID to the reservation and payment record
+    const { data: bindData, error: bindError } = await supabaseAdmin.rpc('bind_provider_checkout_session', {
+      p_payment_id: data.payment_id,
+      p_reservation_id: data.reservation_id,
+      p_provider_name: providerName,
+      p_checkout_session_id: providerCheckoutId,
+      p_checkout_url: checkoutUrl,
+      p_idempotency_key: `${idempotencyKey}_bind`,
+      p_metadata: {
+        is_simulated: isSimulated,
+        provider_session_id: providerCheckoutId,
+      },
     });
+
+    if (bindError) {
+      return new Response(
+        JSON.stringify({ error: `Checkout binding error: ${bindError.message}` }),
+        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
+    return new Response(
+      JSON.stringify({
+        ...data,
+        checkout_session_id: providerCheckoutId,
+        checkout_url: checkoutUrl,
+        is_simulated: isSimulated,
+      }),
+      { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+    );
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     return new Response(

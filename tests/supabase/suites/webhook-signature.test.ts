@@ -7,7 +7,7 @@ import crypto from 'node:crypto';
 import { PayMongoAdapter } from '../../../src/lib/payments/paymongo-adapter';
 import { PaymentProviderRegistry, XenditAdapter } from '../../../src/lib/payments/provider-adapter';
 
-export function runWebhookSignatureTests(): { passed: number; failed: number; errors: string[] } {
+export async function runWebhookSignatureTests(): Promise<{ passed: number; failed: number; errors: string[] }> {
   const errors: string[] = [];
   let passed = 0;
   let failed = 0;
@@ -108,13 +108,72 @@ export function runWebhookSignatureTests(): { passed: number; failed: number; er
     );
   }
 
-  // Test 7: Xendit adapter is marked NOT READY
+  // Test 7: Xendit adapter is marked NOT READY for webhooks
   {
     const xendit = PaymentProviderRegistry.getAdapter('xendit');
     const res = xendit.verifyWebhookSignature('', '', '');
     assert(
       xendit.isReady === false && res.isValid === false && (res.error?.includes('NOT READY') ?? false),
       'Test 7: Xendit adapter safely isolated behind interface and marked NOT READY'
+    );
+  }
+
+  // Test 8: Xendit adapter rejects checkout session creation
+  {
+    const xendit = PaymentProviderRegistry.getAdapter('xendit');
+    let rejected = false;
+    try {
+      await xendit.createCheckoutSession({
+        amountCentavos: 35000,
+        currency: 'PHP',
+        description: 'Test Booking',
+        customerName: 'Test Booker',
+        referenceCode: 'CB-TEST-001',
+        successUrl: 'https://courtbook.app/success',
+        cancelUrl: 'https://courtbook.app/cancel'
+      });
+    } catch (err: unknown) {
+      if (err instanceof Error && err.message.includes('NOT READY')) {
+        rejected = true;
+      }
+    }
+    assert(rejected, 'Test 8: Xendit createCheckoutSession strictly rejected with NOT READY error');
+  }
+
+  // Test 9: PayMongo adapter returns clearly marked sandbox simulation without active live keys
+  {
+    const res = await adapter.createCheckoutSession({
+      amountCentavos: 35000,
+      currency: 'PHP',
+      description: 'CourtBook Booking',
+      customerName: 'Sandbox Booker',
+      referenceCode: 'CB-SANDBOX-001',
+      successUrl: 'https://courtbook.app/success',
+      cancelUrl: 'https://courtbook.app/cancel'
+    });
+    assert(
+      res.isSimulated === true &&
+      res.providerCheckoutId.startsWith('cs_sandbox_') &&
+      res.checkoutUrl.includes('test-checkout.paymongo.com'),
+      'Test 9: PayMongo adapter cleanly identifies simulated sandbox session with isSimulated: true'
+    );
+  }
+
+  // Test 10: Manual test adapter cleanly registers and creates test checkout session
+  {
+    const manualAdapter = PaymentProviderRegistry.getAdapter('manual_test');
+    const res = await manualAdapter.createCheckoutSession({
+      amountCentavos: 40000,
+      currency: 'PHP',
+      description: 'Test Court',
+      customerName: 'Manual User',
+      referenceCode: 'CB-MANUAL-001',
+      successUrl: 'https://courtbook.app/success',
+      cancelUrl: 'https://courtbook.app/cancel'
+    });
+    assert(
+      res.isSimulated === true && res.providerCheckoutId.startsWith('cs_manual_'),
+      'Test 10: Manual test adapter clearly separated and verified for disposable testing'
     );
   }
 

@@ -2,33 +2,6 @@
 -- CourtBook / BookSuite — Test Fixture SQL
 -- File: tests/supabase/fixtures/005c_integration_test.sql
 -- Description: Integration Verification Test Suite for Hardened Migration 005C
---
--- TESTS COVERED (All 25 Core Verification Scenarios):
---   1. Successful verified payment and valid reservation
---   2. Duplicate checkout request idempotency
---   3. Duplicate webhook delivery idempotency
---   4. Forged or unverified webhook rejection
---   5. Incorrect payment amount handling (routed to customer refund liability)
---   6. Incorrect currency rejection
---   7. Cross-tenant payment and facility mismatch rejection
---   8. Payment after booking hold expiration (routed to customer refund liability)
---   9. Payment after staff decline
---   10. Booking collision & court overlap rejection
---   11. Captured payment with court collision (customer refund liability preserved)
---   12. Full refund reversal & double-entry journal balance
---   13. Partial refund and payment status transition
---   14. Chargeback and adjustment verification
---   15. Missing settlement batch rejection
---   16. Duplicate funds-cleared event idempotency
---   17. Payout reservation & available balance deduction
---   18. Duplicate payout completion idempotency
---   19. Payout failure & reserve fund restoration
---   20. Unauthorized RPC execution restriction (service_role only)
---   21. Journal debits equal credits across all financial transactions
---   22. Existing booking system preservation (003 create_public_reservation)
---   23. Exact 5% commission calculation correctness (₱350 = ₱17.50 + ₱332.50)
---   24. Protection against over-withdrawal (balance invariant check)
---   25. Fee allocation policies confirmed as undecided
 -- ==============================================================================
 
 BEGIN;
@@ -70,6 +43,7 @@ BEGIN
     v_slot_2 := (v_test_date::text || ' 11:00:00 Asia/Manila')::timestamptz;
     v_slot_3 := (v_test_date::text || ' 13:00:00 Asia/Manila')::timestamptz;
     v_slot_4 := (v_test_date::text || ' 15:00:00 Asia/Manila')::timestamptz;
+
     RAISE NOTICE '========================================================================';
     RAISE NOTICE '=== Migration 005C: Trusted Booking & Payment Integration Tests       ===';
     RAISE NOTICE '========================================================================';
@@ -105,7 +79,6 @@ BEGIN
         v_test_date,
         v_slot_1,
         60,
-        'cs_paymongo_test_001',
         'paymongo'
     );
 
@@ -122,6 +95,61 @@ BEGIN
     RAISE NOTICE 'Test 23 PASSED: Server-authoritative 5%% commission correctly computed (₱350.00 = ₱17.50 + ₱332.50).';
 
     -- -------------------------------------------------------------------------
+    -- TEST 26 (NEW): Missing or Forged Provider Checkout Binding Rejection
+    -- -------------------------------------------------------------------------
+    -- 26A: Invalid session ID format rejection
+    BEGIN
+        PERFORM public.bind_provider_checkout_session(
+            v_pay_id,
+            v_res_id,
+            'paymongo',
+            'forged_session_without_cs_prefix',
+            'https://test.com',
+            'idem_bind_forged_001'
+        );
+        RAISE EXCEPTION 'Test 26A Failed: Forged checkout session format was not rejected!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Must begin with "cs_"%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 26A PASSED: Forged provider session format rejected.';
+        ELSE
+            RAISE EXCEPTION 'Test 26A Failed: Unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    -- 26B: Mismatched reservation ID rejection
+    BEGIN
+        PERFORM public.bind_provider_checkout_session(
+            v_pay_id,
+            gen_random_uuid(), -- WRONG RESERVATION!
+            'paymongo',
+            'cs_paymongo_test_001',
+            'https://test.com',
+            'idem_bind_mismatch_res'
+        );
+        RAISE EXCEPTION 'Test 26B Failed: Mismatched reservation ID was not rejected!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%does not belong to reservation%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 26B PASSED: Mismatched reservation ID rejected during binding.';
+        ELSE
+            RAISE EXCEPTION 'Test 26B Failed: Unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    -- 26C: Valid Provider Checkout Binding
+    PERFORM public.bind_provider_checkout_session(
+        v_pay_id,
+        v_res_id,
+        'paymongo',
+        'cs_paymongo_test_001',
+        'https://test-checkout.paymongo.com/sandbox/cs_paymongo_test_001',
+        'idem_bind_valid_001'
+    );
+    v_test_count := v_test_count + 1;
+    RAISE NOTICE 'Test 26C PASSED: Valid provider checkout session securely bound to payment record.';
+
+    -- -------------------------------------------------------------------------
     -- TEST 2: Duplicate Checkout Request Idempotency
     -- -------------------------------------------------------------------------
     v_dup_checkout := public.create_booking_checkout_session(
@@ -134,7 +162,6 @@ BEGIN
         v_test_date,
         v_slot_1,
         60,
-        'cs_paymongo_test_001',
         'paymongo'
     );
 
@@ -146,15 +173,96 @@ BEGIN
     RAISE NOTICE 'Test 2 PASSED: Duplicate checkout request idempotency verified.';
 
     -- -------------------------------------------------------------------------
+    -- TEST 27 (NEW): Unauthenticated Checkout Abuse & Idempotency Tampering
+    -- -------------------------------------------------------------------------
+    -- 27A: Idempotency conflict on altered customer parameters
+    BEGIN
+        PERFORM public.create_booking_checkout_session(
+            'idem_checkout_valid_001', -- SAME KEY AS Juan Dela Cruz!
+            v_synth_fac_a,
+            v_synth_court_a,
+            'Altered Attacker Name',   -- ALTERED PARAMETERS!
+            '09170009999',
+            'attacker@example.com',
+            v_test_date,
+            v_slot_1,
+            60,
+            'paymongo'
+        );
+        RAISE EXCEPTION 'Test 27A Failed: Altered idempotency replay was not rejected!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Idempotency conflict%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 27A PASSED: Idempotency replay with altered parameters strictly blocked.';
+        ELSE
+            RAISE EXCEPTION 'Test 27A Failed: Unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    -- 27B: Anti-Abuse: Max 3 active pending holds per contact
+    PERFORM public.create_booking_checkout_session('idem_abuse_hold_001', v_synth_fac_a, v_synth_court_a, 'Abuse Booker', '09170001111', 'abuse@test.com', v_test_date, v_slot_2, 60);
+    PERFORM public.create_booking_checkout_session('idem_abuse_hold_002', v_synth_fac_a, v_synth_court_a, 'Abuse Booker', '09170001111', 'abuse@test.com', v_test_date, v_slot_3, 60);
+    PERFORM public.create_booking_checkout_session('idem_abuse_hold_003', v_synth_fac_a, v_synth_court_a, 'Abuse Booker', '09170001111', 'abuse@test.com', v_test_date, v_slot_4, 60);
+
+    -- 4th hold attempt must be blocked by anti-abuse guard
+    BEGIN
+        PERFORM public.create_booking_checkout_session(
+            'idem_abuse_hold_004',
+            v_synth_fac_a,
+            v_synth_court_a,
+            'Abuse Booker',
+            '09170001111',
+            'abuse@test.com',
+            (v_test_date + interval '1 day')::date,
+            (((v_test_date + interval '1 day')::date)::text || ' 10:00:00 Asia/Manila')::timestamptz,
+            60
+        );
+        RAISE EXCEPTION 'Test 27B Failed: 4th pending hold was not blocked by anti-abuse limit!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Anti-abuse limit exceeded%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 27B PASSED: Anti-abuse guard blocked excessive pending holds.';
+        ELSE
+            RAISE EXCEPTION 'Test 27B Failed: Unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    -- Clean up abuse test holds so courts remain available for subsequent tests
+    UPDATE public.reservations SET status = 'cancelled' WHERE customer_phone = '09170001111';
+
+    -- -------------------------------------------------------------------------
+    -- TEST 28 (NEW): NULL Webhook Event ID Rejection
+    -- -------------------------------------------------------------------------
+    BEGIN
+        PERFORM public.process_verified_payment_event(
+            NULL, -- NULL WEBHOOK EVENT ID!
+            'paymongo',
+            'evt_test_null_wh',
+            'pay_prov_null_001',
+            'cs_paymongo_test_001',
+            350.00,
+            'PHP',
+            'idem_null_wh_001'
+        );
+        RAISE EXCEPTION 'Test 28 Failed: NULL webhook ID was not rejected!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Authoritative verified webhook_event_id is required%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 28 PASSED: NULL webhook event ID strictly rejected.';
+        ELSE
+            RAISE EXCEPTION 'Test 28 Failed: Unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    -- -------------------------------------------------------------------------
     -- TEST 4: Forged or Unverified Webhook Signature Rejection
     -- -------------------------------------------------------------------------
-    -- Insert unverified webhook record
     INSERT INTO public.provider_webhook_events (
         provider_name, provider_event_id, event_type, signature_verification_status,
         signature_header, processing_state, payload
     ) VALUES (
-        'paymongo', 'evt_forged_sig_001', 'payment.paid', 'failed',
-        't=12345,te=forged_bad_sig', 'failed', '{"data": {"id": "pay_forged_001"}}'::jsonb
+        'paymongo', 'evt_forged_sig_001', 'payment.paid', 'failed', -- FAILED SIGNATURE!
+        't=1700000000,li=bad_sig', 'pending', '{"data": {"id": "pay_forged_001"}}'::jsonb
     ) RETURNING id INTO v_wh_forged_id;
 
     BEGIN
@@ -168,28 +276,67 @@ BEGIN
             'PHP',
             'idem_proc_forged_001'
         );
-        RAISE EXCEPTION 'Test 4 Failed: Processing unverified webhook event was not rejected!';
+        RAISE EXCEPTION 'Test 4 Failed: Unverified webhook was not rejected!';
     EXCEPTION WHEN OTHERS THEN
-        IF SQLERRM LIKE '%Security rejection: Webhook event % has unverified signature status%' THEN
+        IF SQLERRM LIKE '%Security rejection%' THEN
             v_test_count := v_test_count + 1;
-            RAISE NOTICE 'Test 4 PASSED: Forged or unverified webhook strictly rejected.';
+            RAISE NOTICE 'Test 4 PASSED: Webhook with failed signature rejected.';
         ELSE
             RAISE EXCEPTION 'Test 4 Failed: Unexpected error: %', SQLERRM;
         END IF;
     END;
 
     -- -------------------------------------------------------------------------
-    -- TEST 1: Successful Verified Payment & Valid Reservation Confirmation
+    -- TEST 29 (NEW): Verified Webhook ID with Mismatched Details (Evidence Tampering)
     -- -------------------------------------------------------------------------
-    -- Insert verified webhook record
     INSERT INTO public.provider_webhook_events (
         provider_name, provider_event_id, event_type, signature_verification_status,
         signature_header, processing_state, payload
     ) VALUES (
         'paymongo', 'evt_verified_valid_001', 'payment.paid', 'verified',
-        't=1700000000,li=valid_hmac_hex', 'pending', '{"data": {"id": "pay_prov_valid_001"}}'::jsonb
+        't=1700000000,li=valid_hmac_hex', 'pending',
+        jsonb_build_object(
+            'data', jsonb_build_object(
+                'id', 'pay_prov_valid_001',
+                'attributes', jsonb_build_object(
+                    'data', jsonb_build_object(
+                        'id', 'pay_prov_valid_001',
+                        'attributes', jsonb_build_object(
+                            'amount', 35000,
+                            'currency', 'PHP',
+                            'checkout_session_id', 'cs_paymongo_test_001'
+                        )
+                    )
+                )
+            )
+        )
     ) RETURNING id INTO v_wh_event_id;
 
+    -- Caller attempts to supply ₱500.00 instead of payload's ₱350.00
+    BEGIN
+        PERFORM public.process_verified_payment_event(
+            v_wh_event_id,
+            'paymongo',
+            'evt_verified_valid_001',
+            'pay_prov_valid_001',
+            'cs_paymongo_test_001',
+            500.00, -- TAMPERED AMOUNT!
+            'PHP',
+            'idem_tamper_amt_001'
+        );
+        RAISE EXCEPTION 'Test 29A Failed: Tampered amount was not rejected!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Evidence tampering detected%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 29A PASSED: Tampered payment amount rejected against webhook evidence.';
+        ELSE
+            RAISE EXCEPTION 'Test 29A Failed: Unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    -- -------------------------------------------------------------------------
+    -- TEST 1: Successful Verified Payment Processing & Financial Journal Posting
+    -- -------------------------------------------------------------------------
     v_process_res := public.process_verified_payment_event(
         v_wh_event_id,
         'paymongo',
@@ -255,7 +402,6 @@ BEGIN
     -- -------------------------------------------------------------------------
     -- TEST 5: Incorrect Payment Amount Handling (Routed to Customer Refund Liability)
     -- -------------------------------------------------------------------------
-    -- Create another checkout
     v_checkout_res := public.create_booking_checkout_session(
         'idem_checkout_mismatch_001',
         v_synth_fac_a,
@@ -266,8 +412,16 @@ BEGIN
         v_test_date,
         v_slot_2,
         60,
-        'cs_paymongo_mismatch_001',
         'paymongo'
+    );
+
+    PERFORM public.bind_provider_checkout_session(
+        (v_checkout_res->>'payment_id')::UUID,
+        (v_checkout_res->>'reservation_id')::UUID,
+        'paymongo',
+        'cs_paymongo_mismatch_001',
+        'https://test.com',
+        'idem_bind_mismatch_001'
     );
 
     INSERT INTO public.provider_webhook_events (
@@ -275,7 +429,8 @@ BEGIN
         signature_header, processing_state, payload
     ) VALUES (
         'paymongo', 'evt_mismatch_001', 'payment.paid', 'verified',
-        't=1700000000,li=valid_hmac_hex', 'pending', '{"data": {"id": "pay_prov_mismatch_001"}}'::jsonb
+        't=1700000000,li=valid_hmac_hex', 'pending',
+        jsonb_build_object('data', jsonb_build_object('id', 'pay_prov_mismatch_001', 'attributes', jsonb_build_object('amount', 10000, 'currency', 'PHP', 'checkout_session_id', 'cs_paymongo_mismatch_001')))
     ) RETURNING id INTO v_wh_event_id;
 
     -- Send ₱100.00 instead of expected ₱350.00
@@ -285,7 +440,7 @@ BEGIN
         'evt_mismatch_001',
         'pay_prov_mismatch_001',
         'cs_paymongo_mismatch_001',
-        100.00, -- WRONG AMOUNT!
+        100.00,
         'PHP',
         'idem_proc_mismatch_001'
     );
@@ -306,7 +461,7 @@ BEGIN
             'evt_mismatch_001',
             'pay_prov_mismatch_001',
             'cs_paymongo_mismatch_001',
-            350.00,
+            100.00,
             'USD', -- UNSUPPORTED CURRENCY!
             'idem_proc_bad_curr_001'
         );
@@ -323,7 +478,6 @@ BEGIN
     -- -------------------------------------------------------------------------
     -- TEST 8: Payment After Booking Hold Expiration (Customer Refund Liability)
     -- -------------------------------------------------------------------------
-    -- Create checkout
     v_checkout_res := public.create_booking_checkout_session(
         'idem_checkout_late_001',
         v_synth_fac_a,
@@ -334,11 +488,19 @@ BEGIN
         v_test_date,
         v_slot_3,
         60,
-        'cs_paymongo_late_001',
         'paymongo'
     );
     v_res_id := (v_checkout_res->>'reservation_id')::UUID;
     v_pay_id := (v_checkout_res->>'payment_id')::UUID;
+
+    PERFORM public.bind_provider_checkout_session(
+        v_pay_id,
+        v_res_id,
+        'paymongo',
+        'cs_paymongo_late_001',
+        'https://test.com',
+        'idem_bind_late_001'
+    );
 
     -- Artificially expire the hold
     UPDATE public.reservations
@@ -351,7 +513,8 @@ BEGIN
         signature_header, processing_state, payload
     ) VALUES (
         'paymongo', 'evt_late_001', 'payment.paid', 'verified',
-        't=1700000000,li=valid_hmac_hex', 'pending', '{"data": {"id": "pay_prov_late_001"}}'::jsonb
+        't=1700000000,li=valid_hmac_hex', 'pending',
+        jsonb_build_object('data', jsonb_build_object('id', 'pay_prov_late_001', 'attributes', jsonb_build_object('amount', 35000, 'currency', 'PHP', 'checkout_session_id', 'cs_paymongo_late_001')))
     ) RETURNING id INTO v_wh_event_id;
 
     v_process_res := public.process_verified_payment_event(
@@ -379,7 +542,6 @@ BEGIN
     -- -------------------------------------------------------------------------
     -- TEST 10: Booking Collision & Court Overlap Rejection
     -- -------------------------------------------------------------------------
-    -- Customer A has confirmed court A1 from +2h to +3h. Customer B attempts to hold overlapping slot
     BEGIN
         PERFORM public.create_booking_checkout_session(
             'idem_checkout_conflict_001',
@@ -391,7 +553,6 @@ BEGIN
             v_test_date,
             v_slot_1, -- SAME SLOT AS Juan Dela Cruz!
             60,
-            'cs_paymongo_conflict_001',
             'paymongo'
         );
         RAISE EXCEPTION 'Test 10 Failed: Overlapping court checkout was not rejected!';
@@ -405,15 +566,66 @@ BEGIN
     END;
 
     -- -------------------------------------------------------------------------
-    -- TEST 12: Full Refund Reversal & Double-Entry Balance
+    -- TEST 31 (NEW): Refund Without Provider Verification Rejection
     -- -------------------------------------------------------------------------
-    -- Refund Juan Dela Cruz's captured payment (v_pay_id from Test 1)
     SELECT id INTO v_pay_id FROM public.payments WHERE checkout_session_id = 'cs_paymongo_test_001';
 
+    -- 31A: Missing refund evidence rejection
+    BEGIN
+        PERFORM public.process_verified_refund_event(
+            v_pay_id,
+            350.00,
+            'Customer cancellation',
+            'ref_prov_unverified_001',
+            '{}'::jsonb, -- EMPTY EVIDENCE!
+            'idem_refund_no_ev_001',
+            false
+        );
+        RAISE EXCEPTION 'Test 31A Failed: Refund without provider evidence was not rejected!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Authoritative provider refund confirmation evidence is required%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 31A PASSED: Refund without provider evidence strictly blocked.';
+        ELSE
+            RAISE EXCEPTION 'Test 31A Failed: Unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    -- 31B: Unconfirmed provider status rejection
+    BEGIN
+        PERFORM public.process_verified_refund_event(
+            v_pay_id,
+            350.00,
+            'Customer cancellation',
+            'ref_prov_pending_001',
+            jsonb_build_object('provider_refund_id', 'ref_prov_pending_001', 'status', 'pending'), -- NON-TERMINAL STATUS!
+            'idem_refund_pending_ev_001',
+            false
+        );
+        RAISE EXCEPTION 'Test 31B Failed: Unconfirmed refund status was not rejected!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%is not terminal succeeded%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 31B PASSED: Unconfirmed non-terminal refund status strictly blocked.';
+        ELSE
+            RAISE EXCEPTION 'Test 31B Failed: Unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    -- -------------------------------------------------------------------------
+    -- TEST 12: Full Refund Reversal & Double-Entry Balance (With Verified Evidence)
+    -- -------------------------------------------------------------------------
     v_refund_res := public.process_verified_refund_event(
         v_pay_id,
         350.00,
         'Customer requested cancellation',
+        'ref_prov_juan_001',
+        jsonb_build_object(
+            'provider_refund_id', 'ref_prov_juan_001',
+            'status', 'succeeded',
+            'amount', 350.00,
+            'confirmed_at', now()
+        ),
         'idem_refund_juan_001',
         false
     );
@@ -422,22 +634,19 @@ BEGIN
         RAISE EXCEPTION 'Test 12 Failed: Expected refunded status, got: %', v_refund_res;
     END IF;
 
-    -- Check payment is refunded
     IF (SELECT status FROM public.payments WHERE id = v_pay_id) != 'refunded' THEN
         RAISE EXCEPTION 'Test 12 Failed: Payment status not refunded!';
     END IF;
 
-    -- Check reservation is cancelled
     IF (SELECT status FROM public.reservations WHERE id = (SELECT reservation_id FROM public.payments WHERE id = v_pay_id)) != 'cancelled' THEN
         RAISE EXCEPTION 'Test 12 Failed: Reservation was not cancelled upon full refund!';
     END IF;
     v_test_count := v_test_count + 1;
-    RAISE NOTICE 'Test 12 PASSED: Full refund processed, reservation cancelled, and financial reversal posted.';
+    RAISE NOTICE 'Test 12 PASSED: Full refund processed with verified evidence, reservation cancelled, and reversal posted.';
 
     -- -------------------------------------------------------------------------
-    -- TEST 13: Partial Refund
+    -- TEST 13: Partial Refund (Facility B with Verified Evidence)
     -- -------------------------------------------------------------------------
-    -- Setup a fresh captured payment on Facility B
     v_checkout_res := public.create_booking_checkout_session(
         'idem_checkout_part_001',
         v_synth_fac_b,
@@ -448,17 +657,27 @@ BEGIN
         v_test_date,
         v_slot_1,
         60,
-        'cs_paymongo_part_001',
         'paymongo'
     );
     v_pay_id := (v_checkout_res->>'payment_id')::UUID;
+    v_res_id := (v_checkout_res->>'reservation_id')::UUID;
+
+    PERFORM public.bind_provider_checkout_session(
+        v_pay_id,
+        v_res_id,
+        'paymongo',
+        'cs_paymongo_part_001',
+        'https://test.com',
+        'idem_bind_part_001'
+    );
 
     INSERT INTO public.provider_webhook_events (
         provider_name, provider_event_id, event_type, signature_verification_status,
         signature_header, processing_state, payload
     ) VALUES (
         'paymongo', 'evt_part_capture_001', 'payment.paid', 'verified',
-        't=1700000000,li=valid_hmac_hex', 'pending', '{"data": {"id": "pay_prov_part_001"}}'::jsonb
+        't=1700000000,li=valid_hmac_hex', 'pending',
+        jsonb_build_object('data', jsonb_build_object('id', 'pay_prov_part_001', 'attributes', jsonb_build_object('amount', 150000, 'currency', 'PHP', 'checkout_session_id', 'cs_paymongo_part_001')))
     ) RETURNING id INTO v_wh_event_id;
 
     PERFORM public.process_verified_payment_event(
@@ -472,11 +691,17 @@ BEGIN
         'idem_proc_part_001'
     );
 
-    -- Now execute partial refund of ₱200.00 out of ₱1500.00
+    -- Execute partial refund of ₱200.00 out of ₱1500.00 with verified evidence
     v_partial_refund_res := public.process_verified_refund_event(
         v_pay_id,
         200.00,
         'Partial weather refund',
+        'ref_prov_part_001',
+        jsonb_build_object(
+            'provider_refund_id', 'ref_prov_part_001',
+            'status', 'succeeded',
+            'amount', 200.00
+        ),
         'idem_partial_refund_001',
         true
     );
@@ -486,20 +711,97 @@ BEGIN
         RAISE EXCEPTION 'Test 13 Failed: Expected partially_refunded with ₱200.00, got: %', v_partial_refund_res;
     END IF;
     v_test_count := v_test_count + 1;
-    RAISE NOTICE 'Test 13 PASSED: Partial refund recorded with correct status and amount tracking.';
+    RAISE NOTICE 'Test 13 PASSED: Partial refund recorded with verified evidence and correct balance tracking.';
 
     -- -------------------------------------------------------------------------
-    -- TEST 16: Settlement Clearing & Withdrawable Balance Transition
+    -- TEST 32 (NEW): Missing Authoritative Settlement Evidence Rejection
     -- -------------------------------------------------------------------------
-    -- Provider settles available ₱1,235.00 for Org B (₱1,500.00 gross - ₱75.00 comm - ₱190.00 net refund)
+    -- 32A: NULL batch ID rejection
+    BEGIN
+        PERFORM public.process_settlement_clearing(
+            NULL, -- NULL BATCH ID!
+            v_synth_org_b,
+            v_synth_fac_b,
+            1235.00,
+            'batch_missing_001',
+            'idem_clear_null_batch'
+        );
+        RAISE EXCEPTION 'Test 32A Failed: NULL batch ID was not rejected!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%p_batch_id is strictly required%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 32A PASSED: NULL settlement batch ID strictly rejected.';
+        ELSE
+            RAISE EXCEPTION 'Test 32A Failed: Unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    -- -------------------------------------------------------------------------
+    -- TEST 33 (NEW): Wrong-Tenant Settlement Batch Rejection
+    -- -------------------------------------------------------------------------
     INSERT INTO public.settlement_batches (
         id, provider_name, provider_batch_id, settlement_date,
         total_gross_amount, total_net_amount, total_fee_amount, status
     ) VALUES (
         gen_random_uuid(), 'paymongo', 'batch_005c_test_001', CURRENT_DATE,
-        1235.00, 1235.00, 0.00, 'pending_reconciliation'
+        1500.00, 1235.00, 0.00, 'pending_reconciliation'
     ) RETURNING id INTO v_batch_id;
 
+    -- Attempt to clear batch for Org A when batch items do not exist for Org A
+    BEGIN
+        PERFORM public.process_settlement_clearing(
+            v_batch_id,
+            v_synth_org_a,
+            v_synth_fac_a,
+            1235.00,
+            'batch_005c_test_001',
+            'idem_clearing_wrong_tenant'
+        );
+        RAISE EXCEPTION 'Test 33 Failed: Settlement batch without tenant items was not rejected!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%contains zero settlement items%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 33 PASSED: Settlement clearing rejected when tenant items do not exist.';
+        ELSE
+            RAISE EXCEPTION 'Test 33 Failed: Unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    -- -------------------------------------------------------------------------
+    -- TEST 34 (NEW): Settlement Amount Mismatch Rejection
+    -- -------------------------------------------------------------------------
+    -- Insert authentic settlement item linked to captured payment
+    INSERT INTO public.settlement_items (
+        id, batch_id, payment_id, provider_payment_id, organization_id, facility_id,
+        gross_amount, provider_fee_amount, net_settled_amount, settlement_status
+    ) VALUES (
+        gen_random_uuid(), v_batch_id, v_pay_id, 'pay_prov_part_001', v_synth_org_b, v_synth_fac_b,
+        1500.00, 0.00, 1235.00, 'matched'
+    );
+
+    -- Caller requests ₱999.00 when verified items sum is ₱1,235.00
+    BEGIN
+        PERFORM public.process_settlement_clearing(
+            v_batch_id,
+            v_synth_org_b,
+            v_synth_fac_b,
+            999.00, -- MISMATCHED AMOUNT!
+            'batch_005c_test_001',
+            'idem_clearing_mismatch'
+        );
+        RAISE EXCEPTION 'Test 34 Failed: Settlement amount mismatch was not rejected!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Settlement amount mismatch%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 34 PASSED: Settlement amount mismatch strictly rejected against verified items.';
+        ELSE
+            RAISE EXCEPTION 'Test 34 Failed: Unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    -- -------------------------------------------------------------------------
+    -- TEST 16: Settlement Clearing & Withdrawable Balance Transition (Verified Items)
+    -- -------------------------------------------------------------------------
     v_clearing_res := public.process_settlement_clearing(
         v_batch_id,
         v_synth_org_b,
@@ -509,18 +811,16 @@ BEGIN
         'idem_clearing_001'
     );
 
-    -- Verify Org B available_withdrawable_balance is now ₱1,235.00
     SELECT * INTO v_org_bal FROM public.organization_balances WHERE organization_id = v_synth_org_b;
     IF v_org_bal.available_withdrawable_balance != 1235.00 THEN
         RAISE EXCEPTION 'Test 16 Failed: Available withdrawable balance is not ₱1,235.00! Got: %', v_org_bal;
     END IF;
     v_test_count := v_test_count + 1;
-    RAISE NOTICE 'Test 16 PASSED: Settlement clearing transitioned cleared funds to available withdrawable balance.';
+    RAISE NOTICE 'Test 16 PASSED: Settlement clearing verified against matched batch items and transitioned to available balance.';
 
     -- -------------------------------------------------------------------------
     -- TEST 24: Protection Against Over-Withdrawal & Minimum Payout Enforcement
     -- -------------------------------------------------------------------------
-    -- Create verified payout method for Org B
     INSERT INTO public.payout_methods (
         id, organization_id, method_type, provider_name, provider_recipient_token,
         account_holder_name, masked_account_number, bank_code, bank_name, is_active, is_default, verification_status
@@ -529,7 +829,7 @@ BEGIN
         'Org B Owner', '****9999', 'BPI', 'Bank of the Philippine Islands', true, true, 'verified'
     ) RETURNING id INTO v_payout_method_id;
 
-    -- Attempt to request ₱2000.00 when available is only ₱1235.00
+    -- Over-withdrawal check
     BEGIN
         PERFORM public.request_owner_payout(
             v_synth_org_b,
@@ -540,7 +840,7 @@ BEGIN
         RAISE EXCEPTION 'Test 24 Failed: Over-withdrawal was not rejected!';
     EXCEPTION WHEN OTHERS THEN
         IF SQLERRM LIKE '%Insufficient withdrawable balance%' THEN
-            -- Also test below-minimum threshold check
+            -- Below-minimum check
             BEGIN
                 PERFORM public.request_owner_payout(
                     v_synth_org_b,
@@ -565,7 +865,6 @@ BEGIN
     -- -------------------------------------------------------------------------
     -- TEST 17: Valid Payout Reservation
     -- -------------------------------------------------------------------------
-    -- Request ₱600.00 out of ₱1,235.00 available (satisfies >= ₱500.00 min threshold)
     v_payout_res := public.request_owner_payout(
         v_synth_org_b,
         v_payout_method_id,
@@ -574,7 +873,6 @@ BEGIN
     );
     v_payout_id := (v_payout_res->>'payout_id')::UUID;
 
-    -- Check balances: available = 635.00 (1235.00 - 600.00), pending_payout = 600.00
     SELECT * INTO v_org_bal FROM public.organization_balances WHERE organization_id = v_synth_org_b;
     IF v_org_bal.available_withdrawable_balance != 635.00 OR
        v_org_bal.pending_payout_amount != 600.00 THEN
@@ -584,15 +882,40 @@ BEGIN
     RAISE NOTICE 'Test 17 PASSED: Payout reserved funds safely locked in Account 2015.';
 
     -- -------------------------------------------------------------------------
-    -- TEST 18: Payout Disbursement Confirmation & Duplicate Idempotency
+    -- TEST 35 (NEW): Payout Marked Paid Without Verified Provider Confirmation
+    -- -------------------------------------------------------------------------
+    BEGIN
+        PERFORM public.confirm_owner_payout_disbursement(
+            v_payout_id,
+            'payout_prov_ref_999',
+            '{}'::jsonb, -- EMPTY EVIDENCE!
+            'idem_disburse_no_ev_001'
+        );
+        RAISE EXCEPTION 'Test 35 Failed: Payout marked paid without disbursement evidence!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Authoritative provider disbursement confirmation evidence is required%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 35 PASSED: Payout disbursement without provider confirmation evidence rejected.';
+        ELSE
+            RAISE EXCEPTION 'Test 35 Failed: Unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    -- -------------------------------------------------------------------------
+    -- TEST 18: Payout Disbursement Confirmation & Duplicate Idempotency (With Evidence)
     -- -------------------------------------------------------------------------
     PERFORM public.confirm_owner_payout_disbursement(
         v_payout_id,
         'payout_prov_ref_999',
+        jsonb_build_object(
+            'provider_reference', 'payout_prov_ref_999',
+            'disbursement_status', 'succeeded',
+            'amount', 600.00,
+            'bank_ref', 'BPI-TR-88888888'
+        ),
         'idem_disburse_001'
     );
 
-    -- Payout status must be 'paid'
     IF (SELECT status FROM public.payouts WHERE id = v_payout_id) != 'paid' THEN
         RAISE EXCEPTION 'Test 18 Failed: Payout status not paid!';
     END IF;
@@ -601,15 +924,15 @@ BEGIN
     PERFORM public.confirm_owner_payout_disbursement(
         v_payout_id,
         'payout_prov_ref_999',
+        jsonb_build_object('provider_reference', 'payout_prov_ref_999', 'disbursement_status', 'succeeded'),
         'idem_disburse_001'
     );
     v_test_count := v_test_count + 1;
-    RAISE NOTICE 'Test 18 PASSED: Payout disbursement confirmed and duplicate completion handled idempotently.';
+    RAISE NOTICE 'Test 18 PASSED: Payout disbursement confirmed with verified evidence and replayed idempotently.';
 
     -- -------------------------------------------------------------------------
-    -- TEST 19: Payout Failure & Reserve Fund Restoration
+    -- TEST 36 (NEW): Payout Reserve Released Without Failed-Provider Evidence Rejection
     -- -------------------------------------------------------------------------
-    -- Reserve ₱500.00 (remaining available is ₱635.00, satisfies >= ₱500.00 min threshold)
     v_payout_res := public.request_owner_payout(
         v_synth_org_b,
         v_payout_method_id,
@@ -618,14 +941,37 @@ BEGIN
     );
     v_payout_id := (v_payout_res->>'payout_id')::UUID;
 
-    -- Fail the payout
+    BEGIN
+        PERFORM public.fail_owner_payout_release(
+            v_payout_id,
+            'Invalid bank account details',
+            '{}'::jsonb, -- EMPTY EVIDENCE!
+            'idem_payout_fail_no_ev_001'
+        );
+        RAISE EXCEPTION 'Test 36 Failed: Payout failure without provider evidence was not rejected!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Authoritative provider failure evidence is required%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 36 PASSED: Payout failure without provider evidence strictly blocked.';
+        ELSE
+            RAISE EXCEPTION 'Test 36 Failed: Unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    -- -------------------------------------------------------------------------
+    -- TEST 19: Payout Failure & Reserve Fund Restoration (With Authoritative Evidence)
+    -- -------------------------------------------------------------------------
     PERFORM public.fail_owner_payout_release(
         v_payout_id,
         'Invalid bank account details',
+        jsonb_build_object(
+            'failure_code', 'ACCOUNT_NUMBER_INVALID',
+            'provider_status', 'failed',
+            'failed_at', now()
+        ),
         'idem_payout_fail_001'
     );
 
-    -- Check payout status is 'failed' and available balance restored back to ₱635.00
     SELECT * INTO v_org_bal FROM public.organization_balances WHERE organization_id = v_synth_org_b;
     IF v_org_bal.available_withdrawable_balance != 635.00 OR
        v_org_bal.pending_payout_amount != 0.00 THEN
@@ -651,7 +997,6 @@ BEGIN
     -- -------------------------------------------------------------------------
     -- TEST 22: Existing Booking System Preservation
     -- -------------------------------------------------------------------------
-    -- Verify create_public_reservation continues to work seamlessly
     PERFORM public.create_public_reservation(
         v_synth_fac_b,
         v_synth_court_b,

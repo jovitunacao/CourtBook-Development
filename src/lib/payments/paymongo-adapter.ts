@@ -7,12 +7,90 @@ import crypto from 'node:crypto';
 import type {
   PaymentProviderAdapter,
   WebhookVerificationResult,
-  NormalizedWebhookEvent
+  NormalizedWebhookEvent,
+  ProviderCheckoutSessionParams,
+  ProviderCheckoutSessionResult
 } from './types';
 
 export class PayMongoAdapter implements PaymentProviderAdapter {
   readonly providerName = 'paymongo';
   readonly isReady = true;
+
+  /**
+   * Creates a checkout session using PayMongo API with server-authoritative amount and currency.
+   * If PAYMONGO_SECRET_KEY is configured with a valid sk_live_ or sk_test_ key, calls official PayMongo API.
+   * If in simulated/sandbox mode without keys, returns a clearly marked simulated checkout session.
+   */
+  async createCheckoutSession(
+    params: ProviderCheckoutSessionParams,
+    secretKey?: string
+  ): Promise<ProviderCheckoutSessionResult> {
+    const key = secretKey || (typeof process !== 'undefined' ? process.env?.PAYMONGO_SECRET_KEY : '') || '';
+    const hasLiveOrTestKey = key.startsWith('sk_live_') || key.startsWith('sk_test_');
+
+    if (!hasLiveOrTestKey) {
+      // Clearly separated simulated sandbox mode when real gateway secret is not configured
+      const simulatedId = `cs_sandbox_${params.referenceCode}_${crypto.randomBytes(4).toString('hex')}`;
+      return {
+        providerCheckoutId: simulatedId,
+        checkoutUrl: `https://test-checkout.paymongo.com/sandbox/${simulatedId}`,
+        isSimulated: true,
+        rawResponse: {
+          simulated: true,
+          provider: 'paymongo',
+          amount: params.amountCentavos,
+          currency: params.currency,
+          reference: params.referenceCode
+        }
+      };
+    }
+
+    const authHeader = 'Basic ' + Buffer.from(`${key}:`).toString('base64');
+    const response = await fetch('https://api.paymongo.com/v1/checkout_sessions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': authHeader
+      },
+      body: JSON.stringify({
+        data: {
+          attributes: {
+            send_email_receipt: true,
+            show_description: true,
+            show_line_items: true,
+            description: params.description,
+            line_items: [
+              {
+                currency: params.currency,
+                amount: params.amountCentavos,
+                name: params.description,
+                quantity: 1
+              }
+            ],
+            payment_method_types: ['card', 'gcash', 'paymaya', 'grab_pay'],
+            reference_number: params.referenceCode,
+            success_url: params.successUrl,
+            cancel_url: params.cancelUrl,
+            metadata: params.metadata || {}
+          }
+        }
+      })
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`PayMongo Checkout API error (${response.status}): ${errText}`);
+    }
+
+    const resJson = await response.json();
+    const data = resJson.data;
+    return {
+      providerCheckoutId: data.id,
+      checkoutUrl: data.attributes.checkout_url,
+      isSimulated: false,
+      rawResponse: resJson
+    };
+  }
 
   /**
    * Verifies PayMongo webhook signatures according to official PayMongo specification.
