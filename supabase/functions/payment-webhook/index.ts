@@ -281,15 +281,34 @@ serve(async (req: Request) => {
   ]);
 
   if (supportedCaptureEvents.has(eventType)) {
-    const rawAmount = typeof eventDataAttrs.amount === 'number'
-      ? eventDataAttrs.amount
-      : (typeof attributes.amount === 'number' ? attributes.amount : 0);
+    let providerPaymentId = '';
+    let checkoutSessionId = '';
+    let rawAmount = 0;
+    let currency = '';
+    let paymentStatus = '';
+
+    if (eventType === 'checkout_session.payment.paid') {
+      checkoutSessionId = String(eventData.id || '').trim();
+      const embeddedPayments = Array.isArray(eventDataAttrs.payments) ? eventDataAttrs.payments : [];
+      const firstPayment = (embeddedPayments[0] as Record<string, unknown>) || {};
+      const firstPayAttrs = (firstPayment.attributes as Record<string, unknown>) || firstPayment;
+
+      providerPaymentId = String(firstPayment.id || '').trim();
+      rawAmount = typeof firstPayAttrs.amount === 'number' ? firstPayAttrs.amount : 0;
+      currency = typeof firstPayAttrs.currency === 'string' ? firstPayAttrs.currency.trim().toUpperCase() : '';
+      paymentStatus = typeof firstPayAttrs.status === 'string' ? firstPayAttrs.status.trim().toLowerCase() : '';
+    } else {
+      providerPaymentId = String(eventData.id || '').trim();
+      const metadata = (eventDataAttrs.metadata as Record<string, unknown>) || {};
+      checkoutSessionId = String(metadata.checkout_session_id || eventDataAttrs.checkout_session_id || '').trim();
+      rawAmount = typeof eventDataAttrs.amount === 'number'
+        ? eventDataAttrs.amount
+        : (typeof attributes.amount === 'number' ? attributes.amount : 0);
+      currency = typeof eventDataAttrs.currency === 'string' ? eventDataAttrs.currency.trim().toUpperCase() : '';
+      paymentStatus = typeof eventDataAttrs.status === 'string' ? eventDataAttrs.status.trim().toLowerCase() : '';
+    }
+
     const capturedAmount = rawAmount > 0 ? rawAmount / 100 : 0;
-    const providerPaymentId = String(eventData.id || '').trim();
-    const metadata = (eventDataAttrs.metadata as Record<string, unknown>) || {};
-    const checkoutSessionId = String(metadata.checkout_session_id || eventDataAttrs.checkout_session_id || '').trim();
-    const currency = typeof eventDataAttrs.currency === 'string' ? eventDataAttrs.currency.trim().toUpperCase() : '';
-    const paymentStatus = typeof eventDataAttrs.status === 'string' ? eventDataAttrs.status.trim().toLowerCase() : '';
 
     if (!providerPaymentId || !checkoutSessionId || capturedAmount <= 0 || !currency) {
       return new Response(
