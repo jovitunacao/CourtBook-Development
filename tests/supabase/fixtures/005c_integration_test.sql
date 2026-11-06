@@ -633,7 +633,7 @@ BEGIN
     ) VALUES (
         'paymongo', 'evt_refund_juan_001', 'refund.succeeded', 'verified',
         't=1700000000,li=valid_hmac_hex', 'pending',
-        jsonb_build_object('data', jsonb_build_object('id', 'ref_prov_juan_001', 'attributes', jsonb_build_object('amount', 35000, 'currency', 'PHP', 'status', 'succeeded')))
+        jsonb_build_object('data', jsonb_build_object('id', 'ref_prov_juan_001', 'attributes', jsonb_build_object('payment_id', 'pay_prov_valid_001', 'amount', 35000, 'currency', 'PHP', 'status', 'succeeded')))
     ) RETURNING id INTO v_wh_event_id;
 
     v_refund_res := public.process_verified_refund_event(
@@ -720,7 +720,7 @@ BEGIN
     ) VALUES (
         'paymongo', 'evt_refund_part_001', 'refund.succeeded', 'verified',
         't=1700000000,li=valid_hmac_hex', 'pending',
-        jsonb_build_object('data', jsonb_build_object('id', 'ref_prov_part_001', 'attributes', jsonb_build_object('amount', 20000, 'currency', 'PHP', 'status', 'succeeded')))
+        jsonb_build_object('data', jsonb_build_object('id', 'ref_prov_part_001', 'attributes', jsonb_build_object('payment_id', 'pay_prov_part_001', 'amount', 20000, 'currency', 'PHP', 'status', 'succeeded')))
     ) RETURNING id INTO v_wh_event_id;
 
     v_partial_refund_res := public.process_verified_refund_event(
@@ -942,7 +942,7 @@ BEGIN
     ) VALUES (
         'paymongo', 'evt_payout_paid_001', 'payout.paid', 'verified',
         't=1700000000,li=valid_hmac_hex', 'pending',
-        jsonb_build_object('data', jsonb_build_object('id', 'payout_prov_ref_999', 'attributes', jsonb_build_object('amount', 60000, 'currency', 'PHP', 'status', 'paid')))
+        jsonb_build_object('data', jsonb_build_object('id', 'payout_prov_ref_999', 'attributes', jsonb_build_object('amount', 60000, 'currency', 'PHP', 'status', 'paid', 'destination', v_payout_method_id, 'metadata', jsonb_build_object('organization_id', v_synth_org_b))))
     ) RETURNING id INTO v_wh_event_id;
 
     PERFORM public.confirm_owner_payout_disbursement(
@@ -1009,7 +1009,7 @@ BEGIN
     ) VALUES (
         'paymongo', 'evt_payout_failed_001', 'payout.failed', 'verified',
         't=1700000000,li=valid_hmac_hex', 'pending',
-        jsonb_build_object('data', jsonb_build_object('id', 'payout_prov_fail_001', 'attributes', jsonb_build_object('status', 'failed', 'failure_code', 'ACCOUNT_NUMBER_INVALID')))
+        jsonb_build_object('data', jsonb_build_object('id', 'payout_prov_fail_001', 'attributes', jsonb_build_object('currency', 'PHP', 'status', 'failed', 'failure_code', 'ACCOUNT_NUMBER_INVALID', 'destination', v_payout_method_id, 'metadata', jsonb_build_object('organization_id', v_synth_org_b))))
     ) RETURNING id INTO v_wh_event_id;
 
     PERFORM public.fail_owner_payout_release(

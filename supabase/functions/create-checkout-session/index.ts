@@ -154,6 +154,19 @@ serve(async (req: Request) => {
         }
       }
 
+      if (!recoveredExisting && data.idempotent_replayed) {
+        return new Response(
+          JSON.stringify({
+            success: false,
+            status: 'reconciliation_required',
+            payment_id: data.payment_id,
+            reference_code: data.reference_code,
+            error: 'Checkout session recovery failed or no active provider session found. Booking marked for reconciliation; refusing to create a duplicate payable session.',
+          }),
+          { status: 503, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+
       if (!recoveredExisting) {
         // Official PayMongo API invocation using server-authoritative pricing
         const pmRes = await fetch('https://api.paymongo.com/v1/checkout_sessions', {

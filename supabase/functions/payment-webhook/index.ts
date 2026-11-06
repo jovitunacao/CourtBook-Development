@@ -145,7 +145,7 @@ serve(async (req: Request) => {
     if (inboxError.code === '23505') {
       const { data: existingEvent, error: fetchErr } = await supabaseAdmin
         .from('provider_webhook_events')
-        .select('id, payload_hash, processing_state')
+        .select('id, payload_hash, processing_state, updated_at, created_at')
         .eq('provider_name', 'paymongo')
         .eq('provider_event_id', eventId)
         .single();
@@ -191,16 +191,48 @@ serve(async (req: Request) => {
       }
 
       if (existingEvent.processing_state === 'processing') {
-        return new Response(
-          JSON.stringify({
-            success: false,
-            status: 'currently_processing',
-            retryable: true,
-            message: 'Webhook event is currently being processed',
-          }),
-          { status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
+        const leaseTimestamp = new Date(existingEvent.updated_at || existingEvent.created_at).getTime();
+        const leaseAgeMs = Date.now() - leaseTimestamp;
+        if (leaseAgeMs < 60_000) {
+          return new Response(
+            JSON.stringify({
+              success: false,
+              status: 'currently_processing',
+              retryable: true,
+              message: 'Webhook event is currently being processed under an active lease',
+            }),
+            { status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+
+        // Stale lease recovery (>= 60s): atomically reclaim lease
+        const { data: reclaimed, error: reclaimErr } = await supabaseAdmin
+          .from('provider_webhook_events')
+          .update({
+            processing_state: 'processing',
+            last_error: 'Recovered stale processing lease',
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', existingEvent.id)
+          .eq('processing_state', 'processing')
+          .eq('updated_at', existingEvent.updated_at)
+          .select('id')
+          .single();
+
+        if (reclaimErr || !reclaimed) {
+          return new Response(
+            JSON.stringify({
+              success: false,
+              status: 'currently_processing',
+              retryable: true,
+              message: 'Concurrent stale lease recovery detected',
+            }),
+            { status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+
+        activeInboxId = reclaimed.id;
+      } else {
 
       // Stored but unprocessed ('pending' or 'failed'): acquire lease and resume reconciliation
       const { data: leased, error: leaseErr } = await supabaseAdmin
@@ -224,6 +256,7 @@ serve(async (req: Request) => {
       }
 
       activeInboxId = leased.id;
+      }
     } else {
       return new Response(JSON.stringify({ error: inboxError.message }), {
         status: 500,
@@ -312,6 +345,15 @@ serve(async (req: Request) => {
     });
 
     if (processError) {
+      await supabaseAdmin
+        .from('provider_webhook_events')
+        .update({
+          processing_state: 'failed',
+          last_error: processError.message,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', activeInboxId);
+
       return new Response(JSON.stringify({ error: processError.message }), {
         status: 500,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },

@@ -1334,9 +1334,9 @@ BEGIN
             v_webhook.payload->>'provider_payment_id',
             ''
         )), '');
-        IF v_ev_payment_id IS NOT NULL AND v_ev_payment_id != v_payment.provider_payment_id THEN
-            RAISE EXCEPTION 'Evidence mismatch: Webhook original payment ID ("%") does not match payment ("%").',
-                v_ev_payment_id, v_payment.provider_payment_id;
+        IF v_ev_payment_id IS NULL OR v_ev_payment_id != v_payment.provider_payment_id THEN
+            RAISE EXCEPTION 'Evidence mismatch: Missing or mismatched original payment ID ("%") for payment ("%").',
+                COALESCE(v_ev_payment_id, 'NULL'), v_payment.provider_payment_id;
         END IF;
 
         v_ev_currency := upper(NULLIF(trim(COALESCE(
@@ -1344,9 +1344,9 @@ BEGIN
             v_webhook.payload->>'currency',
             ''
         )), ''));
-        IF v_ev_currency IS NOT NULL AND v_ev_currency != v_payment.currency THEN
-            RAISE EXCEPTION 'Evidence mismatch: Webhook currency ("%") does not match payment currency ("%").',
-                v_ev_currency, v_payment.currency;
+        IF v_ev_currency IS NULL OR v_ev_currency != v_payment.currency THEN
+            RAISE EXCEPTION 'Evidence mismatch: Missing or mismatched currency ("%") for payment currency ("%").',
+                COALESCE(v_ev_currency, 'NULL'), v_payment.currency;
         END IF;
 
         v_ev_org_id := NULLIF(trim(COALESCE(
@@ -1621,11 +1621,6 @@ BEGIN
             v_webhook_event_id, v_webhook.signature_verification_status;
     END IF;
 
-    IF v_webhook.processing_state = 'processed' THEN
-        RAISE EXCEPTION 'Security rejection: Payout webhook event % has already been processed and cannot be reused.',
-            v_webhook_event_id;
-    END IF;
-
     IF v_webhook.event_type NOT IN ('payout.paid', 'payout.succeeded', 'transfer.paid') THEN
         RAISE EXCEPTION 'Unsupported payout disbursement webhook event type: "%".', v_webhook.event_type;
     END IF;
@@ -1663,6 +1658,63 @@ BEGIN
     IF NOT FOUND THEN
         RAISE EXCEPTION 'Payout ID % not found.', p_payout_id;
     END IF;
+
+    IF v_payout.status = 'paid' AND v_payout.provider_payout_id = v_clean_ref THEN
+        RETURN jsonb_build_object(
+            'success', true,
+            'payout_id', p_payout_id,
+            'status', 'paid',
+            'idempotent_replayed', true
+        );
+    END IF;
+
+    IF v_webhook.processing_state = 'processed' THEN
+        RAISE EXCEPTION 'Security rejection: Payout webhook event % has already been processed and cannot be reused.',
+            v_webhook_event_id;
+    END IF;
+
+    DECLARE
+        v_ev_org_id TEXT;
+        v_ev_currency TEXT;
+        v_ev_destination TEXT;
+    BEGIN
+        v_ev_org_id := NULLIF(trim(COALESCE(
+            v_webhook.payload->'data'->'attributes'->'metadata'->>'organization_id',
+            v_webhook.payload->'metadata'->>'organization_id',
+            v_webhook.payload->>'organization_id',
+            ''
+        )), '');
+        IF v_ev_org_id IS NULL OR v_ev_org_id::uuid != v_payout.organization_id THEN
+            RAISE EXCEPTION 'Evidence mismatch: Missing or mismatched organization ("%") for payout ("%").',
+                COALESCE(v_ev_org_id, 'NULL'), v_payout.organization_id;
+        END IF;
+
+        v_ev_currency := upper(NULLIF(trim(COALESCE(
+            v_webhook.payload->'data'->'attributes'->>'currency',
+            v_webhook.payload->>'currency',
+            ''
+        )), ''));
+        IF v_ev_currency IS NULL OR v_ev_currency != v_payout.currency THEN
+            RAISE EXCEPTION 'Evidence mismatch: Missing or mismatched currency ("%") for payout ("%").',
+                COALESCE(v_ev_currency, 'NULL'), v_payout.currency;
+        END IF;
+
+        v_ev_destination := NULLIF(trim(COALESCE(
+            v_webhook.payload->'data'->'attributes'->>'destination',
+            v_webhook.payload->>'payout_method_id',
+            v_webhook.payload->>'destination',
+            ''
+        )), '');
+        IF v_ev_destination IS NULL OR v_ev_destination::uuid != v_payout.payout_method_id THEN
+            RAISE EXCEPTION 'Evidence mismatch: Missing or mismatched payout destination ("%") for payout ("%").',
+                COALESCE(v_ev_destination, 'NULL'), v_payout.payout_method_id;
+        END IF;
+    END;
+
+    UPDATE public.provider_webhook_events
+    SET processing_state = 'processed',
+        processed_at = now()
+    WHERE id = v_webhook_event_id;
 
     IF v_webhook.payload->'data'->'attributes' ? 'amount' THEN
         v_trusted_amount := ((v_webhook.payload->'data'->'attributes'->>'amount')::NUMERIC / 100.00);
