@@ -328,8 +328,11 @@ export function isSlotBusyInTimezone(
  * Public facilities query for anonymous visitors.
  * RLS policy "public_can_view_active_facilities" grants SELECT on active facilities.
  */
-export async function fetchPublicFacilities(): Promise<SupabaseFacility[]> {
-  if (!supabase) return [];
+export async function fetchPublicFacilitiesWithStatus(): Promise<{
+  data: SupabaseFacility[];
+  error: string | null;
+}> {
+  if (!supabase) return { data: [], error: null };
 
   try {
     const { data, error } = await supabase
@@ -340,14 +343,19 @@ export async function fetchPublicFacilities(): Promise<SupabaseFacility[]> {
 
     if (error) {
       console.warn('Error fetching public facilities:', error.message);
-      return [];
+      return { data: [], error: error.message };
     }
 
-    return (data as SupabaseFacility[]) || [];
-  } catch (err) {
+    return { data: (data as SupabaseFacility[]) || [], error: null };
+  } catch (err: any) {
     console.error('Failed to fetch public facilities:', err);
-    return [];
+    return { data: [], error: err?.message || 'Failed to load public facilities.' };
   }
+}
+
+export async function fetchPublicFacilities(): Promise<SupabaseFacility[]> {
+  const res = await fetchPublicFacilitiesWithStatus();
+  return res.data;
 }
 
 /**

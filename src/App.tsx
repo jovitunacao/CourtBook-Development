@@ -12,6 +12,7 @@ import { Navbar } from './components/Navbar';
 import { Footer } from './components/Footer';
 import { HomePage } from './components/HomePage';
 import { BookingPage } from './components/BookingPage';
+import { VenueDirectory } from './components/VenueDirectory';
 import { AdminPage } from './components/AdminPage';
 import { FacilitySettingsPage } from './components/FacilitySettingsPage';
 import { AuthModal } from './components/AuthModal';
@@ -37,22 +38,35 @@ function CourtBookApp() {
   const [isAuthModalOpen, setIsAuthModalOpen] = useState<boolean>(false);
 
   const {
+    isConfigured,
     user,
     onboardingState,
     membershipLookupError,
     refreshStaffData,
     signOut,
     mappedFacilitySettings,
+    publicFacilitySettings,
+    publicFacilities,
+    publicFacilitiesLoading,
+    publicFacilitiesError,
+    refreshPublicFacilities,
+    directoryCourts,
+    activePublicFacility,
+    setActivePublicFacilityId,
   } = useSupabaseAuth();
 
-  // Active facility settings for public views: prioritize live Supabase facility settings if available, else localStorage
+  // Active facility settings for administrative/demo views
   const activeSettings = mappedFacilitySettings || facilitySettings;
+  // Active facility settings for public customer views (strictly isolated to selected public venue)
+  const publicActiveSettings = isConfigured ? publicFacilitySettings : facilitySettings;
 
   // Header display name
   const displayFacilityName =
     user && onboardingState === 'needs_onboarding'
       ? 'CourtBook Owner Portal'
-      : activeSettings.name;
+      : currentTab === 'admin' || currentTab === 'settings'
+      ? activeSettings.name
+      : publicActiveSettings?.name || 'CourtBook Directory';
 
   // Keep selectedCourtForBooking synchronized with available courts in activeSettings
   useEffect(() => {
@@ -357,27 +371,63 @@ function CourtBookApp() {
       {/* Screen Render */}
       <main className="flex-1">
         {currentTab === 'home' && (
-          <HomePage
-            settings={activeSettings}
-            onStartBooking={handleStartBooking}
-            onOpenAdmin={handleOpenAdmin}
-            activeReservationsCount={activeReservationsCount}
-          />
+          isConfigured && !activePublicFacility ? (
+            <VenueDirectory
+              facilities={publicFacilities}
+              directoryCourts={directoryCourts}
+              isLoading={publicFacilitiesLoading}
+              error={publicFacilitiesError}
+              onSelectFacility={async (facilityId) => {
+                await setActivePublicFacilityId(facilityId);
+                setCurrentTab('booking');
+                window.scrollTo({ top: 0, behavior: 'smooth' });
+              }}
+              onRetry={refreshPublicFacilities}
+            />
+          ) : (
+            <HomePage
+              settings={publicActiveSettings || facilitySettings}
+              onStartBooking={handleStartBooking}
+              onOpenAdmin={handleOpenAdmin}
+              activeReservationsCount={activeReservationsCount}
+            />
+          )
         )}
 
         {currentTab === 'booking' && (
-          <BookingPage
-            initialCourtId={selectedCourtForBooking}
-            settings={activeSettings}
-            reservations={reservations}
-            onAddReservation={handleAddReservation}
-            onNavigateToAdmin={handleOpenAdmin}
-            onNavigateToSettings={handleOpenSettings}
-            onResetToNewBooking={() => {
-              const firstCourt = activeSettings.courts.find((c) => c.isEnabled) || activeSettings.courts[0];
-              setSelectedCourtForBooking(firstCourt ? firstCourt.id : '');
-            }}
-          />
+          isConfigured && !activePublicFacility ? (
+            <VenueDirectory
+              facilities={publicFacilities}
+              directoryCourts={directoryCourts}
+              isLoading={publicFacilitiesLoading}
+              error={publicFacilitiesError}
+              onSelectFacility={async (facilityId) => {
+                await setActivePublicFacilityId(facilityId);
+                setCurrentTab('booking');
+                window.scrollTo({ top: 0, behavior: 'smooth' });
+              }}
+              onRetry={refreshPublicFacilities}
+            />
+          ) : (
+            <BookingPage
+              initialCourtId={selectedCourtForBooking}
+              settings={publicActiveSettings || facilitySettings}
+              reservations={reservations}
+              onAddReservation={handleAddReservation}
+              onNavigateToAdmin={handleOpenAdmin}
+              onNavigateToSettings={handleOpenSettings}
+              onChangeVenue={() => {
+                setActivePublicFacilityId('');
+                setCurrentTab('home');
+                window.scrollTo({ top: 0, behavior: 'smooth' });
+              }}
+              onResetToNewBooking={() => {
+                const targetSettings = publicActiveSettings || facilitySettings;
+                const firstCourt = targetSettings.courts.find((c) => c.isEnabled) || targetSettings.courts[0];
+                setSelectedCourtForBooking(firstCourt ? firstCourt.id : '');
+              }}
+            />
+          )
         )}
 
         {/* Administrative Views: Gated by user authentication and onboardingState */}

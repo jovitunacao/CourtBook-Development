@@ -56,6 +56,7 @@ interface BookingPageProps {
   onNavigateToAdmin: () => void;
   onNavigateToSettings: () => void;
   onResetToNewBooking: () => void;
+  onChangeVenue?: () => void;
 }
 
 export const BookingPage: React.FC<BookingPageProps> = ({
@@ -65,6 +66,7 @@ export const BookingPage: React.FC<BookingPageProps> = ({
   onAddReservation,
   onNavigateToAdmin,
   onNavigateToSettings,
+  onChangeVenue,
 }) => {
   const { isConfigured, publicFacilities, publicCourts, activePublicFacility, setActivePublicFacilityId } =
     useSupabaseAuth();
@@ -102,14 +104,26 @@ export const BookingPage: React.FC<BookingPageProps> = ({
     }
   }, [selectedDate, todayInTimezone]);
 
-  // Effective courts: Prioritize live Supabase publicCourts when configured, or mapped settings.courts
+  // Reset booking state whenever the active public facility changes to prevent stale tenant data
+  const activeFacilityId = activePublicFacility?.id || '';
+  useEffect(() => {
+    setSelectedSlotId(null);
+    setConfirmedReservation(null);
+    setErrorMessage(null);
+    setIsUncertainOutcome(false);
+    setCourtStatus(null);
+    setBusySlots([]);
+    if (activePublicFacility?.timezone) {
+      setSelectedDate(getTodayStringInTimezone(activePublicFacility.timezone));
+    }
+  }, [activeFacilityId, activePublicFacility?.timezone]);
+
+  // Effective courts: Strictly filter live Supabase publicCourts to activePublicFacility (never mix tenants)
   const effectiveCourts: Court[] = useMemo(() => {
-    if (isConfigured && publicCourts && publicCourts.length > 0) {
-      const facilityCourts = activePublicFacility
-        ? publicCourts.filter((c) => c.facility_id === activePublicFacility.id)
-        : publicCourts;
-      const courtSource = facilityCourts.length > 0 ? facilityCourts : publicCourts;
-      return courtSource.map((c) => ({
+    if (isConfigured) {
+      if (!activePublicFacility) return [];
+      const facilityCourts = publicCourts.filter((c) => c.facility_id === activePublicFacility.id);
+      return facilityCourts.map((c) => ({
         id: c.id,
         facilityId: c.facility_id,
         name: c.name,
@@ -1071,7 +1085,7 @@ export const BookingPage: React.FC<BookingPageProps> = ({
             <div>
               <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-blue-100 text-blue-800 text-xs font-bold uppercase tracking-wider mb-2">
                 <Database className="w-3.5 h-3.5" />
-                <span>Supabase Calendar Sync &bull; Public RPC Active</span>
+                <span>{activePublicFacility?.name || settings.name}</span>
               </div>
               <h1 className="text-2xl sm:text-3xl font-extrabold text-slate-900 tracking-tight">
                 Reserve a Sports Court
@@ -1081,8 +1095,24 @@ export const BookingPage: React.FC<BookingPageProps> = ({
               </p>
             </div>
 
-            {/* Public Facility Switcher & Mode Badge */}
+            {/* Public Facility Switcher & Change Venue */}
             <div className="flex flex-wrap items-center gap-2.5 self-start sm:self-auto">
+              {(onChangeVenue || isConfigured) && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (onChangeVenue) {
+                      onChangeVenue();
+                    } else {
+                      setActivePublicFacilityId('');
+                    }
+                  }}
+                  className="px-3.5 py-2 rounded-xl bg-white hover:bg-slate-100 text-slate-700 border border-slate-200 shadow-xs text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer"
+                >
+                  <Building className="w-3.5 h-3.5 text-blue-600" />
+                  <span>Change Venue</span>
+                </button>
+              )}
               {publicFacilities.length > 1 && (
                 <div className="flex items-center gap-1.5 bg-white border border-slate-200 px-3 py-1.5 rounded-xl shadow-xs text-xs">
                   <Building className="w-3.5 h-3.5 text-blue-600" />

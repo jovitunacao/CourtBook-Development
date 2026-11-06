@@ -10,7 +10,7 @@ import {
   approveBookingRequestViaRpc,
   declineBookingRequestViaRpc,
   updateFacilityConfirmationSettingsViaRpc,
-  fetchPublicFacilities,
+  fetchPublicFacilitiesWithStatus,
   fetchPublicCourts,
   StaffMembershipData,
   StaffLookupResult,
@@ -91,10 +91,16 @@ interface SupabaseAuthContextType {
   declineStaffReservation: (id: string, reason?: string) => Promise<{ success: boolean; error?: string }>;
   updateConfirmationSettings: (mode: 'instant' | 'manual_approval', holdMinutes?: number) => Promise<{ success: boolean; error?: string }>;
   mappedFacilitySettings: FacilitySettings | null;
+  publicFacilitySettings: FacilitySettings | null;
   publicFacilities: SupabaseFacility[];
+  publicFacilitiesLoading: boolean;
+  publicFacilitiesError: string | null;
+  refreshPublicFacilities: () => Promise<void>;
   publicCourts: SupabaseCourt[];
+  directoryCourts: SupabaseCourt[];
+  publicCourtsLoading: boolean;
   activePublicFacility: SupabaseFacility | null;
-  setActivePublicFacilityId: (facilityId: string) => void;
+  setActivePublicFacilityId: (facilityId: string) => Promise<void>;
 }
 
 const SupabaseAuthContext = createContext<SupabaseAuthContextType | undefined>(undefined);
@@ -170,43 +176,114 @@ export const SupabaseAuthProvider: React.FC<{ children: React.ReactNode }> = ({ 
   const [supabaseReservations, setSupabaseReservations] = useState<Reservation[]>([]);
   const [authError, setAuthError] = useState<string | null>(null);
 
-  // Public facilities for customers
+  // Public facilities for customers (never auto-selects first facility)
+  const PUBLIC_FACILITY_STORAGE_KEY = 'courtbook_selected_public_facility_id';
   const [publicFacilities, setPublicFacilities] = useState<SupabaseFacility[]>([]);
+  const [publicFacilitiesLoading, setPublicFacilitiesLoading] = useState<boolean>(isSupabaseConfigured);
+  const [publicFacilitiesError, setPublicFacilitiesError] = useState<string | null>(null);
   const [publicCourts, setPublicCourts] = useState<SupabaseCourt[]>([]);
+  const [directoryCourts, setDirectoryCourts] = useState<SupabaseCourt[]>([]);
+  const [publicCourtsLoading, setPublicCourtsLoading] = useState<boolean>(false);
   const [activePublicFacilityId, setActivePublicFacilityId] = useState<string>('');
+  const publicFacilityRequestRef = React.useRef<number>(0);
 
-  // Load public facilities & courts if Supabase is configured
-  useEffect(() => {
-    let isMounted = true;
-    async function loadPublicData() {
-      if (!isSupabaseConfigured || !supabase) return;
-      try {
-        const facs = await fetchPublicFacilities();
-        if (isMounted && facs.length > 0) {
-          setPublicFacilities(facs);
-          const firstFacId = facs[0].id;
-          setActivePublicFacilityId(firstFacId);
-          const courts = await fetchPublicCourts(firstFacId);
-          if (isMounted) {
-            setPublicCourts(courts);
-          }
-        }
-      } catch (err) {
-        console.warn('Could not load public facilities:', err);
-      }
+  const loadPublicData = useCallback(async () => {
+    if (!isSupabaseConfigured || !supabase) {
+      setPublicFacilitiesLoading(false);
+      setPublicFacilitiesError(null);
+      return;
     }
-    loadPublicData();
-    return () => {
-      isMounted = false;
-    };
+
+    setPublicFacilitiesLoading(true);
+    setPublicFacilitiesError(null);
+    try {
+      const [facRes, allCourts] = await Promise.all([
+        fetchPublicFacilitiesWithStatus(),
+        fetchPublicCourts(),
+      ]);
+
+      if (facRes.error) {
+        setPublicFacilities([]);
+        setDirectoryCourts([]);
+        setPublicFacilitiesError(facRes.error);
+        setPublicFacilitiesLoading(false);
+        return;
+      }
+
+      const facs = facRes.data;
+      setPublicFacilities(facs);
+      setDirectoryCourts(allCourts);
+
+      // Restore previously selected venue from sessionStorage if still active
+      let savedId = '';
+      try {
+        savedId = sessionStorage.getItem(PUBLIC_FACILITY_STORAGE_KEY) || '';
+      } catch {}
+
+      if (savedId && facs.some((f) => f.id === savedId)) {
+        const reqId = ++publicFacilityRequestRef.current;
+        setActivePublicFacilityId(savedId);
+        setPublicCourtsLoading(true);
+        const courts = await fetchPublicCourts(savedId);
+        if (publicFacilityRequestRef.current === reqId) {
+          setPublicCourts(courts);
+          setPublicCourtsLoading(false);
+        }
+      } else {
+        if (savedId) {
+          try {
+            sessionStorage.removeItem(PUBLIC_FACILITY_STORAGE_KEY);
+          } catch {}
+        }
+        setActivePublicFacilityId('');
+        setPublicCourts([]);
+      }
+    } catch (err: any) {
+      console.warn('Could not load public facilities:', err);
+      setPublicFacilities([]);
+      setPublicFacilitiesError(err?.message || 'Failed to load public venues.');
+    } finally {
+      setPublicFacilitiesLoading(false);
+    }
   }, []);
 
-  // When public facility changes, update courts
+  // Load public facilities & directory courts on mount
+  useEffect(() => {
+    loadPublicData();
+  }, [loadPublicData]);
+
+  // When public facility changes, immediately clear stale courts and load only the selected facility's courts
   const handleSelectPublicFacility = useCallback(async (facilityId: string) => {
+    const reqId = ++publicFacilityRequestRef.current;
+
+    if (!facilityId) {
+      setActivePublicFacilityId('');
+      setPublicCourts([]);
+      setPublicCourtsLoading(false);
+      try {
+        sessionStorage.removeItem(PUBLIC_FACILITY_STORAGE_KEY);
+      } catch {}
+      return;
+    }
+
     setActivePublicFacilityId(facilityId);
+    setPublicCourts([]);
+    try {
+      sessionStorage.setItem(PUBLIC_FACILITY_STORAGE_KEY, facilityId);
+    } catch {}
+
     if (isSupabaseConfigured && supabase) {
-      const courts = await fetchPublicCourts(facilityId);
-      setPublicCourts(courts);
+      setPublicCourtsLoading(true);
+      try {
+        const courts = await fetchPublicCourts(facilityId);
+        if (publicFacilityRequestRef.current === reqId) {
+          setPublicCourts(courts);
+        }
+      } finally {
+        if (publicFacilityRequestRef.current === reqId) {
+          setPublicCourtsLoading(false);
+        }
+      }
     }
   }, []);
 
@@ -663,14 +740,17 @@ export const SupabaseAuthProvider: React.FC<{ children: React.ReactNode }> = ({ 
   };
 
   const activePublicFacility =
-    publicFacilities.find((f) => f.id === activePublicFacilityId) ||
-    publicFacilities[0] ||
-    null;
+    publicFacilities.find((f) => f.id === activePublicFacilityId) || null;
 
-  // Filter public courts for active public facility if available
+  // Filter public courts strictly for active public facility (never fall back to other facilities)
   const activePublicCourts = activePublicFacility
     ? publicCourts.filter((c) => c.facility_id === activePublicFacility.id)
-    : publicCourts;
+    : [];
+
+  const publicFacilitySettings: FacilitySettings | null = useMemo(() => {
+    if (!activePublicFacility) return null;
+    return mapFacilityToSettings(activePublicFacility, activePublicCourts);
+  }, [activePublicFacility, activePublicCourts]);
 
   // Derive mapped facility settings if available:
   // 1. Staff authenticated active facility
@@ -685,9 +765,8 @@ export const SupabaseAuthProvider: React.FC<{ children: React.ReactNode }> = ({ 
     if (user && (onboardingState === 'needs_onboarding' || onboardingState === 'error')) {
       return null;
     }
-    if (activePublicFacility) {
-      const courtsToUse = activePublicCourts.length > 0 ? activePublicCourts : publicCourts;
-      return mapFacilityToSettings(activePublicFacility, courtsToUse);
+    if (publicFacilitySettings) {
+      return publicFacilitySettings;
     }
     if (demoProfile) {
       return {
@@ -748,8 +827,14 @@ export const SupabaseAuthProvider: React.FC<{ children: React.ReactNode }> = ({ 
         declineStaffReservation,
         updateConfirmationSettings,
         mappedFacilitySettings,
+        publicFacilitySettings,
         publicFacilities,
-        publicCourts,
+        publicFacilitiesLoading,
+        publicFacilitiesError,
+        refreshPublicFacilities: loadPublicData,
+        publicCourts: activePublicCourts,
+        directoryCourts,
+        publicCourtsLoading,
         activePublicFacility,
         setActivePublicFacilityId: handleSelectPublicFacility,
       }}
