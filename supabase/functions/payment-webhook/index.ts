@@ -162,14 +162,62 @@ serve(async (req: Request) => {
   }
 
   // 2. Process verified event if it represents a capture
-  if (eventType === 'payment.paid' || eventType === 'checkout_session.payment.paid') {
+  const supportedCaptureEvents = new Set([
+    'payment.paid',
+    'checkout_session.payment.paid',
+    'payment.captured',
+  ]);
+
+  if (supportedCaptureEvents.has(eventType)) {
     const rawAmount = typeof eventDataAttrs.amount === 'number'
       ? eventDataAttrs.amount
       : (typeof attributes.amount === 'number' ? attributes.amount : 0);
     const capturedAmount = rawAmount > 0 ? rawAmount / 100 : 0;
-    const providerPaymentId = String(eventData.id || data.id || '');
+    const providerPaymentId = String(eventData.id || '').trim();
     const metadata = (eventDataAttrs.metadata as Record<string, unknown>) || {};
-    const checkoutSessionId = String(metadata.checkout_session_id || eventDataAttrs.checkout_session_id || '');
+    const checkoutSessionId = String(metadata.checkout_session_id || eventDataAttrs.checkout_session_id || '').trim();
+    const currency = typeof eventDataAttrs.currency === 'string' ? eventDataAttrs.currency.trim().toUpperCase() : '';
+    const paymentStatus = typeof eventDataAttrs.status === 'string' ? eventDataAttrs.status.trim().toLowerCase() : '';
+
+    if (!providerPaymentId || !checkoutSessionId || capturedAmount <= 0 || !currency) {
+      return new Response(
+        JSON.stringify({
+          success: false,
+          error: 'Webhook payload missing mandatory payment identity, checkout session identity, captured amount, or currency.',
+        }),
+        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
+    if (!['paid', 'succeeded', 'captured'].includes(paymentStatus)) {
+      return new Response(
+        JSON.stringify({
+          success: false,
+          error: `Unsupported or non-terminal payment status: ${paymentStatus || 'missing'}`,
+        }),
+        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
+    // Enforce PayMongo test/live environment isolation
+    const paymongoSecretKey = Deno.env.get('PAYMONGO_SECRET_KEY') || '';
+    const isLiveKey = paymongoSecretKey.startsWith('sk_live_');
+    const isTestKey = paymongoSecretKey.startsWith('sk_test_');
+    if (typeof eventDataAttrs.livemode === 'boolean') {
+      if (isLiveKey && !eventDataAttrs.livemode) {
+        return new Response(
+          JSON.stringify({ success: false, error: 'Environment mismatch: test webhook event rejected in live mode.' }),
+          { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+      if (isTestKey && eventDataAttrs.livemode) {
+        return new Response(
+          JSON.stringify({ success: false, error: 'Environment mismatch: live webhook event rejected in test mode.' }),
+          { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+    }
+
     const idempotencyKey = `wh_proc_${eventId}_${providerPaymentId}`;
 
     const { data: processResult, error: processError } = await supabaseAdmin.rpc('process_verified_payment_event', {
@@ -177,9 +225,9 @@ serve(async (req: Request) => {
       p_provider_name: 'paymongo',
       p_provider_event_id: eventId,
       p_provider_payment_id: providerPaymentId,
-      p_checkout_session_id: checkoutSessionId || null,
+      p_checkout_session_id: checkoutSessionId,
       p_captured_amount: capturedAmount,
-      p_currency: String(eventDataAttrs.currency || 'PHP'),
+      p_currency: currency,
       p_idempotency_key: idempotencyKey,
       p_metadata: { raw_event_type: eventType },
     });
