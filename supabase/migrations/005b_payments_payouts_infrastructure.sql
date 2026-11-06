@@ -212,7 +212,11 @@ BEGIN
         FROM public.platform_billing_config
         WHERE id = 1;
 
-        IF v_config_comm_rate IS NOT NULL AND NEW.commission_rate IS DISTINCT FROM v_config_comm_rate THEN
+        IF NOT FOUND OR v_config_comm_rate IS NULL THEN
+            RAISE EXCEPTION 'Authoritative platform billing configuration (id = 1) is missing or unconfigured. Cannot initialize payments.';
+        END IF;
+
+        IF NEW.commission_rate IS DISTINCT FROM v_config_comm_rate THEN
             RAISE EXCEPTION 'Commission rate tampering rejected: Supplied rate % does not match configured platform commission rate %.',
                 NEW.commission_rate, v_config_comm_rate;
         END IF;
@@ -267,13 +271,6 @@ BEGIN
         END IF;
     END IF;
 
-    -- Captured amount is strictly immutable once captured (including same-status updates)
-    IF (OLD.status IN ('captured', 'partially_refunded', 'disputed') OR OLD.captured_amount > 0.00) THEN
-        IF NEW.captured_amount IS DISTINCT FROM OLD.captured_amount THEN
-            RAISE EXCEPTION 'Captured amount (₱%) is strictly immutable once captured.', OLD.captured_amount;
-        END IF;
-    END IF;
-
     -- Refunded amount invariants on UPDATE: Cannot decrease
     IF NEW.refunded_amount < OLD.refunded_amount THEN
         RAISE EXCEPTION 'Refunded amount cannot decrease (attempted reduction from ₱% to ₱%).', OLD.refunded_amount, NEW.refunded_amount;
@@ -284,8 +281,32 @@ BEGIN
         RAISE EXCEPTION 'Refunded amount (₱%) cannot exceed captured amount (₱%).', NEW.refunded_amount, NEW.captured_amount;
     END IF;
 
-    -- 4. If status unchanged, validate same-status constraints and exit
+    -- 4. Same-Status Updates & Invariant Protections
     IF OLD.status = NEW.status THEN
+        -- Pending, requires_action, or processing payments CANNOT acquire captured funds, captured timestamp, or refunded funds
+        IF OLD.status IN ('pending', 'requires_action', 'processing') THEN
+            IF NEW.captured_amount IS DISTINCT FROM 0.00 THEN
+                RAISE EXCEPTION 'Payment in status "%" cannot acquire captured funds without a valid capture transition (attempted ₱%).',
+                    OLD.status, NEW.captured_amount;
+            END IF;
+            IF NEW.captured_at IS NOT NULL THEN
+                RAISE EXCEPTION 'Payment in status "%" cannot set captured_at timestamp.', OLD.status;
+            END IF;
+            IF NEW.refunded_amount IS DISTINCT FROM 0.00 THEN
+                RAISE EXCEPTION 'Payment in status "%" cannot acquire refunded funds.', OLD.status;
+            END IF;
+        END IF;
+
+        -- If captured, partially_refunded, or disputed: captured_amount is strictly immutable
+        IF (OLD.status IN ('captured', 'partially_refunded', 'disputed') OR OLD.captured_amount > 0.00) THEN
+            IF NEW.captured_amount IS DISTINCT FROM OLD.captured_amount THEN
+                RAISE EXCEPTION 'Captured amount (₱%) is strictly immutable once captured.', OLD.captured_amount;
+            END IF;
+            IF NEW.captured_at IS DISTINCT FROM OLD.captured_at THEN
+                RAISE EXCEPTION 'captured_at timestamp is strictly immutable once captured.';
+            END IF;
+        END IF;
+
         -- If refunded_amount changed while status remains unchanged:
         IF NEW.refunded_amount IS DISTINCT FROM OLD.refunded_amount THEN
             IF OLD.status != 'partially_refunded' THEN
@@ -328,8 +349,19 @@ BEGIN
         END IF;
     END IF;
 
-    -- 6. Hardened Captured Evidence Invariants (do NOT silently default captured_amount)
-    IF NEW.status = 'captured' THEN
+    -- 6. Hardened Invariants on Transition
+    IF NEW.status IN ('failed', 'cancelled') THEN
+        IF NEW.captured_amount IS DISTINCT FROM 0.00 THEN
+            RAISE EXCEPTION 'Payment transitioning to "%" cannot have captured amount (attempted ₱%).',
+                NEW.status, NEW.captured_amount;
+        END IF;
+        IF NEW.captured_at IS NOT NULL THEN
+            RAISE EXCEPTION 'Payment transitioning to "%" cannot have captured_at timestamp.', NEW.status;
+        END IF;
+        IF NEW.refunded_amount IS DISTINCT FROM 0.00 THEN
+            RAISE EXCEPTION 'Payment transitioning to "%" cannot have refunded amount.', NEW.status;
+        END IF;
+    ELSIF NEW.status = 'captured' THEN
         IF NEW.captured_amount IS NULL OR NEW.captured_amount <= 0.00 THEN
             RAISE EXCEPTION 'Explicit verified captured_amount is required when marking payment captured.';
         END IF;
@@ -343,10 +375,7 @@ BEGIN
         IF NEW.captured_at IS NULL THEN
             NEW.captured_at := now();
         END IF;
-    END IF;
-
-    -- 7. Hardened Refund Transition Invariants
-    IF NEW.status = 'refunded' THEN
+    ELSIF NEW.status = 'refunded' THEN
         IF NEW.refunded_amount IS NULL OR NEW.refunded_amount <= 0.00 THEN
             NEW.refunded_amount := NEW.captured_amount;
         END IF;
@@ -662,6 +691,7 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
     v_journal_tx RECORD;
+    v_reserve_exists BOOLEAN := false;
 BEGIN
     -- 1. INSERT-TIME STATUS & LIFECYCLE INITIALIZATION
     IF TG_OP = 'INSERT' THEN
@@ -701,39 +731,21 @@ BEGIN
         RAISE EXCEPTION 'Payout amount, currency, organization, destination method, and reserve journal link are strictly immutable once created.';
     END IF;
 
-    -- 4. Journal Reference Transaction Type Validation
-    IF NEW.journal_reserve_tx_id IS NOT NULL AND (OLD.journal_reserve_tx_id IS NULL OR OLD.journal_reserve_tx_id != NEW.journal_reserve_tx_id) THEN
-        SELECT transaction_type INTO v_journal_tx
-        FROM public.financial_transactions
-        WHERE id = NEW.journal_reserve_tx_id AND organization_id = NEW.organization_id;
-
-        IF NOT FOUND OR v_journal_tx.transaction_type != 'payout_reserve' THEN
-            RAISE EXCEPTION 'Invalid journal reserve transaction: Must reference an existing financial_transaction of type "payout_reserve" for organization %.',
-                NEW.organization_id;
-        END IF;
-    END IF;
-
-    IF NEW.journal_terminal_tx_id IS NOT NULL AND (OLD.journal_terminal_tx_id IS NULL OR OLD.journal_terminal_tx_id != NEW.journal_terminal_tx_id) THEN
-        SELECT transaction_type INTO v_journal_tx
-        FROM public.financial_transactions
-        WHERE id = NEW.journal_terminal_tx_id AND organization_id = NEW.organization_id;
-
-        IF NOT FOUND THEN
-            RAISE EXCEPTION 'Referenced terminal journal transaction % not found for organization %.',
-                NEW.journal_terminal_tx_id, NEW.organization_id;
-        END IF;
-
-        IF NEW.status = 'paid' AND v_journal_tx.transaction_type != 'payout_disbursement' THEN
-            RAISE EXCEPTION 'Terminal journal mismatch: Successful paid payout must reference transaction type "payout_disbursement" (got "%").',
-                v_journal_tx.transaction_type;
-        ELSIF NEW.status IN ('failed', 'cancelled') AND v_journal_tx.transaction_type != 'payout_failed_release' THEN
-            RAISE EXCEPTION 'Terminal journal mismatch: Failed/cancelled payout must reference transaction type "payout_failed_release" (got "%").',
-                v_journal_tx.transaction_type;
-        END IF;
-    END IF;
-
-    -- If status unchanged, update timestamp and exit
+    -- 4. If status unchanged, validate same-status constraints and exit
     IF OLD.status = NEW.status THEN
+        IF OLD.status = 'pending_request' THEN
+            IF NEW.journal_reserve_tx_id IS NOT NULL THEN
+                RAISE EXCEPTION 'Payout in "pending_request" status cannot set journal_reserve_tx_id without transition to approved_reserved.';
+            END IF;
+            IF NEW.journal_terminal_tx_id IS NOT NULL THEN
+                RAISE EXCEPTION 'Payout in "pending_request" status cannot set journal_terminal_tx_id.';
+            END IF;
+        ELSIF OLD.status IN ('approved_reserved', 'submitted_to_provider') THEN
+            IF NEW.journal_terminal_tx_id IS NOT NULL THEN
+                RAISE EXCEPTION 'Payout in "%" status cannot set journal_terminal_tx_id without terminal transition.', OLD.status;
+            END IF;
+        END IF;
+
         NEW.updated_at = now();
         RETURN NEW;
     END IF;
@@ -750,6 +762,101 @@ BEGIN
     ELSIF OLD.status = 'submitted_to_provider' THEN
         IF NEW.status NOT IN ('paid', 'failed') THEN
             RAISE EXCEPTION 'Invalid payout transition: cannot move from submitted_to_provider to %.', NEW.status;
+        END IF;
+    END IF;
+
+    -- 6. MANDATORY JOURNAL LINKAGE & LIFECYCLE STATE VALIDATION
+    -- 6a. Transition to 'approved_reserved': requires a valid payout_reserve journal transaction
+    IF NEW.status = 'approved_reserved' THEN
+        IF NEW.journal_reserve_tx_id IS NULL THEN
+            RAISE EXCEPTION 'Payout % cannot transition to "approved_reserved" without a valid payout_reserve journal transaction.',
+                NEW.id;
+        END IF;
+
+        SELECT transaction_type INTO v_journal_tx
+        FROM public.financial_transactions
+        WHERE id = NEW.journal_reserve_tx_id AND organization_id = NEW.organization_id;
+
+        IF NOT FOUND OR v_journal_tx.transaction_type != 'payout_reserve' THEN
+            RAISE EXCEPTION 'Invalid journal reserve transaction: Must reference an existing financial_transaction of type "payout_reserve" for organization %.',
+                NEW.organization_id;
+        END IF;
+
+        IF NEW.journal_terminal_tx_id IS NOT NULL THEN
+            RAISE EXCEPTION 'Payout transitioning to "approved_reserved" cannot have journal_terminal_tx_id set.';
+        END IF;
+    END IF;
+
+    -- 6b. Transition to 'submitted_to_provider': preserves reserve journal, terminal journal must be NULL
+    IF NEW.status = 'submitted_to_provider' THEN
+        IF NEW.journal_reserve_tx_id IS NULL THEN
+            RAISE EXCEPTION 'Payout % in "submitted_to_provider" must have an active journal_reserve_tx_id.', NEW.id;
+        END IF;
+        IF NEW.journal_terminal_tx_id IS NOT NULL THEN
+            RAISE EXCEPTION 'Payout in "submitted_to_provider" cannot have journal_terminal_tx_id set.';
+        END IF;
+    END IF;
+
+    -- 6c. Transition to 'paid': requires valid payout_disbursement journal transaction
+    IF NEW.status = 'paid' THEN
+        IF NEW.journal_reserve_tx_id IS NULL THEN
+            RAISE EXCEPTION 'Payout % cannot transition to "paid" without existing journal_reserve_tx_id.', NEW.id;
+        END IF;
+
+        IF NEW.journal_terminal_tx_id IS NULL THEN
+            RAISE EXCEPTION 'Payout % cannot transition to "paid" without a valid payout_disbursement journal transaction.',
+                NEW.id;
+        END IF;
+
+        SELECT transaction_type INTO v_journal_tx
+        FROM public.financial_transactions
+        WHERE id = NEW.journal_terminal_tx_id AND organization_id = NEW.organization_id;
+
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'Referenced terminal journal transaction % not found for organization %.',
+                NEW.journal_terminal_tx_id, NEW.organization_id;
+        END IF;
+
+        IF v_journal_tx.transaction_type != 'payout_disbursement' THEN
+            RAISE EXCEPTION 'Terminal journal mismatch: Successful paid payout must reference transaction type "payout_disbursement" (got "%").',
+                v_journal_tx.transaction_type;
+        END IF;
+    END IF;
+
+    -- 6d. Transition to 'failed' or 'cancelled': distinguish whether reserve existed
+    IF NEW.status IN ('failed', 'cancelled') THEN
+        v_reserve_exists := (OLD.status IN ('approved_reserved', 'submitted_to_provider') OR OLD.journal_reserve_tx_id IS NOT NULL);
+
+        IF v_reserve_exists THEN
+            -- Funds were locked in Account 2015 reserve; must have payout_failed_release journal to restore to 2011
+            IF NEW.journal_terminal_tx_id IS NULL THEN
+                RAISE EXCEPTION 'Reserved payout % transitioning to "%" requires a valid payout_failed_release journal transaction to release reserved funds.',
+                    NEW.id, NEW.status;
+            END IF;
+
+            SELECT transaction_type INTO v_journal_tx
+            FROM public.financial_transactions
+            WHERE id = NEW.journal_terminal_tx_id AND organization_id = NEW.organization_id;
+
+            IF NOT FOUND THEN
+                RAISE EXCEPTION 'Referenced terminal journal transaction % not found for organization %.',
+                    NEW.journal_terminal_tx_id, NEW.organization_id;
+            END IF;
+
+            IF v_journal_tx.transaction_type != 'payout_failed_release' THEN
+                RAISE EXCEPTION 'Terminal journal mismatch: Failed/cancelled payout with active reserve must reference transaction type "payout_failed_release" (got "%").',
+                    v_journal_tx.transaction_type;
+            END IF;
+        ELSE
+            -- No funds were ever reserved (e.g. cancelled/failed directly from pending_request)
+            IF NEW.journal_terminal_tx_id IS NOT NULL THEN
+                RAISE EXCEPTION 'Unreserved payout % transitioning to "%" cannot specify a terminal release journal.',
+                    NEW.id, NEW.status;
+            END IF;
+            IF NEW.journal_reserve_tx_id IS NOT NULL THEN
+                RAISE EXCEPTION 'Unreserved payout % transitioning to "%" cannot specify a reserve journal.',
+                    NEW.id, NEW.status;
+            END IF;
         END IF;
     END IF;
 
