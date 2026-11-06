@@ -139,18 +139,97 @@ serve(async (req: Request) => {
     .select('id')
     .single();
 
+  let activeInboxId = inboxRecord?.id;
+
   if (inboxError) {
-    // If unique constraint violation on provider_event_id, mark duplicate and return 200
     if (inboxError.code === '23505') {
-      return new Response(JSON.stringify({ success: true, message: 'Duplicate webhook event ignored' }), {
-        status: 200,
+      const { data: existingEvent, error: fetchErr } = await supabaseAdmin
+        .from('provider_webhook_events')
+        .select('id, payload_hash, processing_state')
+        .eq('provider_name', 'paymongo')
+        .eq('provider_event_id', eventId)
+        .single();
+
+      if (fetchErr || !existingEvent) {
+        return new Response(JSON.stringify({ error: 'Failed to inspect duplicate webhook event' }), {
+          status: 500,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+      }
+
+      if (existingEvent.payload_hash !== payloadHash) {
+        await supabaseAdmin
+          .from('provider_webhook_events')
+          .update({ last_error: 'Conflicting payload hash for duplicate provider_event_id' })
+          .eq('id', existingEvent.id);
+
+        return new Response(
+          JSON.stringify({
+            success: false,
+            error: 'Conflicting payload hash for duplicate provider_event_id',
+          }),
+          { status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+
+      if (!verification.isValid) {
+        return new Response(
+          JSON.stringify({ success: false, error: 'Invalid or forged webhook signature' }),
+          { status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+
+      if (existingEvent.processing_state === 'processed') {
+        return new Response(
+          JSON.stringify({
+            success: true,
+            status: 'already_processed',
+            message: 'Duplicate webhook event already processed',
+          }),
+          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+
+      if (existingEvent.processing_state === 'processing') {
+        return new Response(
+          JSON.stringify({
+            success: false,
+            status: 'currently_processing',
+            retryable: true,
+            message: 'Webhook event is currently being processed',
+          }),
+          { status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+
+      // Stored but unprocessed ('pending' or 'failed'): acquire lease and resume reconciliation
+      const { data: leased, error: leaseErr } = await supabaseAdmin
+        .from('provider_webhook_events')
+        .update({ processing_state: 'processing', last_error: null })
+        .eq('id', existingEvent.id)
+        .eq('processing_state', existingEvent.processing_state)
+        .select('id')
+        .single();
+
+      if (leaseErr || !leased) {
+        return new Response(
+          JSON.stringify({
+            success: false,
+            status: 'currently_processing',
+            retryable: true,
+            message: 'Concurrent webhook retry detected',
+          }),
+          { status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+
+      activeInboxId = leased.id;
+    } else {
+      return new Response(JSON.stringify({ error: inboxError.message }), {
+        status: 500,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       });
     }
-    return new Response(JSON.stringify({ error: inboxError.message }), {
-      status: 500,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-    });
   }
 
   // Reject unverified events
@@ -221,7 +300,7 @@ serve(async (req: Request) => {
     const idempotencyKey = `wh_proc_${eventId}_${providerPaymentId}`;
 
     const { data: processResult, error: processError } = await supabaseAdmin.rpc('process_verified_payment_event', {
-      p_webhook_event_id: inboxRecord.id,
+      p_webhook_event_id: activeInboxId,
       p_provider_name: 'paymongo',
       p_provider_event_id: eventId,
       p_provider_payment_id: providerPaymentId,

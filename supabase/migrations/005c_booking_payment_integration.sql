@@ -1250,6 +1250,11 @@ BEGIN
             v_webhook_event_id, v_webhook.signature_verification_status;
     END IF;
 
+    IF v_webhook.processing_state = 'processed' THEN
+        RAISE EXCEPTION 'Security rejection: Refund webhook event % has already been processed and cannot be reused.',
+            v_webhook_event_id;
+    END IF;
+
     IF v_webhook.event_type NOT IN ('refund.succeeded', 'payment.refunded', 'charge.refunded') THEN
         RAISE EXCEPTION 'Unsupported refund webhook event type: "%".', v_webhook.event_type;
     END IF;
@@ -1311,6 +1316,55 @@ BEGIN
         RAISE EXCEPTION 'Cannot refund payment %: Current status is "%". Only captured payments can be refunded.',
             p_payment_id, v_payment.status;
     END IF;
+
+    IF v_webhook.provider_name != v_payment.provider_name THEN
+        RAISE EXCEPTION 'Evidence mismatch: Webhook provider ("%") does not match payment provider ("%").',
+            v_webhook.provider_name, v_payment.provider_name;
+    END IF;
+
+    -- Bind original payment ID, currency, and organization if present in webhook evidence
+    DECLARE
+        v_ev_payment_id TEXT;
+        v_ev_currency TEXT;
+        v_ev_org_id TEXT;
+    BEGIN
+        v_ev_payment_id := NULLIF(trim(COALESCE(
+            v_webhook.payload->'data'->'attributes'->>'payment_id',
+            v_webhook.payload->>'payment_id',
+            v_webhook.payload->>'provider_payment_id',
+            ''
+        )), '');
+        IF v_ev_payment_id IS NOT NULL AND v_ev_payment_id != v_payment.provider_payment_id THEN
+            RAISE EXCEPTION 'Evidence mismatch: Webhook original payment ID ("%") does not match payment ("%").',
+                v_ev_payment_id, v_payment.provider_payment_id;
+        END IF;
+
+        v_ev_currency := upper(NULLIF(trim(COALESCE(
+            v_webhook.payload->'data'->'attributes'->>'currency',
+            v_webhook.payload->>'currency',
+            ''
+        )), ''));
+        IF v_ev_currency IS NOT NULL AND v_ev_currency != v_payment.currency THEN
+            RAISE EXCEPTION 'Evidence mismatch: Webhook currency ("%") does not match payment currency ("%").',
+                v_ev_currency, v_payment.currency;
+        END IF;
+
+        v_ev_org_id := NULLIF(trim(COALESCE(
+            v_webhook.payload->'data'->'attributes'->'metadata'->>'organization_id',
+            v_webhook.payload->'metadata'->>'organization_id',
+            v_webhook.payload->>'organization_id',
+            ''
+        )), '');
+        IF v_ev_org_id IS NOT NULL AND v_ev_org_id::uuid != v_payment.organization_id THEN
+            RAISE EXCEPTION 'Evidence mismatch: Webhook organization ("%") does not match payment organization ("%").',
+                v_ev_org_id, v_payment.organization_id;
+        END IF;
+    END;
+
+    UPDATE public.provider_webhook_events
+    SET processing_state = 'processed',
+        processed_at = now()
+    WHERE id = v_webhook_event_id;
 
     -- Prevent duplicate processing of the exact same provider refund ID
     IF v_payment.verified_capture_evidence ? ('refund_' || v_clean_refund_id) THEN
@@ -1567,6 +1621,11 @@ BEGIN
             v_webhook_event_id, v_webhook.signature_verification_status;
     END IF;
 
+    IF v_webhook.processing_state = 'processed' THEN
+        RAISE EXCEPTION 'Security rejection: Payout webhook event % has already been processed and cannot be reused.',
+            v_webhook_event_id;
+    END IF;
+
     IF v_webhook.event_type NOT IN ('payout.paid', 'payout.succeeded', 'transfer.paid') THEN
         RAISE EXCEPTION 'Unsupported payout disbursement webhook event type: "%".', v_webhook.event_type;
     END IF;
@@ -1736,6 +1795,11 @@ BEGIN
     IF v_webhook.signature_verification_status != 'verified' THEN
         RAISE EXCEPTION 'Security rejection: Payout failure webhook event % has unverified signature status ("%").',
             v_webhook_event_id, v_webhook.signature_verification_status;
+    END IF;
+
+    IF v_webhook.processing_state = 'processed' THEN
+        RAISE EXCEPTION 'Security rejection: Payout failure webhook event % has already been processed and cannot be reused.',
+            v_webhook_event_id;
     END IF;
 
     IF v_webhook.event_type NOT IN ('payout.failed', 'transfer.failed') THEN

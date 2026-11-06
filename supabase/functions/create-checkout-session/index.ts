@@ -123,9 +123,40 @@ serve(async (req: Request) => {
     let isSimulated = false;
 
     if (paymongoSecretKey.startsWith('sk_live_') || paymongoSecretKey.startsWith('sk_test_')) {
-      // Official PayMongo API invocation using server-authoritative pricing
       const authHeader = 'Basic ' + btoa(`${paymongoSecretKey}:`);
-      const pmRes = await fetch('https://api.paymongo.com/v1/checkout_sessions', {
+
+      // On idempotent replay where local binding previously failed, check PayMongo for an existing active session
+      // matching this reference_code before creating a second payable checkout session.
+      let recoveredExisting = false;
+      if (data.idempotent_replayed) {
+        try {
+          const listRes = await fetch('https://api.paymongo.com/v1/checkout_sessions?limit=10', {
+            method: 'GET',
+            headers: { 'Authorization': authHeader },
+          });
+          if (listRes.ok) {
+            const listJson = await listRes.json();
+            const sessions = Array.isArray(listJson?.data) ? listJson.data : [];
+            const matched = sessions.find(
+              (s: any) =>
+                s?.attributes?.reference_number === data.reference_code &&
+                s?.attributes?.status === 'active' &&
+                s?.attributes?.checkout_url
+            );
+            if (matched) {
+              providerCheckoutId = matched.id;
+              checkoutUrl = matched.attributes.checkout_url;
+              recoveredExisting = true;
+            }
+          }
+        } catch {
+          // Proceed to creation if lookup fails
+        }
+      }
+
+      if (!recoveredExisting) {
+        // Official PayMongo API invocation using server-authoritative pricing
+        const pmRes = await fetch('https://api.paymongo.com/v1/checkout_sessions', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -168,9 +199,10 @@ serve(async (req: Request) => {
         );
       }
 
-      const pmJson = await pmRes.json();
-      providerCheckoutId = pmJson.data.id;
-      checkoutUrl = pmJson.data.attributes.checkout_url;
+        const pmJson = await pmRes.json();
+        providerCheckoutId = pmJson.data.id;
+        checkoutUrl = pmJson.data.attributes.checkout_url;
+      }
     } else {
       // In production or when simulation is not explicitly configured, fail closed
       if (appEnv === 'production' || !allowSimulation) {
