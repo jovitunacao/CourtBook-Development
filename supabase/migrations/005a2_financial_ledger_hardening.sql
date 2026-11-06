@@ -20,14 +20,15 @@
 --        * Exact debit/credit normal balance rules for Assets/Expenses vs Liabilities/Revenue.
 --        * In-memory multi-entry running balance tracking across transaction lines.
 --        * Exact column references in organization_balances:
---          unsettled_clearing_amount, pending_payout_amount, negative_recovery_balance,
---          available_withdrawable_balance, total_gross_settled, total_commission_paid,
---          total_withdrawn, last_journal_transaction_id.
+--          unsettled_clearing_amount, pending_payout_amount, restricted_reserve_amount,
+--          available_withdrawable_balance, negative_recovery_balance, total_gross_settled,
+--          total_commission_paid, total_withdrawn, last_journal_transaction_id.
 --        * Exact column reference in ledger_entries: running_balance.
 --      - Hardens:
 --        * Idempotency comparison uses IS DISTINCT FROM (never skips NULL or partial records).
 --        * Total debits & credits must be strictly positive (v_total_debits <= 0.00 rejected).
 --        * Strict transaction-specific DEBIT/CREDIT direction validation across all 13 types.
+--        * Correct balance deltas for dispute holds, chargeback reserves, and platform adjustments.
 --   4. Re-applies strict EXECUTE privilege revocations for PUBLIC, anon, authenticated,
 --      and service_role.
 -- ==============================================================================
@@ -167,6 +168,7 @@ DECLARE
     v_delta_pending_payout NUMERIC(10, 2) := 0.00;
     v_delta_total_withdrawn NUMERIC(10, 2) := 0.00;
     v_delta_negative_recovery NUMERIC(10, 2) := 0.00;
+    v_delta_restricted_reserve NUMERIC(10, 2) := 0.00;
 
     -- Target balances
     v_new_gross NUMERIC(10, 2);
@@ -176,6 +178,7 @@ DECLARE
     v_new_pending NUMERIC(10, 2);
     v_new_withdrawn NUMERIC(10, 2);
     v_new_negative_recovery NUMERIC(10, 2);
+    v_new_restricted_reserve NUMERIC(10, 2);
 BEGIN
     -- 1. Input Sanitization & Basic Guards
     IF p_organization_id IS NULL THEN
@@ -438,6 +441,8 @@ BEGIN
                 v_delta_available_withdrawable := v_delta_available_withdrawable - v_entry_amount;
             ELSIF v_entry_direction = 'DEBIT' AND v_entry_account = '1030' THEN
                 v_delta_negative_recovery := v_delta_negative_recovery + v_entry_amount;
+            ELSIF v_entry_direction = 'DEBIT' AND v_entry_account = '2012' THEN
+                v_delta_restricted_reserve := v_delta_restricted_reserve - v_entry_amount;
             END IF;
 
         ELSIF v_clean_type = 'payout_reserve' THEN
@@ -473,7 +478,7 @@ BEGIN
 
         ELSIF v_clean_type = 'payout_failed_release' THEN
             IF v_entry_account NOT IN ('2011', '2015') THEN
-                RAISE EXCEPTION 'Only 2015 (Pending Payout) and 2011 (Available) permitted for payout_failed_release.';
+                RAISE EXCEPTION 'Only 2011 (Available) and 2015 (Pending Payout) permitted for payout_failed_release.';
             END IF;
             IF v_entry_direction = 'DEBIT' AND v_entry_account != '2015' THEN
                 RAISE EXCEPTION 'payout_failed_release DEBIT must target 2015 (Pending Payout), got %.', v_entry_account;
@@ -516,6 +521,9 @@ BEGIN
             ELSIF v_entry_direction = 'DEBIT' AND v_entry_account = '2011' THEN
                 v_delta_available_withdrawable := v_delta_available_withdrawable - v_entry_amount;
             END IF;
+            IF v_entry_direction = 'CREDIT' AND v_entry_account = '2012' THEN
+                v_delta_restricted_reserve := v_delta_restricted_reserve + v_entry_amount;
+            END IF;
 
         ELSIF v_clean_type IN ('excess_payment_liability', 'late_payment_liability') THEN
             IF v_entry_account NOT IN ('1010', '1020', '2030') THEN
@@ -550,6 +558,18 @@ BEGIN
                 ELSE
                     v_delta_negative_recovery := v_delta_negative_recovery - v_entry_amount;
                 END IF;
+            ELSIF v_entry_account = '4010' THEN
+                IF v_entry_direction = 'CREDIT' THEN
+                    v_delta_commission_paid := v_delta_commission_paid + v_entry_amount;
+                ELSE
+                    v_delta_commission_paid := v_delta_commission_paid - v_entry_amount;
+                END IF;
+            ELSIF v_entry_account IN ('1010', '1020') THEN
+                IF v_entry_direction = 'DEBIT' THEN
+                    v_delta_gross_settled := v_delta_gross_settled + v_entry_amount;
+                ELSE
+                    v_delta_gross_settled := v_delta_gross_settled - v_entry_amount;
+                END IF;
             END IF;
 
         END IF;
@@ -563,6 +583,7 @@ BEGIN
     v_new_pending := v_org_balance.pending_payout_amount + v_delta_pending_payout;
     v_new_withdrawn := v_org_balance.total_withdrawn + v_delta_total_withdrawn;
     v_new_negative_recovery := v_org_balance.negative_recovery_balance + v_delta_negative_recovery;
+    v_new_restricted_reserve := v_org_balance.restricted_reserve_amount + v_delta_restricted_reserve;
 
     IF v_new_gross < 0.00 THEN
         RAISE EXCEPTION 'Balance invariant violation: total_gross_settled cannot be negative (would be ₱%).', v_new_gross;
@@ -585,6 +606,9 @@ BEGIN
     END IF;
     IF v_new_negative_recovery < 0.00 THEN
         RAISE EXCEPTION 'Balance invariant violation: negative_recovery_balance cannot be negative (would be ₱%).', v_new_negative_recovery;
+    END IF;
+    IF v_new_restricted_reserve < 0.00 THEN
+        RAISE EXCEPTION 'Balance invariant violation: restricted_reserve_amount cannot be negative (would be ₱%).', v_new_restricted_reserve;
     END IF;
 
     -- 8. Create Financial Transaction Header with Versioned Canonical Payload Hash
@@ -788,6 +812,7 @@ BEGIN
         pending_payout_amount = v_new_pending,
         total_withdrawn = v_new_withdrawn,
         negative_recovery_balance = v_new_negative_recovery,
+        restricted_reserve_amount = v_new_restricted_reserve,
         last_journal_transaction_id = v_new_tx_id,
         updated_at = now()
     WHERE organization_id = p_organization_id;
@@ -801,6 +826,7 @@ BEGIN
         'available_withdrawable_balance', v_new_available,
         'unsettled_clearing_amount', v_new_unsettled,
         'negative_recovery_balance', v_new_negative_recovery,
+        'restricted_reserve_amount', v_new_restricted_reserve,
         'idempotent_duplicate', false
     );
 END;
