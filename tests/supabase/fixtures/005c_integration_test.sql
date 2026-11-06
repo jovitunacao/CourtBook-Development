@@ -1347,6 +1347,122 @@ BEGIN
         END IF;
     END;
 
+    -- -------------------------------------------------------------------------
+    -- TEST 46 (NEW): Realistic checkout_session.payment.paid Envelope & Negative Cases
+    -- -------------------------------------------------------------------------
+    DECLARE
+        v_cs_res JSONB;
+        v_cs_pay_id UUID;
+        v_cs_res_id UUID;
+        v_wh_cs_missing UUID;
+        v_wh_cs_valid UUID;
+        v_cs_proc_res JSONB;
+    BEGIN
+        v_cs_res := public.create_booking_checkout_session(
+            'idem_cs_envelope_001',
+            v_synth_fac_b,
+            v_synth_court_b,
+            'Elena Reyes',
+            '+639171234567',
+            'elena@example.com',
+            CURRENT_DATE + 4,
+            ((CURRENT_DATE + 4)::text || ' 14:00:00+08')::timestamptz,
+            60,
+            'paymongo'
+        );
+        v_cs_pay_id := (v_cs_res->>'payment_id')::UUID;
+        v_cs_res_id := (v_cs_res->>'reservation_id')::UUID;
+
+        PERFORM public.bind_provider_checkout_session(
+            v_cs_pay_id, v_cs_res_id, 'paymongo', 'cs_paymongo_env_001',
+            'https://checkout.paymongo.com/cs_paymongo_env_001', 'idem_bind_cs_env_001'
+        );
+
+        -- 46A: Missing embedded payments[0] must be rejected
+        INSERT INTO public.provider_webhook_events (
+            provider_name, provider_event_id, event_type, signature_verification_status,
+            signature_header, processing_state, payload
+        ) VALUES (
+            'paymongo', 'evt_cs_missing_pay_001', 'checkout_session.payment.paid', 'verified',
+            't=1700000000,te=valid_hmac_hex', 'pending',
+            jsonb_build_object(
+                'data', jsonb_build_object(
+                    'id', 'evt_cs_missing_pay_001',
+                    'type', 'checkout_session.payment.paid',
+                    'attributes', jsonb_build_object(
+                        'data', jsonb_build_object(
+                            'id', 'cs_paymongo_env_001',
+                            'type', 'checkout_session',
+                            'attributes', jsonb_build_object('payments', '[]'::jsonb)
+                        )
+                    )
+                )
+            )
+        ) RETURNING id INTO v_wh_cs_missing;
+
+        BEGIN
+            PERFORM public.process_verified_payment_event(
+                v_wh_cs_missing, 'paymongo', 'evt_cs_missing_pay_001', 'pay_missing_001',
+                'cs_paymongo_env_001', 350.00, 'PHP', 'idem_cs_missing_001', '{}'::jsonb
+            );
+            RAISE EXCEPTION 'Test 46A Failed: Missing embedded payments[0] was not rejected!';
+        EXCEPTION WHEN OTHERS THEN
+            IF SQLERRM LIKE '%does not contain provider payment identity%' THEN
+                v_test_count := v_test_count + 1;
+                RAISE NOTICE 'Test 46A PASSED: checkout_session.payment.paid without embedded payments[0] rejected.';
+            ELSE
+                RAISE EXCEPTION 'Test 46A Failed: Unexpected error: %', SQLERRM;
+            END IF;
+        END;
+
+        -- 46B: Valid realistic checkout_session.payment.paid envelope confirms booking & posts balanced journal
+        INSERT INTO public.provider_webhook_events (
+            provider_name, provider_event_id, event_type, signature_verification_status,
+            signature_header, processing_state, payload
+        ) VALUES (
+            'paymongo', 'evt_cs_valid_001', 'checkout_session.payment.paid', 'verified',
+            't=1700000000,te=valid_hmac_hex', 'pending',
+            jsonb_build_object(
+                'data', jsonb_build_object(
+                    'id', 'evt_cs_valid_001',
+                    'type', 'checkout_session.payment.paid',
+                    'attributes', jsonb_build_object(
+                        'data', jsonb_build_object(
+                            'id', 'cs_paymongo_env_001',
+                            'type', 'checkout_session',
+                            'attributes', jsonb_build_object(
+                                'reference_number', v_cs_res->>'reference_code',
+                                'payments', jsonb_build_array(
+                                    jsonb_build_object(
+                                        'id', 'pay_embedded_001',
+                                        'type', 'payment',
+                                        'attributes', jsonb_build_object(
+                                            'amount', 35000,
+                                            'currency', 'PHP',
+                                            'status', 'paid'
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                    )
+                )
+            )
+        ) RETURNING id INTO v_wh_cs_valid;
+
+        v_cs_proc_res := public.process_verified_payment_event(
+            v_wh_cs_valid, 'paymongo', 'evt_cs_valid_001', 'pay_embedded_001',
+            'cs_paymongo_env_001', 350.00, 'PHP', 'idem_cs_valid_001', '{}'::jsonb
+        );
+
+        IF (v_cs_proc_res->>'success')::boolean IS NOT TRUE THEN
+            RAISE EXCEPTION 'Test 46B Failed: Valid checkout_session.payment.paid was not processed!';
+        END IF;
+
+        v_test_count := v_test_count + 1;
+        RAISE NOTICE 'Test 46B PASSED: Realistic checkout_session.payment.paid envelope confirmed booking and posted balanced journal.';
+    END;
+
     RAISE NOTICE '=== ALL % DATABASE TESTS COMPLETED SUCCESSFULLY ===', v_test_count;
 END $$;
 

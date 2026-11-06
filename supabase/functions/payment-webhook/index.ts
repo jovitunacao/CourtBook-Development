@@ -123,8 +123,14 @@ serve(async (req: Request) => {
   const eventData = (attributes.data as Record<string, unknown>) || {};
   const eventDataAttrs = (eventData.attributes as Record<string, unknown>) || {};
 
-  // Verify HMAC signature with strict test/live mode isolation
+  // Verify HMAC signature with strict test/live mode isolation (fail closed on missing/malformed key)
   const paymongoSecretKey = Deno.env.get('PAYMONGO_SECRET_KEY') || '';
+  if (!paymongoSecretKey.startsWith('sk_live_') && !paymongoSecretKey.startsWith('sk_test_')) {
+    return new Response(
+      JSON.stringify({ success: false, error: 'Server misconfiguration: missing or malformed PAYMONGO_SECRET_KEY' }),
+      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+    );
+  }
   const expectedMode: 'test' | 'live' = paymongoSecretKey.startsWith('sk_live_') ? 'live' : 'test';
   const verification = await verifyPayMongoSignature(rawBody, signatureHeader, webhookSecret, expectedMode);
   const signatureStatus = verification.isValid ? 'verified' : 'failed';
