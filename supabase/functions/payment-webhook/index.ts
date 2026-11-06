@@ -25,6 +25,7 @@ async function verifyPayMongoSignature(
   rawBody: string,
   signatureHeader: string,
   secret: string,
+  expectedMode: 'test' | 'live',
   toleranceSeconds = 300
 ): Promise<{ isValid: boolean; timestamp?: number; error?: string }> {
   if (!signatureHeader || !rawBody || !secret) {
@@ -64,14 +65,18 @@ async function verifyPayMongoSignature(
   const testSig = parts['te'];
   const liveSig = parts['li'];
 
-  if (liveSig && liveSig === computedHex) {
-    return { isValid: true, timestamp };
+  if (expectedMode === 'live') {
+    if (liveSig && liveSig === computedHex) {
+      return { isValid: true, timestamp };
+    }
+    return { isValid: false, timestamp, error: 'Missing or invalid live-mode signature (li)' };
   }
+
   if (testSig && testSig === computedHex) {
     return { isValid: true, timestamp };
   }
 
-  return { isValid: false, timestamp, error: 'Signature mismatch' };
+  return { isValid: false, timestamp, error: 'Missing or invalid test-mode signature (te)' };
 }
 
 serve(async (req: Request) => {
@@ -118,8 +123,10 @@ serve(async (req: Request) => {
   const eventData = (attributes.data as Record<string, unknown>) || {};
   const eventDataAttrs = (eventData.attributes as Record<string, unknown>) || {};
 
-  // Verify HMAC signature
-  const verification = await verifyPayMongoSignature(rawBody, signatureHeader, webhookSecret);
+  // Verify HMAC signature with strict test/live mode isolation
+  const paymongoSecretKey = Deno.env.get('PAYMONGO_SECRET_KEY') || '';
+  const expectedMode: 'test' | 'live' = paymongoSecretKey.startsWith('sk_live_') ? 'live' : 'test';
+  const verification = await verifyPayMongoSignature(rawBody, signatureHeader, webhookSecret, expectedMode);
   const signatureStatus = verification.isValid ? 'verified' : 'failed';
 
   // 1. Ingest into append-only provider_webhook_events

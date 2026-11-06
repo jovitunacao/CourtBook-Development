@@ -8,27 +8,27 @@ Execution Evidence Log: /app/applet/tests/supabase/reports/005c_execution_eviden
 
 Connected to disposable PostgreSQL engine:
 PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit
-Server Data Directory: /tmp/cb_005c_3470_1793967237112_data
-Server Socket Directory: /tmp/cb_005c_3470_1793967237112_sock (Port: 53981)
+Server Data Directory: /tmp/cb_005c_3659_1793968706028_data
+Server Socket Directory: /tmp/cb_005c_3659_1793968706028_sock (Port: 52765)
 
 --- Running Gate 1: Baseline Migrations 001-005B & Migration 005C Application ---
-[PASS] Gate 1: Baseline 001-005B Application & Migration 005C Execution (82ms): All baseline migrations and Migration 005C applied atomically within isolated disposable database.
+[PASS] Gate 1: Baseline 001-005B Application & Migration 005C Execution (85ms): All baseline migrations and Migration 005C applied atomically within isolated disposable database.
 
 --- Running Gate 2: Stored Procedures & Authorization Boundary Verification ---
 [PASS] Gate 2: Stored Procedures & Authorization Boundary Verification (5ms): All 8 005C integration procedures verified with SECURITY DEFINER and search_path hardening.
 
 --- Running Gate 3: Webhook Signature Verification & Provider Adapter Unit Tests ---
   All 11 signature and adapter tests passed successfully.
-[PASS] Gate 3: Webhook Signature & Adapter Tests (2ms): PayMongo HMAC-SHA256 signature algorithm, test/live mode, tolerance windows, tampering rejection, and Xendit isolation verified (11 passed).
+[PASS] Gate 3: Webhook Signature & Adapter Tests (3ms): PayMongo HMAC-SHA256 signature algorithm, test/live mode, tolerance windows, tampering rejection, and Xendit isolation verified (11 passed).
 
 --- Running Gate 4: SQL Test Fixture Execution (Tests 1 through 25 — Comprehensive Suite) ---
-[PASS] Gate 4: SQL Test Fixture Execution (Tests 1-25) (66ms): All 25 integration tests passed: checkout hold binding, 5% commission snapshot, webhook reconciliation, customer refund liabilities, partial/full refunds, settlement clearing, and payout lifecycle.
+[PASS] Gate 4: SQL Test Fixture Execution (Tests 1-25) (67ms): All 25 integration tests passed: checkout hold binding, 5% commission snapshot, webhook reconciliation, customer refund liabilities, partial/full refunds, settlement clearing, and payout lifecycle.
 
 --- Running Gate 5: Multi-Session Concurrent PostgreSQL Race Tests ---
-  Verified 2 independent concurrent PostgreSQL sessions: Session 1 PID=3521, Session 2 PID=3522
+  Verified 2 independent concurrent PostgreSQL sessions: Session 1 PID=3707, Session 2 PID=3708
   5A PASSED: Concurrent checkout race safely resolved with exactly 1 winner and 1 slot collision rejection.
   5B PASSED: Concurrent payout overdraft race safely prevented over-withdrawal across 2 independent PostgreSQL sessions.
-[PASS] Gate 5: Multi-Session Concurrent PostgreSQL Race Tests (30ms): Concurrent slot checkout serialized (1 winner). Competing payout reserve overdraft prevented across 2 independent sessions (PIDs 3521, 3522).
+[PASS] Gate 5: Multi-Session Concurrent PostgreSQL Race Tests (33ms): Concurrent slot checkout serialized (1 winner). Competing payout reserve overdraft prevented across 2 independent sessions (PIDs 3707, 3708).
 
 --- Running Gate 6: Double-Entry Ledger Reconciliation & Invariant Check ---
   Double-entry ledger check: 100% of transactions balanced (Debits == Credits).
@@ -38,11 +38,11 @@ Server Socket Directory: /tmp/cb_005c_3470_1793967237112_sock (Port: 53981)
 ================================================================================
 COURTBOOK PHASE 4.2.4 VALIDATION GATE SUMMARY REPORT
 ================================================================================
-- [PASS] Gate 1: Baseline 001-005B Application & Migration 005C Execution (82ms)
+- [PASS] Gate 1: Baseline 001-005B Application & Migration 005C Execution (85ms)
 - [PASS] Gate 2: Stored Procedures & Authorization Boundary Verification (5ms)
-- [PASS] Gate 3: Webhook Signature & Adapter Tests (2ms)
-- [PASS] Gate 4: SQL Test Fixture Execution (Tests 1-25) (66ms)
-- [PASS] Gate 5: Multi-Session Concurrent PostgreSQL Race Tests (30ms)
+- [PASS] Gate 3: Webhook Signature & Adapter Tests (3ms)
+- [PASS] Gate 4: SQL Test Fixture Execution (Tests 1-25) (67ms)
+- [PASS] Gate 5: Multi-Session Concurrent PostgreSQL Race Tests (33ms)
 - [PASS] Gate 6: Double-Entry Ledger Reconciliation & Invariant Check (1ms)
 ================================================================================
 TOTAL GATES: 6 | PASS: 6 | FAIL: 0

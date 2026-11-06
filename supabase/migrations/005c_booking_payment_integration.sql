@@ -623,51 +623,98 @@ BEGIN
     END IF;
 
     -- 3. Extract and Verify Trusted Payload Evidence (No fallbacks to caller-supplied parameters)
-    v_trusted_payment_id := NULLIF(trim(COALESCE(
-        v_webhook.payload->'data'->'attributes'->'data'->>'id',
-        v_webhook.payload->'data'->>'id',
-        v_webhook.payload->>'provider_payment_id',
-        v_webhook.payload->>'payment_id',
-        ''
-    )), '');
+    IF v_webhook.event_type = 'checkout_session.payment.paid' THEN
+        DECLARE
+            v_cs_resource JSONB;
+            v_embedded_payment JSONB;
+            v_embedded_pay_attrs JSONB;
+        BEGIN
+            v_cs_resource := COALESCE(
+                v_webhook.payload->'data'->'attributes'->'data',
+                v_webhook.payload->'data'->'data'
+            );
 
-    v_trusted_session_id := NULLIF(trim(COALESCE(
-        v_webhook.payload->'data'->'attributes'->'data'->'attributes'->>'checkout_session_id',
-        v_webhook.payload->'data'->'attributes'->'data'->'attributes'->'metadata'->>'checkout_session_id',
-        v_webhook.payload->'data'->'attributes'->>'checkout_session_id',
-        v_webhook.payload->'data'->'attributes'->'metadata'->>'checkout_session_id',
-        v_webhook.payload->'data'->>'checkout_session_id',
-        v_webhook.payload->>'checkout_session_id',
-        ''
-    )), '');
+            v_trusted_session_id := NULLIF(trim(COALESCE(
+                v_cs_resource->>'id',
+                v_webhook.payload->>'checkout_session_id',
+                ''
+            )), '');
 
-    IF v_webhook.payload->'data'->'attributes'->'data'->'attributes' ? 'amount' THEN
-        v_trusted_amount := ((v_webhook.payload->'data'->'attributes'->'data'->'attributes'->>'amount')::NUMERIC / 100.00);
-    ELSIF v_webhook.payload->'data'->'attributes' ? 'amount' THEN
-        v_trusted_amount := ((v_webhook.payload->'data'->'attributes'->>'amount')::NUMERIC / 100.00);
-    ELSIF v_webhook.payload ? 'captured_amount' THEN
-        v_trusted_amount := (v_webhook.payload->>'captured_amount')::NUMERIC;
-    ELSIF v_webhook.payload ? 'amount' THEN
-        IF (v_webhook.payload->>'amount')::NUMERIC >= 10000 THEN
-            v_trusted_amount := ((v_webhook.payload->>'amount')::NUMERIC / 100.00);
-        ELSE
-            v_trusted_amount := (v_webhook.payload->>'amount')::NUMERIC;
+            v_embedded_payment := COALESCE(
+                v_cs_resource->'attributes'->'payments'->0,
+                v_webhook.payload->'payments'->0
+            );
+            v_embedded_pay_attrs := COALESCE(
+                v_embedded_payment->'attributes',
+                v_embedded_payment
+            );
+
+            v_trusted_payment_id := NULLIF(trim(COALESCE(
+                v_embedded_payment->>'id',
+                ''
+            )), '');
+
+            IF v_embedded_pay_attrs ? 'amount' THEN
+                v_trusted_amount := ((v_embedded_pay_attrs->>'amount')::NUMERIC / 100.00);
+            END IF;
+
+            v_trusted_currency := upper(NULLIF(trim(COALESCE(
+                v_embedded_pay_attrs->>'currency',
+                ''
+            )), ''));
+
+            v_trusted_status := lower(NULLIF(trim(COALESCE(
+                v_embedded_pay_attrs->>'status',
+                ''
+            )), ''));
+        END;
+    ELSE
+        v_trusted_payment_id := NULLIF(trim(COALESCE(
+            v_webhook.payload->'data'->'attributes'->'data'->>'id',
+            v_webhook.payload->'data'->>'id',
+            v_webhook.payload->>'provider_payment_id',
+            v_webhook.payload->>'payment_id',
+            ''
+        )), '');
+
+        v_trusted_session_id := NULLIF(trim(COALESCE(
+            v_webhook.payload->'data'->'attributes'->'data'->'attributes'->>'checkout_session_id',
+            v_webhook.payload->'data'->'attributes'->'data'->'attributes'->'metadata'->>'checkout_session_id',
+            v_webhook.payload->'data'->'attributes'->>'checkout_session_id',
+            v_webhook.payload->'data'->'attributes'->'metadata'->>'checkout_session_id',
+            v_webhook.payload->'data'->>'checkout_session_id',
+            v_webhook.payload->>'checkout_session_id',
+            ''
+        )), '');
+
+        IF v_webhook.payload->'data'->'attributes'->'data'->'attributes' ? 'amount' THEN
+            v_trusted_amount := ((v_webhook.payload->'data'->'attributes'->'data'->'attributes'->>'amount')::NUMERIC / 100.00);
+        ELSIF v_webhook.payload->'data'->'attributes' ? 'amount' THEN
+            v_trusted_amount := ((v_webhook.payload->'data'->'attributes'->>'amount')::NUMERIC / 100.00);
+        ELSIF v_webhook.payload ? 'captured_amount' THEN
+            v_trusted_amount := (v_webhook.payload->>'captured_amount')::NUMERIC;
+        ELSIF v_webhook.payload ? 'amount' THEN
+            IF (v_webhook.payload->>'amount')::NUMERIC >= 10000 THEN
+                v_trusted_amount := ((v_webhook.payload->>'amount')::NUMERIC / 100.00);
+            ELSE
+                v_trusted_amount := (v_webhook.payload->>'amount')::NUMERIC;
+            END IF;
         END IF;
+
+        v_trusted_currency := upper(NULLIF(trim(COALESCE(
+            v_webhook.payload->'data'->'attributes'->'data'->'attributes'->>'currency',
+            v_webhook.payload->'data'->'attributes'->>'currency',
+            v_webhook.payload->>'currency',
+            ''
+        )), ''));
+
+        v_trusted_status := lower(NULLIF(trim(COALESCE(
+            v_webhook.payload->'data'->'attributes'->'data'->'attributes'->>'status',
+            v_webhook.payload->'data'->'attributes'->>'status',
+            v_webhook.payload->>'status',
+            ''
+        )), ''));
     END IF;
-
-    v_trusted_currency := upper(NULLIF(trim(COALESCE(
-        v_webhook.payload->'data'->'attributes'->'data'->'attributes'->>'currency',
-        v_webhook.payload->'data'->'attributes'->>'currency',
-        v_webhook.payload->>'currency',
-        ''
-    )), ''));
-
-    v_trusted_status := lower(NULLIF(trim(COALESCE(
-        v_webhook.payload->'data'->'attributes'->'data'->'attributes'->>'status',
-        v_webhook.payload->'data'->'attributes'->>'status',
-        v_webhook.payload->>'status',
-        ''
-    )), ''));
 
     IF v_trusted_payment_id IS NULL THEN
         RAISE EXCEPTION 'Missing trusted evidence: Webhook payload does not contain provider payment identity.';
