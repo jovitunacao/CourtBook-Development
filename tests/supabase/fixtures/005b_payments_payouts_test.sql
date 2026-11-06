@@ -881,6 +881,299 @@ BEGIN
         WHERE id = v_pay_amount_test;
         v_test_count := v_test_count + 1;
         RAISE NOTICE 'Test 22h PASSED: Legitimate partial refund followed by full refund completed successfully.';
+
+        -- ---------------------------------------------------------------------
+        -- TEST 23: Commission Snapshot Validation against Platform Config
+        -- ---------------------------------------------------------------------
+        -- 23a: Non-standard commission rate (0.1000 instead of 0.0500) must be rejected
+        BEGIN
+            INSERT INTO public.payments (
+                organization_id, facility_id, reservation_id, expected_amount,
+                commission_rate, commission_amount, owner_gross_share, status
+            ) VALUES (
+                v_synth_org_b, v_synth_fac_b, v_synth_res_b,
+                400.00, 0.1000, 40.00, 360.00, 'pending'
+            );
+            RAISE EXCEPTION 'Test 23a Failed: Non-standard commission rate was not rejected!';
+        EXCEPTION WHEN OTHERS THEN
+            IF SQLERRM LIKE '%Commission rate tampering rejected%' THEN
+                v_test_count := v_test_count + 1;
+                RAISE NOTICE 'Test 23a PASSED: Non-standard commission rate strictly rejected.';
+            ELSE
+                RAISE EXCEPTION 'Test 23a Failed with unexpected error: %', SQLERRM;
+            END IF;
+        END;
+
+        -- 23b: Manipulated commission amount must be rejected
+        BEGIN
+            INSERT INTO public.payments (
+                organization_id, facility_id, reservation_id, expected_amount,
+                commission_rate, commission_amount, owner_gross_share, status
+            ) VALUES (
+                v_synth_org_b, v_synth_fac_b, v_synth_res_b,
+                400.00, 0.0500, 50.00, 350.00, 'pending'
+            );
+            RAISE EXCEPTION 'Test 23b Failed: Manipulated commission amount was not rejected!';
+        EXCEPTION WHEN OTHERS THEN
+            IF SQLERRM LIKE '%Commission amount mismatch%' THEN
+                v_test_count := v_test_count + 1;
+                RAISE NOTICE 'Test 23b PASSED: Manipulated commission amount strictly rejected.';
+            ELSE
+                RAISE EXCEPTION 'Test 23b Failed with unexpected error: %', SQLERRM;
+            END IF;
+        END;
+
+        -- 23c: Manipulated owner share must be rejected
+        BEGIN
+            INSERT INTO public.payments (
+                organization_id, facility_id, reservation_id, expected_amount,
+                commission_rate, commission_amount, owner_gross_share, status
+            ) VALUES (
+                v_synth_org_b, v_synth_fac_b, v_synth_res_b,
+                400.00, 0.0500, 20.00, 300.00, 'pending'
+            );
+            RAISE EXCEPTION 'Test 23c Failed: Manipulated owner share was not rejected!';
+        EXCEPTION WHEN OTHERS THEN
+            IF SQLERRM LIKE '%Owner gross share mismatch%' OR SQLERRM LIKE '%chk_payment_amount_split%' THEN
+                v_test_count := v_test_count + 1;
+                RAISE NOTICE 'Test 23c PASSED: Manipulated owner gross share strictly rejected.';
+            ELSE
+                RAISE EXCEPTION 'Test 23c Failed with unexpected error: %', SQLERRM;
+            END IF;
+        END;
+
+        -- ---------------------------------------------------------------------
+        -- TEST 24: Payment Intent Identity & Capture Evidence Immutability
+        -- ---------------------------------------------------------------------
+        DECLARE
+            v_pay_intent_test UUID := gen_random_uuid();
+        BEGIN
+            INSERT INTO public.payments (
+                id, organization_id, facility_id, reservation_id, expected_amount,
+                commission_rate, commission_amount, owner_gross_share, status,
+                provider_payment_intent_id, verified_capture_evidence
+            ) VALUES (
+                v_pay_intent_test, v_synth_org_b, v_synth_fac_b, v_synth_res_b,
+                400.00, 0.0500, 20.00, 380.00, 'pending',
+                'pi_test_established_01', jsonb_build_object('hold_id', 'h_01', 'ref', 'REF01')
+            );
+
+            -- 24a: Altering established provider_payment_intent_id must be rejected
+            BEGIN
+                UPDATE public.payments
+                SET provider_payment_intent_id = 'pi_tampered_02'
+                WHERE id = v_pay_intent_test;
+                RAISE EXCEPTION 'Test 24a Failed: Altering provider_payment_intent_id was not rejected!';
+            EXCEPTION WHEN OTHERS THEN
+                IF SQLERRM LIKE '%established provider identity fields in payments table are strictly immutable%' THEN
+                    v_test_count := v_test_count + 1;
+                    RAISE NOTICE 'Test 24a PASSED: Altering provider_payment_intent_id strictly rejected.';
+                ELSE
+                    RAISE EXCEPTION 'Test 24a Failed with unexpected error: %', SQLERRM;
+                END IF;
+            END;
+
+            -- 24b: Truncating or removing existing keys from verified_capture_evidence must fail
+            BEGIN
+                UPDATE public.payments
+                SET verified_capture_evidence = jsonb_build_object('new_key_only', 'data')
+                WHERE id = v_pay_intent_test;
+                RAISE EXCEPTION 'Test 24b Failed: Truncating verified_capture_evidence was not rejected!';
+            EXCEPTION WHEN OTHERS THEN
+                IF SQLERRM LIKE '%Evidence tampering rejected: verified_capture_evidence cannot have existing keys removed or altered%' THEN
+                    v_test_count := v_test_count + 1;
+                    RAISE NOTICE 'Test 24b PASSED: Truncating verified_capture_evidence strictly rejected.';
+                ELSE
+                    RAISE EXCEPTION 'Test 24b Failed with unexpected error: %', SQLERRM;
+                END IF;
+            END;
+        END;
+
+        -- ---------------------------------------------------------------------
+        -- TEST 25: Terminal Payment Mutation Freeze
+        -- ---------------------------------------------------------------------
+        -- 25a: Attempting any update on terminal 'refunded' payment must fail
+        BEGIN
+            UPDATE public.payments
+            SET notes = 'Attempted note edit on refunded payment'
+            WHERE id = v_pay_amount_test;
+        EXCEPTION WHEN undefined_column THEN
+            -- Attempt update on existing column
+            BEGIN
+                UPDATE public.payments
+                SET currency = 'PHP'
+                WHERE id = v_pay_amount_test;
+                RAISE EXCEPTION 'Test 25a Failed: Mutation on terminal refunded payment was not rejected!';
+            EXCEPTION WHEN OTHERS THEN
+                IF SQLERRM LIKE '%is in terminal status "refunded" and cannot be modified%' THEN
+                    v_test_count := v_test_count + 1;
+                    RAISE NOTICE 'Test 25a PASSED: Mutation on terminal refunded payment strictly frozen.';
+                ELSE
+                    RAISE EXCEPTION 'Test 25a Failed with unexpected error: %', SQLERRM;
+                END IF;
+            END;
+        END;
+
+        -- ---------------------------------------------------------------------
+        -- TEST 26: Payout Lifecycle Logs Composite Consistency & Append-Only Trigger
+        -- ---------------------------------------------------------------------
+        DECLARE
+            v_payout_test_id UUID := gen_random_uuid();
+            v_log_id UUID := gen_random_uuid();
+        BEGIN
+            -- Insert valid payout for Org A
+            INSERT INTO public.payouts (
+                id, organization_id, payout_method_id, amount, status
+            ) VALUES (
+                v_payout_test_id, v_synth_org_a, v_payout_method_id_a, 500.00, 'pending_request'
+            );
+
+            -- 26a: Insert log with mismatched organization must be rejected by composite FK
+            BEGIN
+                INSERT INTO public.payout_lifecycle_logs (
+                    id, payout_id, organization_id, from_status, to_status
+                ) VALUES (
+                    v_log_id, v_payout_test_id, v_synth_org_b, 'pending_request', 'approved_reserved'
+                );
+                RAISE EXCEPTION 'Test 26a Failed: Cross-organization payout log was not rejected!';
+            EXCEPTION WHEN foreign_key_violation THEN
+                v_test_count := v_test_count + 1;
+                RAISE NOTICE 'Test 26a PASSED: Composite foreign key fk_payout_lifecycle_logs_payout_org rejected cross-tenant log.';
+            END;
+
+            -- 26b: Update on payout_lifecycle_logs must be rejected by append-only trigger
+            BEGIN
+                UPDATE public.payout_lifecycle_logs
+                SET to_status = 'tampered'
+                WHERE payout_id = v_payout_test_id;
+                RAISE EXCEPTION 'Test 26b Failed: UPDATE on payout_lifecycle_logs was not rejected!';
+            EXCEPTION WHEN OTHERS THEN
+                IF SQLERRM LIKE '%Payout lifecycle audit records are append-only and strictly immutable%' THEN
+                    v_test_count := v_test_count + 1;
+                    RAISE NOTICE 'Test 26b PASSED: UPDATE on payout_lifecycle_logs rejected by append-only trigger.';
+                ELSE
+                    RAISE EXCEPTION 'Test 26b Failed with unexpected error: %', SQLERRM;
+                END IF;
+            END;
+
+            -- 26c: DELETE on payout_lifecycle_logs must be rejected by append-only trigger
+            BEGIN
+                DELETE FROM public.payout_lifecycle_logs
+                WHERE payout_id = v_payout_test_id;
+                RAISE EXCEPTION 'Test 26c Failed: DELETE on payout_lifecycle_logs was not rejected!';
+            EXCEPTION WHEN OTHERS THEN
+                IF SQLERRM LIKE '%Payout lifecycle audit records are append-only and strictly immutable%' THEN
+                    v_test_count := v_test_count + 1;
+                    RAISE NOTICE 'Test 26c PASSED: DELETE on payout_lifecycle_logs rejected by append-only trigger.';
+                ELSE
+                    RAISE EXCEPTION 'Test 26c Failed with unexpected error: %', SQLERRM;
+                END IF;
+            END;
+
+            -- -----------------------------------------------------------------
+            -- TEST 27: Payout Journal Links Composite Foreign Key & Type Validation
+            -- -----------------------------------------------------------------
+            DECLARE
+                v_ft_res_a UUID := gen_random_uuid();
+                v_ft_res_b UUID := gen_random_uuid();
+                v_ft_wrong_type UUID := gen_random_uuid();
+                v_ft_term_a UUID := gen_random_uuid();
+            BEGIN
+                -- Provision mock financial transactions adhering to 005a1 schema
+                INSERT INTO public.financial_transactions (
+                    id, organization_id, facility_id, transaction_type,
+                    idempotency_key, reference_id, description, canonical_payload_hash
+                ) VALUES (
+                    v_ft_res_a, v_synth_org_a, v_synth_fac_a, 'payout_reserve',
+                    'idem_ft_res_a_01', v_payout_test_id, 'Test Payout Reserve Org A', md5('payload_res_a')
+                ), (
+                    v_ft_res_b, v_synth_org_b, v_synth_fac_b, 'payout_reserve',
+                    'idem_ft_res_b_01', gen_random_uuid(), 'Test Payout Reserve Org B', md5('payload_res_b')
+                ), (
+                    v_ft_wrong_type, v_synth_org_a, v_synth_fac_a, 'booking_settlement',
+                    'idem_ft_wrong_01', gen_random_uuid(), 'Test Booking Settlement', md5('payload_wrong')
+                ), (
+                    v_ft_term_a, v_synth_org_a, v_synth_fac_a, 'payout_disbursement',
+                    'idem_ft_term_a_01', v_payout_test_id, 'Test Payout Disbursement Org A', md5('payload_term_a')
+                );
+
+                -- 27a: Cross-organization journal reserve reference must fail FK constraint
+                BEGIN
+                    UPDATE public.payouts
+                    SET status = 'approved_reserved', journal_reserve_tx_id = v_ft_res_b
+                    WHERE id = v_payout_test_id;
+                    RAISE EXCEPTION 'Test 27a Failed: Cross-organization journal reserve was not rejected!';
+                EXCEPTION WHEN foreign_key_violation THEN
+                    v_test_count := v_test_count + 1;
+                    RAISE NOTICE 'Test 27a PASSED: Composite foreign key fk_payouts_journal_reserve_org rejected cross-tenant journal link.';
+                END;
+
+                -- 27b: Wrong transaction type for journal reserve must fail trigger validation
+                BEGIN
+                    UPDATE public.payouts
+                    SET status = 'approved_reserved', journal_reserve_tx_id = v_ft_wrong_type
+                    WHERE id = v_payout_test_id;
+                    RAISE EXCEPTION 'Test 27b Failed: Wrong transaction type for journal reserve was not rejected!';
+                EXCEPTION WHEN OTHERS THEN
+                    IF SQLERRM LIKE '%Must reference an existing financial_transaction of type "payout_reserve"%' THEN
+                        v_test_count := v_test_count + 1;
+                        RAISE NOTICE 'Test 27b PASSED: Non-payout_reserve transaction type rejected for journal_reserve_tx_id.';
+                    ELSE
+                        RAISE EXCEPTION 'Test 27b Failed with unexpected error: %', SQLERRM;
+                    END IF;
+                END;
+
+                -- Legitimate transition to approved_reserved with valid journal_reserve_tx_id
+                UPDATE public.payouts
+                SET status = 'approved_reserved', journal_reserve_tx_id = v_ft_res_a
+                WHERE id = v_payout_test_id;
+
+                -- Transition to submitted_to_provider
+                UPDATE public.payouts
+                SET status = 'submitted_to_provider', provider_payout_id = 'payout_prov_001'
+                WHERE id = v_payout_test_id;
+
+                -- 27c: Wrong transaction type for terminal paid payout must fail trigger validation
+                BEGIN
+                    UPDATE public.payouts
+                    SET status = 'paid', journal_terminal_tx_id = v_ft_wrong_type
+                    WHERE id = v_payout_test_id;
+                    RAISE EXCEPTION 'Test 27c Failed: Wrong transaction type for terminal paid payout was not rejected!';
+                EXCEPTION WHEN OTHERS THEN
+                    IF SQLERRM LIKE '%Terminal journal mismatch: Successful paid payout must reference transaction type "payout_disbursement"%' THEN
+                        v_test_count := v_test_count + 1;
+                        RAISE NOTICE 'Test 27c PASSED: Terminal journal mismatch on paid payout strictly rejected.';
+                    ELSE
+                        RAISE EXCEPTION 'Test 27c Failed with unexpected error: %', SQLERRM;
+                    END IF;
+                END;
+
+                -- Legitimate transition to paid
+                UPDATE public.payouts
+                SET status = 'paid', journal_terminal_tx_id = v_ft_term_a
+                WHERE id = v_payout_test_id;
+                v_test_count := v_test_count + 1;
+                RAISE NOTICE 'Test 27d PASSED: Valid payout full lifecycle transition to paid completed.';
+
+                -- -------------------------------------------------------------
+                -- TEST 28: Payout Terminal State Freeze
+                -- -------------------------------------------------------------
+                -- 28a: Attempting any update on terminal 'paid' payout must fail
+                BEGIN
+                    UPDATE public.payouts
+                    SET failure_reason = 'Attempted alteration after paid'
+                    WHERE id = v_payout_test_id;
+                    RAISE EXCEPTION 'Test 28a Failed: Mutation on terminal paid payout was not rejected!';
+                EXCEPTION WHEN OTHERS THEN
+                    IF SQLERRM LIKE '%is in terminal status "paid" and cannot be modified%' THEN
+                        v_test_count := v_test_count + 1;
+                        RAISE NOTICE 'Test 28a PASSED: Mutation on terminal paid payout strictly frozen.';
+                    ELSE
+                        RAISE EXCEPTION 'Test 28a Failed with unexpected error: %', SQLERRM;
+                    END IF;
+                END;
+            END;
+        END;
     END;
 
     RAISE NOTICE '=== ALL % DATABASE TESTS COMPLETED SUCCESSFULLY ===', v_test_count;
@@ -953,6 +1246,40 @@ BEGIN
 END $$;
 RESET ROLE;
 
+-- 20f: Staff User CANNOT query public.payouts table (RLS returns 0 rows)
+SET LOCAL ROLE authenticated;
+DO $$
+DECLARE
+    v_staff_uid UUID := current_setting('app.test_staff_a_uid', true)::UUID;
+    v_count INT;
+BEGIN
+    PERFORM set_config('request.jwt.claim.sub', v_staff_uid::text, true);
+
+    SELECT count(*) INTO v_count FROM public.payouts;
+    IF v_count != 0 THEN
+        RAISE EXCEPTION 'Security Breach: staff role was able to view % records in payouts!', v_count;
+    END IF;
+    RAISE NOTICE 'Test 20f PASSED: RLS blocked staff role from querying sensitive payouts table (0 rows returned).';
+END $$;
+RESET ROLE;
+
+-- 20g: Staff User CANNOT query public.payout_lifecycle_logs table (RLS returns 0 rows)
+SET LOCAL ROLE authenticated;
+DO $$
+DECLARE
+    v_staff_uid UUID := current_setting('app.test_staff_a_uid', true)::UUID;
+    v_count INT;
+BEGIN
+    PERFORM set_config('request.jwt.claim.sub', v_staff_uid::text, true);
+
+    SELECT count(*) INTO v_count FROM public.payout_lifecycle_logs;
+    IF v_count != 0 THEN
+        RAISE EXCEPTION 'Security Breach: staff role was able to view % records in payout_lifecycle_logs!', v_count;
+    END IF;
+    RAISE NOTICE 'Test 20g PASSED: RLS blocked staff role from querying payout_lifecycle_logs (0 rows returned).';
+END $$;
+RESET ROLE;
+
 -- 20c: Authenticated Owner of Org A can retrieve expected masked payout details
 SET LOCAL ROLE authenticated;
 DO $$
@@ -973,6 +1300,29 @@ BEGIN
         RAISE EXCEPTION 'Data Masking Failure: Account number (%) is not properly masked!', v_masked_acc;
     END IF;
     RAISE NOTICE 'Test 20c PASSED: Authenticated owner successfully retrieved masked payout methods (% rows, masked: %).', v_count, v_masked_acc;
+END $$;
+RESET ROLE;
+
+-- 20h: Authenticated Owner of Org A CAN query payouts and payout_lifecycle_logs
+SET LOCAL ROLE authenticated;
+DO $$
+DECLARE
+    v_owner_a_uid UUID := current_setting('app.test_owner_a_uid', true)::UUID;
+    v_payout_count INT;
+    v_log_count INT;
+BEGIN
+    PERFORM set_config('request.jwt.claim.sub', v_owner_a_uid::text, true);
+
+    SELECT count(*) INTO v_payout_count FROM public.payouts;
+    SELECT count(*) INTO v_log_count FROM public.payout_lifecycle_logs;
+
+    IF v_payout_count < 1 THEN
+        RAISE EXCEPTION 'Access Failure: Owner was unable to view own payouts (found %)!', v_payout_count;
+    END IF;
+    IF v_log_count < 1 THEN
+        RAISE EXCEPTION 'Access Failure: Owner was unable to view own payout lifecycle logs (found %)!', v_log_count;
+    END IF;
+    RAISE NOTICE 'Test 20h PASSED: Authenticated owner successfully queried payouts (% rows) and logs (% rows).', v_payout_count, v_log_count;
 END $$;
 RESET ROLE;
 
@@ -1016,3 +1366,4 @@ RESET ROLE;
 
 -- Rollback entire synthetic test fixture: leaves persistent database pristine
 ROLLBACK;
+

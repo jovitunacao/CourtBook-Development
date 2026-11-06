@@ -1,33 +1,44 @@
 -- ==============================================================================
 -- CourtBook / BookSuite — Database Schema Migration
 -- Migration: 005b_payments_payouts_infrastructure.sql
--- Description: Phase 4.2.3 Payment & Payout Infrastructure (Security Hardened)
+-- Description: Phase 4.2.3 Payment & Payout Infrastructure (Hardened Security Edition)
 --
 -- FOUNDATION:
---   Built upon Migrations 001 through 005A and 005a1.
+--   Built upon Migrations 001 through 005A, 005a1, and 005a2.
 --   Preserves the 5% platform commission rate and 11-account double-entry journal foundation.
 --
--- OBJECTIVES & SECURITY REVIEW CORRECTIONS:
---   1. Composite cross-tenant payout method constraint: payouts.payout_method_id must belong to payouts.organization_id.
---   2. Composite cross-tenant settlement item constraint: settlement_items.payment_id, organization_id, facility_id
---      must match payments. (facility_id NOT NULL).
---   3. Strict immutability of payment snapshots (expected_amount, commission_rate, commission_amount, owner_gross_share,
---      organization_id, facility_id, reservation_id, currency, provider identity) on ALL updates.
---   4. Permanent payment capture uniqueness across full lifecycle:
---      uq_captured_payment_lifecycle_per_reservation covering ('captured', 'partially_refunded', 'refunded', 'disputed').
---   5. Hardened payment and payout transitions: required explicit captured_amount matching expected_amount;
---      immutable payout amount and destination.
---   6. Webhook evidence immutability: provider identity, original received_at, event_timestamp, signature evidence,
---      payload, and payload_hash strictly protected against alteration.
---   7. Payout destination security: RLS restricted to verified owner/admin roles; safe masked view provided;
---      provider_recipient_token column blocked from ordinary client access.
---   8. Zero client/service execution exposure: journal posting procedures remain blocked.
+-- OBJECTIVES & SECURITY REVIEW CORRECTIONS (PHASE 4.2.3):
+--   1. Payment Evidence Immutability & Provider Identity:
+--      - Protects provider_payment_id, provider_payment_intent_id, checkout_session_id,
+--        and capture_idempotency_key once bound.
+--      - Enforces that verified_capture_evidence cannot have established keys removed/altered.
+--      - Preserves initial checkout binding workflow executed by 005C.
+--   2. Authoritative Commission Snapshot Validation:
+--      - Validates commission_rate, commission_amount, and owner_gross_share at payment creation
+--        against platform_billing_config (5% standard rate).
+--   3. Composite Cross-Tenant Payout & Audit Integrity:
+--      - payouts.payout_method_id must belong to payouts.organization_id.
+--      - payout_lifecycle_logs composite FK enforces organization consistency with payouts.
+--      - payouts journal reserve/terminal links enforce organization consistency with financial_transactions.
+--   4. Terminal Record & Transition Finality:
+--      - Unconditional freeze on terminal payments ('failed', 'cancelled', 'refunded') and
+--        terminal payouts ('paid', 'failed', 'cancelled') against ANY update.
+--      - Same-status updates on terminal records strictly prohibited.
+--   5. Append-Only Payout Audit Trail:
+--      - payout_lifecycle_logs is made strictly append-only with unconditional BEFORE UPDATE OR DELETE trigger.
+--   6. Hardened Financial SELECT Policies:
+--      - Payout methods, payouts, and payout lifecycle logs restricted strictly to verified
+--        'owner' and 'admin' roles. Ordinary staff cannot access sensitive financial disbursement data.
+--   7. Webhook Evidence Immutability:
+--      - Raw payload, payload_hash, signature_header, and timestamps strictly protected.
+--   8. Zero-Trust Procedure Access:
+--      - Direct execution of financial journal procedures remains REVOKED from client/application roles.
 -- ==============================================================================
 
 BEGIN;
 
 -- ==============================================================================
--- 1. Platform Fee Policy Controls (Preserving Undecided Decisions)
+-- 1. Platform Fee Policy Controls (Preserving Undecided Policy Decisions)
 -- ==============================================================================
 CREATE TABLE IF NOT EXISTS public.platform_fee_policy_controls (
     id INT PRIMARY KEY DEFAULT 1 CHECK (id = 1), -- Strict singleton table
@@ -151,10 +162,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_payments_provider_payment_id
     ON public.payments (provider_name, provider_payment_id)
     WHERE provider_payment_id IS NOT NULL;
 
+-- Unique provider payment intent ID constraint when provider_payment_intent_id is present
+CREATE UNIQUE INDEX IF NOT EXISTS uq_payments_provider_intent_id
+    ON public.payments (provider_name, provider_payment_intent_id)
+    WHERE provider_payment_intent_id IS NOT NULL;
+
 -- Permanent capture uniqueness constraint across full lifecycle:
 -- Prevents duplicate captured payments per reservation across captured, refunded, partially_refunded, and disputed states.
--- Legitimate retry attempts before payment (pending, requires_action, processing, failed, cancelled) are not blocked.
--- If a booking is refunded, re-booking requires a new reservation record.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_captured_payment_lifecycle_per_reservation
     ON public.payments (reservation_id)
     WHERE status IN ('captured', 'partially_refunded', 'refunded', 'disputed');
@@ -168,6 +182,10 @@ CREATE OR REPLACE FUNCTION public.fn_validate_payment_status_transition()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
+DECLARE
+    v_config_comm_rate NUMERIC(5, 4);
+    v_expected_comm NUMERIC(10, 2);
+    v_expected_owner NUMERIC(10, 2);
 BEGIN
     -- 1. INSERT-TIME STATUS & FINANCIAL INTEGRITY VALIDATION
     IF TG_OP = 'INSERT' THEN
@@ -189,10 +207,40 @@ BEGIN
             RAISE EXCEPTION 'captured_at timestamp cannot be set at payment creation time.';
         END IF;
 
+        -- Authoritative Commission Rate & Snapshot Validation against platform_billing_config
+        SELECT default_commission_rate INTO v_config_comm_rate
+        FROM public.platform_billing_config
+        WHERE id = 1;
+
+        IF v_config_comm_rate IS NOT NULL AND NEW.commission_rate IS DISTINCT FROM v_config_comm_rate THEN
+            RAISE EXCEPTION 'Commission rate tampering rejected: Supplied rate % does not match configured platform commission rate %.',
+                NEW.commission_rate, v_config_comm_rate;
+        END IF;
+
+        v_expected_comm := round(NEW.expected_amount * NEW.commission_rate, 2);
+        v_expected_owner := NEW.expected_amount - v_expected_comm;
+
+        IF NEW.commission_amount IS DISTINCT FROM v_expected_comm THEN
+            RAISE EXCEPTION 'Commission amount mismatch: Supplied ₱% does not match calculated commission ₱% (rate % on ₱%).',
+                NEW.commission_amount, v_expected_comm, NEW.commission_rate, NEW.expected_amount;
+        END IF;
+
+        IF NEW.owner_gross_share IS DISTINCT FROM v_expected_owner THEN
+            RAISE EXCEPTION 'Owner gross share mismatch: Supplied ₱% does not match calculated owner share ₱%.',
+                NEW.owner_gross_share, v_expected_owner;
+        END IF;
+
         RETURN NEW;
     END IF;
 
-    -- 2. UPDATE-TIME IMMUTABILITY CHECKS
+    -- 2. TERMINAL STATE MUTATION PROTECTION
+    -- Terminal payments ('failed', 'cancelled', 'refunded') are 100% frozen against ANY update
+    IF OLD.status IN ('failed', 'cancelled', 'refunded') THEN
+        RAISE EXCEPTION 'Invalid payment mutation: payment % is in terminal status "%" and cannot be modified.',
+            OLD.id, OLD.status;
+    END IF;
+
+    -- 3. UPDATE-TIME IMMUTABILITY CHECKS
     -- Financial snapshot, tenant ownership, and established provider IDs are strictly immutable on EVERY update
     IF OLD.organization_id IS DISTINCT FROM NEW.organization_id OR
        OLD.facility_id IS DISTINCT FROM NEW.facility_id OR
@@ -205,20 +253,28 @@ BEGIN
        OLD.provider_name IS DISTINCT FROM NEW.provider_name OR
        OLD.created_at IS DISTINCT FROM NEW.created_at OR
        (OLD.provider_payment_id IS NOT NULL AND OLD.provider_payment_id IS DISTINCT FROM NEW.provider_payment_id) OR
+       (OLD.provider_payment_intent_id IS NOT NULL AND OLD.provider_payment_intent_id IS DISTINCT FROM NEW.provider_payment_intent_id) OR
        (OLD.checkout_session_id IS NOT NULL AND OLD.checkout_session_id IS DISTINCT FROM NEW.checkout_session_id) OR
-       (OLD.capture_idempotency_key IS NOT NULL AND OLD.capture_idempotency_key IS DISTINCT FROM NEW.capture_idempotency_key) THEN
+       (OLD.capture_idempotency_key IS NOT NULL AND OLD.capture_idempotency_key IS DISTINCT FROM NEW.capture_idempotency_key) OR
+       (OLD.captured_at IS NOT NULL AND OLD.captured_at IS DISTINCT FROM NEW.captured_at) THEN
         RAISE EXCEPTION 'Financial snapshot, ownership, and established provider identity fields in payments table are strictly immutable.';
     END IF;
 
+    -- Verified capture evidence monotonicity: Established evidence cannot be truncated or cleared
+    IF OLD.verified_capture_evidence IS NOT NULL AND OLD.verified_capture_evidence != '{}'::jsonb THEN
+        IF NOT (NEW.verified_capture_evidence @> OLD.verified_capture_evidence) THEN
+            RAISE EXCEPTION 'Evidence tampering rejected: verified_capture_evidence cannot have existing keys removed or altered.';
+        END IF;
+    END IF;
+
     -- Captured amount is strictly immutable once captured (including same-status updates)
-    IF (OLD.status IN ('captured', 'partially_refunded', 'refunded', 'disputed') OR OLD.captured_amount > 0.00) THEN
+    IF (OLD.status IN ('captured', 'partially_refunded', 'disputed') OR OLD.captured_amount > 0.00) THEN
         IF NEW.captured_amount IS DISTINCT FROM OLD.captured_amount THEN
             RAISE EXCEPTION 'Captured amount (₱%) is strictly immutable once captured.', OLD.captured_amount;
         END IF;
     END IF;
 
-    -- Refunded amount invariants on UPDATE:
-    -- Cannot decrease under any circumstances
+    -- Refunded amount invariants on UPDATE: Cannot decrease
     IF NEW.refunded_amount < OLD.refunded_amount THEN
         RAISE EXCEPTION 'Refunded amount cannot decrease (attempted reduction from ₱% to ₱%).', OLD.refunded_amount, NEW.refunded_amount;
     END IF;
@@ -228,7 +284,7 @@ BEGIN
         RAISE EXCEPTION 'Refunded amount (₱%) cannot exceed captured amount (₱%).', NEW.refunded_amount, NEW.captured_amount;
     END IF;
 
-    -- 3. If status unchanged, validate same-status constraints and exit
+    -- 4. If status unchanged, validate same-status constraints and exit
     IF OLD.status = NEW.status THEN
         -- If refunded_amount changed while status remains unchanged:
         IF NEW.refunded_amount IS DISTINCT FROM OLD.refunded_amount THEN
@@ -245,7 +301,7 @@ BEGIN
         RETURN NEW;
     END IF;
 
-    -- 4. Valid state transition rules
+    -- 5. Valid state transition rules
     IF OLD.status = 'pending' THEN
         IF NEW.status NOT IN ('requires_action', 'processing', 'captured', 'failed', 'cancelled') THEN
             RAISE EXCEPTION 'Invalid payment transition: cannot move from pending to %.', NEW.status;
@@ -262,8 +318,6 @@ BEGIN
         IF NEW.status NOT IN ('refunded', 'partially_refunded', 'disputed') THEN
             RAISE EXCEPTION 'Invalid payment transition: captured payment cannot transition to %.', NEW.status;
         END IF;
-    ELSIF OLD.status IN ('failed', 'cancelled', 'refunded') THEN
-        RAISE EXCEPTION 'Invalid payment transition: payment is in terminal status "%" and cannot be modified.', OLD.status;
     ELSIF OLD.status = 'partially_refunded' THEN
         IF NEW.status NOT IN ('refunded', 'disputed') THEN
             RAISE EXCEPTION 'Invalid payment transition: partially_refunded payment cannot transition to %.', NEW.status;
@@ -274,7 +328,7 @@ BEGIN
         END IF;
     END IF;
 
-    -- 5. Hardened Captured Evidence Invariants (do NOT silently default captured_amount)
+    -- 6. Hardened Captured Evidence Invariants (do NOT silently default captured_amount)
     IF NEW.status = 'captured' THEN
         IF NEW.captured_amount IS NULL OR NEW.captured_amount <= 0.00 THEN
             RAISE EXCEPTION 'Explicit verified captured_amount is required when marking payment captured.';
@@ -291,7 +345,7 @@ BEGIN
         END IF;
     END IF;
 
-    -- 6. Hardened Refund Transition Invariants
+    -- 7. Hardened Refund Transition Invariants
     IF NEW.status = 'refunded' THEN
         IF NEW.refunded_amount IS NULL OR NEW.refunded_amount <= 0.00 THEN
             NEW.refunded_amount := NEW.captured_amount;
@@ -517,9 +571,9 @@ CREATE TABLE IF NOT EXISTS public.payouts (
     fee_allocation_status VARCHAR(50) NOT NULL DEFAULT 'undecided'
         CHECK (fee_allocation_status IN ('undecided', 'absorbed_by_platform', 'deducted_from_owner')),
 
-    -- Journal Links
-    journal_reserve_tx_id UUID REFERENCES public.financial_transactions(id) ON DELETE RESTRICT,
-    journal_terminal_tx_id UUID REFERENCES public.financial_transactions(id) ON DELETE RESTRICT,
+    -- Journal Links with Composite Tenant Integrity (matches uq_financial_tx_id_org from 005a1)
+    journal_reserve_tx_id UUID,
+    journal_terminal_tx_id UUID,
 
     -- Timestamps
     requested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -530,12 +584,25 @@ CREATE TABLE IF NOT EXISTS public.payouts (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 
-    -- Composite Cross-Tenant Payout Method Foreign Key:
-    -- Guarantees that the payout_method_id strictly belongs to payouts.organization_id!
+    -- Composite Cross-Tenant Payout Method Foreign Key
     CONSTRAINT fk_payouts_method_org
         FOREIGN KEY (payout_method_id, organization_id)
         REFERENCES public.payout_methods(id, organization_id)
-        ON DELETE RESTRICT
+        ON DELETE RESTRICT,
+
+    -- Composite Cross-Tenant Journal Foreign Keys
+    CONSTRAINT fk_payouts_journal_reserve_org
+        FOREIGN KEY (journal_reserve_tx_id, organization_id)
+        REFERENCES public.financial_transactions(id, organization_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_payouts_journal_terminal_org
+        FOREIGN KEY (journal_terminal_tx_id, organization_id)
+        REFERENCES public.financial_transactions(id, organization_id)
+        ON DELETE RESTRICT,
+
+    -- Composite Uniqueness for Payout Lifecycle Logs
+    CONSTRAINT uq_payouts_id_org
+        UNIQUE (id, organization_id)
 );
 
 COMMENT ON TABLE public.payouts IS 'Owner disbursement records enforcing composite tenant destination and terminal finality.';
@@ -547,20 +614,45 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_payouts_provider_payout_id
 CREATE INDEX IF NOT EXISTS idx_payouts_org_status ON public.payouts (organization_id, status);
 
 
--- Payout Lifecycle Audit Log
+-- Payout Lifecycle Audit Log (Composite Organization Consistency)
 CREATE TABLE IF NOT EXISTS public.payout_lifecycle_logs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    payout_id UUID NOT NULL REFERENCES public.payouts(id) ON DELETE CASCADE,
+    payout_id UUID NOT NULL,
     organization_id UUID NOT NULL REFERENCES public.organizations(id) ON DELETE RESTRICT,
     from_status VARCHAR(50),
     to_status VARCHAR(50) NOT NULL,
     actor_id UUID REFERENCES auth.users(id) ON DELETE SET NULL,
     trigger_source VARCHAR(100) NOT NULL DEFAULT 'system',
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    -- Composite Foreign Key strictly enforcing organization consistency with referenced payout
+    CONSTRAINT fk_payout_lifecycle_logs_payout_org
+        FOREIGN KEY (payout_id, organization_id)
+        REFERENCES public.payouts(id, organization_id)
+        ON DELETE CASCADE
 );
 
-COMMENT ON TABLE public.payout_lifecycle_logs IS 'Immutable audit log of all payout status transitions.';
+COMMENT ON TABLE public.payout_lifecycle_logs IS 'Immutable audit log of all payout status transitions with composite organization consistency.';
+
+CREATE INDEX IF NOT EXISTS idx_payout_lifecycle_payout ON public.payout_lifecycle_logs (payout_id, created_at);
+
+
+-- Unconditional Append-Only Protection for Payout Lifecycle Logs
+CREATE OR REPLACE FUNCTION public.fn_protect_payout_lifecycle_logs_immutability()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RAISE EXCEPTION 'Payout lifecycle audit records are append-only and strictly immutable. UPDATE and DELETE operations are prohibited.';
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_protect_payout_lifecycle_logs_immutability ON public.payout_lifecycle_logs;
+CREATE TRIGGER trg_protect_payout_lifecycle_logs_immutability
+    BEFORE UPDATE OR DELETE ON public.payout_lifecycle_logs
+    FOR EACH ROW
+    EXECUTE FUNCTION public.fn_protect_payout_lifecycle_logs_immutability();
 
 
 -- Payout State Machine & Immutability Trigger (Runs BEFORE INSERT OR UPDATE)
@@ -568,6 +660,8 @@ CREATE OR REPLACE FUNCTION public.fn_validate_payout_status_transition()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
+DECLARE
+    v_journal_tx RECORD;
 BEGIN
     -- 1. INSERT-TIME STATUS & LIFECYCLE INITIALIZATION
     IF TG_OP = 'INSERT' THEN
@@ -580,10 +674,21 @@ BEGIN
             RAISE EXCEPTION 'Lifecycle timestamps cannot be set at payout creation time.';
         END IF;
 
+        IF NEW.journal_reserve_tx_id IS NOT NULL OR NEW.journal_terminal_tx_id IS NOT NULL THEN
+            RAISE EXCEPTION 'Journal transaction references cannot be set at payout creation time.';
+        END IF;
+
         RETURN NEW;
     END IF;
 
-    -- 2. UPDATE-TIME IMMUTABILITY CHECKS
+    -- 2. TERMINAL STATE MUTATION PROTECTION
+    -- Terminal payouts ('paid', 'failed', 'cancelled') are 100% frozen against ANY update
+    IF OLD.status IN ('paid', 'failed', 'cancelled') THEN
+        RAISE EXCEPTION 'Payout lifecycle violation: Payout % is in terminal status "%" and cannot be modified.',
+            OLD.id, OLD.status;
+    END IF;
+
+    -- 3. UPDATE-TIME IMMUTABILITY CHECKS
     -- Enforce immutability of amount, currency, organization_id, and destination method on EVERY update
     IF OLD.organization_id IS DISTINCT FROM NEW.organization_id OR
        OLD.payout_method_id IS DISTINCT FROM NEW.payout_method_id OR
@@ -591,8 +696,40 @@ BEGIN
        OLD.currency IS DISTINCT FROM NEW.currency OR
        OLD.created_at IS DISTINCT FROM NEW.created_at OR
        (OLD.provider_payout_id IS NOT NULL AND OLD.provider_payout_id IS DISTINCT FROM NEW.provider_payout_id) OR
-       (OLD.provider_reference IS NOT NULL AND OLD.provider_reference IS DISTINCT FROM NEW.provider_reference) THEN
-        RAISE EXCEPTION 'Payout amount, currency, organization, and destination method are strictly immutable once created.';
+       (OLD.provider_reference IS NOT NULL AND OLD.provider_reference IS DISTINCT FROM NEW.provider_reference) OR
+       (OLD.journal_reserve_tx_id IS NOT NULL AND OLD.journal_reserve_tx_id IS DISTINCT FROM NEW.journal_reserve_tx_id) THEN
+        RAISE EXCEPTION 'Payout amount, currency, organization, destination method, and reserve journal link are strictly immutable once created.';
+    END IF;
+
+    -- 4. Journal Reference Transaction Type Validation
+    IF NEW.journal_reserve_tx_id IS NOT NULL AND (OLD.journal_reserve_tx_id IS NULL OR OLD.journal_reserve_tx_id != NEW.journal_reserve_tx_id) THEN
+        SELECT transaction_type INTO v_journal_tx
+        FROM public.financial_transactions
+        WHERE id = NEW.journal_reserve_tx_id AND organization_id = NEW.organization_id;
+
+        IF NOT FOUND OR v_journal_tx.transaction_type != 'payout_reserve' THEN
+            RAISE EXCEPTION 'Invalid journal reserve transaction: Must reference an existing financial_transaction of type "payout_reserve" for organization %.',
+                NEW.organization_id;
+        END IF;
+    END IF;
+
+    IF NEW.journal_terminal_tx_id IS NOT NULL AND (OLD.journal_terminal_tx_id IS NULL OR OLD.journal_terminal_tx_id != NEW.journal_terminal_tx_id) THEN
+        SELECT transaction_type INTO v_journal_tx
+        FROM public.financial_transactions
+        WHERE id = NEW.journal_terminal_tx_id AND organization_id = NEW.organization_id;
+
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'Referenced terminal journal transaction % not found for organization %.',
+                NEW.journal_terminal_tx_id, NEW.organization_id;
+        END IF;
+
+        IF NEW.status = 'paid' AND v_journal_tx.transaction_type != 'payout_disbursement' THEN
+            RAISE EXCEPTION 'Terminal journal mismatch: Successful paid payout must reference transaction type "payout_disbursement" (got "%").',
+                v_journal_tx.transaction_type;
+        ELSIF NEW.status IN ('failed', 'cancelled') AND v_journal_tx.transaction_type != 'payout_failed_release' THEN
+            RAISE EXCEPTION 'Terminal journal mismatch: Failed/cancelled payout must reference transaction type "payout_failed_release" (got "%").',
+                v_journal_tx.transaction_type;
+        END IF;
     END IF;
 
     -- If status unchanged, update timestamp and exit
@@ -601,13 +738,7 @@ BEGIN
         RETURN NEW;
     END IF;
 
-    -- 3. Terminal State Protection: paid, failed, and cancelled are terminal and immutable
-    IF OLD.status IN ('paid', 'failed', 'cancelled') THEN
-        RAISE EXCEPTION 'Payout lifecycle violation: Payout % is in terminal status "%" and cannot be modified.',
-            OLD.id, OLD.status;
-    END IF;
-
-    -- 4. Valid state transition rules
+    -- 5. Valid state transition rules
     IF OLD.status = 'pending_request' THEN
         IF NEW.status NOT IN ('approved_reserved', 'cancelled', 'failed') THEN
             RAISE EXCEPTION 'Invalid payout transition: cannot move from pending_request to %.', NEW.status;
@@ -764,6 +895,7 @@ GRANT SELECT ON public.payout_lifecycle_logs TO authenticated;
 CREATE POLICY rls_fee_policy_select ON public.platform_fee_policy_controls
     FOR SELECT TO authenticated USING (true);
 
+-- Payments RLS: Staff, admins, and owners can view booking payments for their organization
 CREATE POLICY rls_payments_select ON public.payments
     FOR SELECT TO authenticated
     USING (
@@ -784,21 +916,24 @@ CREATE POLICY rls_payout_methods_select ON public.payout_methods
         )
     );
 
+-- Payouts Security: Restrict to verified owner/admin financial roles only!
+-- Ordinary staff members cannot SELECT sensitive disbursement payouts.
 CREATE POLICY rls_payouts_select ON public.payouts
     FOR SELECT TO authenticated
     USING (
         organization_id IN (
             SELECT om.organization_id FROM public.organization_members om
-            WHERE om.user_id = auth.uid()
+            WHERE om.user_id = auth.uid() AND om.role IN ('owner', 'admin')
         )
     );
 
+-- Payout Lifecycle Audit Logs: Restrict to verified owner/admin financial roles only!
 CREATE POLICY rls_payout_lifecycle_select ON public.payout_lifecycle_logs
     FOR SELECT TO authenticated
     USING (
         organization_id IN (
             SELECT om.organization_id FROM public.organization_members om
-            WHERE om.user_id = auth.uid()
+            WHERE om.user_id = auth.uid() AND om.role IN ('owner', 'admin')
         )
     );
 
