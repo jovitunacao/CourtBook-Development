@@ -140,23 +140,30 @@ export async function runWebhookSignatureTests(): Promise<{ passed: number; fail
     assert(rejected, 'Test 8: Xendit createCheckoutSession strictly rejected with NOT READY error');
   }
 
-  // Test 9: PayMongo adapter returns clearly marked sandbox simulation without active live keys
+  // Test 9: PayMongo adapter returns clearly marked sandbox simulation ONLY when explicitly configured
   {
-    const res = await adapter.createCheckoutSession({
-      amountCentavos: 35000,
-      currency: 'PHP',
-      description: 'CourtBook Booking',
-      customerName: 'Sandbox Booker',
-      referenceCode: 'CB-SANDBOX-001',
-      successUrl: 'https://courtbook.app/success',
-      cancelUrl: 'https://courtbook.app/cancel'
-    });
-    assert(
-      res.isSimulated === true &&
-      res.providerCheckoutId.startsWith('cs_sandbox_') &&
-      res.checkoutUrl.includes('test-checkout.paymongo.com'),
-      'Test 9: PayMongo adapter cleanly identifies simulated sandbox session with isSimulated: true'
-    );
+    const prevSim = process.env.ALLOW_PAYMENT_SIMULATION;
+    process.env.ALLOW_PAYMENT_SIMULATION = 'true';
+    try {
+      const res = await adapter.createCheckoutSession({
+        amountCentavos: 35000,
+        currency: 'PHP',
+        description: 'CourtBook Booking',
+        customerName: 'Sandbox Booker',
+        referenceCode: 'CB-SANDBOX-001',
+        successUrl: 'https://courtbook.app/success',
+        cancelUrl: 'https://courtbook.app/cancel'
+      });
+      assert(
+        res.isSimulated === true &&
+        res.providerCheckoutId.startsWith('cs_sandbox_') &&
+        res.checkoutUrl.includes('test-checkout.paymongo.com'),
+        'Test 9: PayMongo adapter cleanly identifies simulated sandbox session with isSimulated: true when explicitly enabled'
+      );
+    } finally {
+      if (prevSim === undefined) delete process.env.ALLOW_PAYMENT_SIMULATION;
+      else process.env.ALLOW_PAYMENT_SIMULATION = prevSim;
+    }
   }
 
   // Test 10: Manual test adapter cleanly registers and creates test checkout session
@@ -175,6 +182,34 @@ export async function runWebhookSignatureTests(): Promise<{ passed: number; fail
       res.isSimulated === true && res.providerCheckoutId.startsWith('cs_manual_'),
       'Test 10: Manual test adapter clearly separated and verified for disposable testing'
     );
+  }
+
+  // Test 11: Missing production PayMongo credentials fail closed
+  {
+    const prevKey = process.env.PAYMONGO_SECRET_KEY;
+    const prevSim = process.env.ALLOW_PAYMENT_SIMULATION;
+    delete process.env.PAYMONGO_SECRET_KEY;
+    delete process.env.ALLOW_PAYMENT_SIMULATION;
+    let failedClosed = false;
+    try {
+      await adapter.createCheckoutSession({
+        amountCentavos: 35000,
+        currency: 'PHP',
+        description: 'Prod Booking',
+        customerName: 'Prod User',
+        referenceCode: 'CB-PROD-001',
+        successUrl: 'https://courtbook.app/success',
+        cancelUrl: 'https://courtbook.app/cancel'
+      });
+    } catch (err: unknown) {
+      if (err instanceof Error && err.message.includes('PayMongo credentials error')) {
+        failedClosed = true;
+      }
+    } finally {
+      if (prevKey !== undefined) process.env.PAYMONGO_SECRET_KEY = prevKey;
+      if (prevSim !== undefined) process.env.ALLOW_PAYMENT_SIMULATION = prevSim;
+    }
+    assert(failedClosed, 'Test 11: Missing PayMongo credentials fail closed without automatic simulation fallback');
   }
 
   return { passed, failed, errors };

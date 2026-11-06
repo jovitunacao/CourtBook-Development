@@ -1,6 +1,6 @@
 ================================================================================
 CourtBook / BookSuite — Phase 4.2.4 Booking & Payment Integration Validation Gate
-Runtime Environment: Node.js v22.23.3 on Debian GNU/Linux 12 (bookworm)
+Runtime Environment: Node.js v22.23.2 on Debian GNU/Linux 12 (bookworm)
 Target Migration: supabase/migrations/005c_booking_payment_integration.sql
 Test Fixture: tests/supabase/fixtures/005c_integration_test.sql
 Execution Evidence Log: /app/applet/tests/supabase/reports/005c_execution_evidence.log
@@ -8,42 +8,42 @@ Execution Evidence Log: /app/applet/tests/supabase/reports/005c_execution_eviden
 
 Connected to disposable PostgreSQL engine:
 PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit
-Server Data Directory: /tmp/cb_005c_2216_1793753050726_data
-Server Socket Directory: /tmp/cb_005c_2216_1793753050726_sock (Port: 23255)
+Server Data Directory: /tmp/cb_005c_1841_1793962715226_data
+Server Socket Directory: /tmp/cb_005c_1841_1793962715226_sock (Port: 55419)
 
 --- Running Gate 1: Baseline Migrations 001-005B & Migration 005C Application ---
-[PASS] Gate 1: Baseline 001-005B Application & Migration 005C Execution (233ms): All baseline migrations and Migration 005C applied atomically within isolated disposable database.
+[PASS] Gate 1: Baseline 001-005B Application & Migration 005C Execution (94ms): All baseline migrations and Migration 005C applied atomically within isolated disposable database.
 
 --- Running Gate 2: Stored Procedures & Authorization Boundary Verification ---
-[PASS] Gate 2: Stored Procedures & Authorization Boundary Verification (7ms): All 8 005C integration procedures verified with SECURITY DEFINER and search_path hardening.
+[PASS] Gate 2: Stored Procedures & Authorization Boundary Verification (5ms): All 8 005C integration procedures verified with SECURITY DEFINER and search_path hardening.
 
 --- Running Gate 3: Webhook Signature Verification & Provider Adapter Unit Tests ---
-  All 10 signature and adapter tests passed successfully.
-[PASS] Gate 3: Webhook Signature & Adapter Tests (4ms): PayMongo HMAC-SHA256 signature algorithm, test/live mode, tolerance windows, tampering rejection, and Xendit isolation verified (10 passed).
+  All 11 signature and adapter tests passed successfully.
+[PASS] Gate 3: Webhook Signature & Adapter Tests (1ms): PayMongo HMAC-SHA256 signature algorithm, test/live mode, tolerance windows, tampering rejection, and Xendit isolation verified (11 passed).
 
 --- Running Gate 4: SQL Test Fixture Execution (Tests 1 through 25 — Comprehensive Suite) ---
-[PASS] Gate 4: SQL Test Fixture Execution (Tests 1-25) (178ms): All 25 integration tests passed: checkout hold binding, 5% commission snapshot, webhook reconciliation, customer refund liabilities, partial/full refunds, settlement clearing, and payout lifecycle.
+[PASS] Gate 4: SQL Test Fixture Execution (Tests 1-25) (66ms): All 25 integration tests passed: checkout hold binding, 5% commission snapshot, webhook reconciliation, customer refund liabilities, partial/full refunds, settlement clearing, and payout lifecycle.
 
 --- Running Gate 5: Multi-Session Concurrent PostgreSQL Race Tests ---
-  Verified 2 independent concurrent PostgreSQL sessions: Session 1 PID=2262, Session 2 PID=2263
+  Verified 2 independent concurrent PostgreSQL sessions: Session 1 PID=1887, Session 2 PID=1888
   5A PASSED: Concurrent checkout race safely resolved with exactly 1 winner and 1 slot collision rejection.
   5B PASSED: Concurrent payout overdraft race safely prevented over-withdrawal across 2 independent PostgreSQL sessions.
-[PASS] Gate 5: Multi-Session Concurrent PostgreSQL Race Tests (92ms): Concurrent slot checkout serialized (1 winner). Competing payout reserve overdraft prevented across 2 independent sessions (PIDs 2262, 2263).
+[PASS] Gate 5: Multi-Session Concurrent PostgreSQL Race Tests (33ms): Concurrent slot checkout serialized (1 winner). Competing payout reserve overdraft prevented across 2 independent sessions (PIDs 1887, 1888).
 
 --- Running Gate 6: Double-Entry Ledger Reconciliation & Invariant Check ---
   Double-entry ledger check: 100% of transactions balanced (Debits == Credits).
   Organization balances check: Zero negative balances detected across all accounts.
-[PASS] Gate 6: Double-Entry Ledger Reconciliation & Invariant Check (4ms): All transactions perfectly double-entry balanced. Zero negative balance violations.
+[PASS] Gate 6: Double-Entry Ledger Reconciliation & Invariant Check (0ms): All transactions perfectly double-entry balanced. Zero negative balance violations.
 
 ================================================================================
 COURTBOOK PHASE 4.2.4 VALIDATION GATE SUMMARY REPORT
 ================================================================================
-- [PASS] Gate 1: Baseline 001-005B Application & Migration 005C Execution (233ms)
-- [PASS] Gate 2: Stored Procedures & Authorization Boundary Verification (7ms)
-- [PASS] Gate 3: Webhook Signature & Adapter Tests (4ms)
-- [PASS] Gate 4: SQL Test Fixture Execution (Tests 1-25) (178ms)
-- [PASS] Gate 5: Multi-Session Concurrent PostgreSQL Race Tests (92ms)
-- [PASS] Gate 6: Double-Entry Ledger Reconciliation & Invariant Check (4ms)
+- [PASS] Gate 1: Baseline 001-005B Application & Migration 005C Execution (94ms)
+- [PASS] Gate 2: Stored Procedures & Authorization Boundary Verification (5ms)
+- [PASS] Gate 3: Webhook Signature & Adapter Tests (1ms)
+- [PASS] Gate 4: SQL Test Fixture Execution (Tests 1-25) (66ms)
+- [PASS] Gate 5: Multi-Session Concurrent PostgreSQL Race Tests (33ms)
+- [PASS] Gate 6: Double-Entry Ledger Reconciliation & Invariant Check (0ms)
 ================================================================================
 TOTAL GATES: 6 | PASS: 6 | FAIL: 0
 ================================================================================

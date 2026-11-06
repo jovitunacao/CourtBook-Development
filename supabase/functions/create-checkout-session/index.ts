@@ -113,6 +113,8 @@ serve(async (req: Request) => {
 
     // 3. Create Checkout Session via trusted Provider Adapter
     const paymongoSecretKey = Deno.env.get('PAYMONGO_SECRET_KEY') || '';
+    const appEnv = Deno.env.get('ENVIRONMENT') || Deno.env.get('NODE_ENV') || 'development';
+    const allowSimulation = Deno.env.get('ALLOW_PAYMENT_SIMULATION') === 'true';
     const appBaseUrl = Deno.env.get('APP_BASE_URL') || 'https://courtbook.app';
     const amountCentavos = Math.round(Number(data.expected_amount) * 100);
 
@@ -170,30 +172,64 @@ serve(async (req: Request) => {
       providerCheckoutId = pmJson.data.id;
       checkoutUrl = pmJson.data.attributes.checkout_url;
     } else {
-      // Clearly separated sandbox / development simulation mode
-      // Explicitly marked is_simulated: true to prevent any claim of active live gateway
+      // In production or when simulation is not explicitly configured, fail closed
+      if (appEnv === 'production' || !allowSimulation) {
+        return new Response(
+          JSON.stringify({
+            error: 'Missing production PayMongo credentials. Simulation is prohibited in production and requires explicit configuration.',
+            is_ready: false
+          }),
+          { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+
+      // Explicit development-only simulated sandbox mode
       isSimulated = true;
       providerCheckoutId = `cs_sandbox_${data.reference_code}`;
       checkoutUrl = `${appBaseUrl}/sandbox/checkout?cs=${providerCheckoutId}&ref=${data.reference_code}`;
     }
 
     // 4. Securely bind the returned provider checkout ID to the reservation and payment record
-    const { data: bindData, error: bindError } = await supabaseAdmin.rpc('bind_provider_checkout_session', {
-      p_payment_id: data.payment_id,
-      p_reservation_id: data.reservation_id,
-      p_provider_name: providerName,
-      p_checkout_session_id: providerCheckoutId,
-      p_checkout_url: checkoutUrl,
-      p_idempotency_key: `${idempotencyKey}_bind`,
-      p_metadata: {
-        is_simulated: isSimulated,
-        provider_session_id: providerCheckoutId,
-      },
-    });
+    // Includes secure retry / lookup recovery to prevent duplicate provider sessions if transient failure occurs
+    let bindSuccess = false;
+    let bindErrorMsg = '';
 
-    if (bindError) {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const { data: bindData, error: bindError } = await supabaseAdmin.rpc('bind_provider_checkout_session', {
+        p_payment_id: data.payment_id,
+        p_reservation_id: data.reservation_id,
+        p_provider_name: providerName,
+        p_checkout_session_id: providerCheckoutId,
+        p_checkout_url: checkoutUrl,
+        p_idempotency_key: `${idempotencyKey}_bind`,
+        p_metadata: {
+          is_simulated: isSimulated,
+          provider_session_id: providerCheckoutId,
+          attempt,
+        },
+      });
+
+      if (!bindError && bindData?.success) {
+        bindSuccess = true;
+        break;
+      }
+
+      bindErrorMsg = bindError?.message || 'Binding failed';
+      // If error indicates it is already bound to this session, treat as recovered success
+      if (bindErrorMsg.includes('already bound') || bindData?.status === 'already_bound') {
+        bindSuccess = true;
+        break;
+      }
+    }
+
+    if (!bindSuccess) {
       return new Response(
-        JSON.stringify({ error: `Checkout binding error: ${bindError.message}` }),
+        JSON.stringify({
+          error: `Checkout binding error after recovery retries: ${bindErrorMsg}`,
+          payment_id: data.payment_id,
+          reference_code: data.reference_code,
+          recovery_instruction: 'Retry request with same idempotency key to recover bound session without creating duplicate sessions.'
+        }),
         { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }

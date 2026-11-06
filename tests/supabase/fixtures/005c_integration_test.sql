@@ -304,6 +304,7 @@ BEGIN
                         'attributes', jsonb_build_object(
                             'amount', 35000,
                             'currency', 'PHP',
+                            'status', 'paid',
                             'checkout_session_id', 'cs_paymongo_test_001'
                         )
                     )
@@ -430,7 +431,7 @@ BEGIN
     ) VALUES (
         'paymongo', 'evt_mismatch_001', 'payment.paid', 'verified',
         't=1700000000,li=valid_hmac_hex', 'pending',
-        jsonb_build_object('data', jsonb_build_object('id', 'pay_prov_mismatch_001', 'attributes', jsonb_build_object('amount', 10000, 'currency', 'PHP', 'checkout_session_id', 'cs_paymongo_mismatch_001')))
+        jsonb_build_object('data', jsonb_build_object('id', 'pay_prov_mismatch_001', 'attributes', jsonb_build_object('amount', 10000, 'currency', 'PHP', 'status', 'paid', 'checkout_session_id', 'cs_paymongo_mismatch_001')))
     ) RETURNING id INTO v_wh_event_id;
 
     -- Send ₱100.00 instead of expected ₱350.00
@@ -514,7 +515,7 @@ BEGIN
     ) VALUES (
         'paymongo', 'evt_late_001', 'payment.paid', 'verified',
         't=1700000000,li=valid_hmac_hex', 'pending',
-        jsonb_build_object('data', jsonb_build_object('id', 'pay_prov_late_001', 'attributes', jsonb_build_object('amount', 35000, 'currency', 'PHP', 'checkout_session_id', 'cs_paymongo_late_001')))
+        jsonb_build_object('data', jsonb_build_object('id', 'pay_prov_late_001', 'attributes', jsonb_build_object('amount', 35000, 'currency', 'PHP', 'status', 'paid', 'checkout_session_id', 'cs_paymongo_late_001')))
     ) RETURNING id INTO v_wh_event_id;
 
     v_process_res := public.process_verified_payment_event(
@@ -592,13 +593,24 @@ BEGIN
     END;
 
     -- 31B: Unconfirmed provider status rejection
+    DECLARE
+        v_wh_pending_ref uuid;
     BEGIN
+        INSERT INTO public.provider_webhook_events (
+            provider_name, provider_event_id, event_type, signature_verification_status,
+            payload, processing_state
+        ) VALUES (
+            'paymongo', 'evt_refund_pending_001', 'payment.refunded', 'verified',
+            jsonb_build_object('provider_refund_id', 'ref_prov_pending_001', 'status', 'pending', 'amount', 350.00),
+            'pending'
+        ) RETURNING id INTO v_wh_pending_ref;
+
         PERFORM public.process_verified_refund_event(
             v_pay_id,
             350.00,
             'Customer cancellation',
             'ref_prov_pending_001',
-            jsonb_build_object('provider_refund_id', 'ref_prov_pending_001', 'status', 'pending'), -- NON-TERMINAL STATUS!
+            jsonb_build_object('webhook_event_id', v_wh_pending_ref, 'provider_refund_id', 'ref_prov_pending_001', 'status', 'pending'), -- NON-TERMINAL STATUS!
             'idem_refund_pending_ev_001',
             false
         );
@@ -615,12 +627,22 @@ BEGIN
     -- -------------------------------------------------------------------------
     -- TEST 12: Full Refund Reversal & Double-Entry Balance (With Verified Evidence)
     -- -------------------------------------------------------------------------
+    INSERT INTO public.provider_webhook_events (
+        provider_name, provider_event_id, event_type, signature_verification_status,
+        signature_header, processing_state, payload
+    ) VALUES (
+        'paymongo', 'evt_refund_juan_001', 'refund.succeeded', 'verified',
+        't=1700000000,li=valid_hmac_hex', 'pending',
+        jsonb_build_object('data', jsonb_build_object('id', 'ref_prov_juan_001', 'attributes', jsonb_build_object('amount', 35000, 'currency', 'PHP', 'status', 'succeeded')))
+    ) RETURNING id INTO v_wh_event_id;
+
     v_refund_res := public.process_verified_refund_event(
         v_pay_id,
         350.00,
         'Customer requested cancellation',
         'ref_prov_juan_001',
         jsonb_build_object(
+            'webhook_event_id', v_wh_event_id,
             'provider_refund_id', 'ref_prov_juan_001',
             'status', 'succeeded',
             'amount', 350.00,
@@ -677,7 +699,7 @@ BEGIN
     ) VALUES (
         'paymongo', 'evt_part_capture_001', 'payment.paid', 'verified',
         't=1700000000,li=valid_hmac_hex', 'pending',
-        jsonb_build_object('data', jsonb_build_object('id', 'pay_prov_part_001', 'attributes', jsonb_build_object('amount', 150000, 'currency', 'PHP', 'checkout_session_id', 'cs_paymongo_part_001')))
+        jsonb_build_object('data', jsonb_build_object('id', 'pay_prov_part_001', 'attributes', jsonb_build_object('amount', 150000, 'currency', 'PHP', 'status', 'paid', 'checkout_session_id', 'cs_paymongo_part_001')))
     ) RETURNING id INTO v_wh_event_id;
 
     PERFORM public.process_verified_payment_event(
@@ -692,12 +714,22 @@ BEGIN
     );
 
     -- Execute partial refund of ₱200.00 out of ₱1500.00 with verified evidence
+    INSERT INTO public.provider_webhook_events (
+        provider_name, provider_event_id, event_type, signature_verification_status,
+        signature_header, processing_state, payload
+    ) VALUES (
+        'paymongo', 'evt_refund_part_001', 'refund.succeeded', 'verified',
+        't=1700000000,li=valid_hmac_hex', 'pending',
+        jsonb_build_object('data', jsonb_build_object('id', 'ref_prov_part_001', 'attributes', jsonb_build_object('amount', 20000, 'currency', 'PHP', 'status', 'succeeded')))
+    ) RETURNING id INTO v_wh_event_id;
+
     v_partial_refund_res := public.process_verified_refund_event(
         v_pay_id,
         200.00,
         'Partial weather refund',
         'ref_prov_part_001',
         jsonb_build_object(
+            'webhook_event_id', v_wh_event_id,
             'provider_refund_id', 'ref_prov_part_001',
             'status', 'succeeded',
             'amount', 200.00
@@ -741,10 +773,10 @@ BEGIN
     -- -------------------------------------------------------------------------
     INSERT INTO public.settlement_batches (
         id, provider_name, provider_batch_id, settlement_date,
-        total_gross_amount, total_net_amount, total_fee_amount, status
+        total_gross_amount, total_net_amount, total_fee_amount, status, verified_at
     ) VALUES (
         gen_random_uuid(), 'paymongo', 'batch_005c_test_001', CURRENT_DATE,
-        1500.00, 1235.00, 0.00, 'pending_reconciliation'
+        1500.00, 1235.00, 265.00, 'pending_reconciliation', now()
     ) RETURNING id INTO v_batch_id;
 
     -- Attempt to clear batch for Org A when batch items do not exist for Org A
@@ -775,8 +807,8 @@ BEGIN
         id, batch_id, payment_id, provider_payment_id, organization_id, facility_id,
         gross_amount, provider_fee_amount, net_settled_amount, settlement_status
     ) VALUES (
-        gen_random_uuid(), v_batch_id, v_pay_id, 'pay_prov_part_001', v_synth_org_b, v_synth_fac_b,
-        1500.00, 0.00, 1235.00, 'matched'
+        gen_random_uuid(), v_batch_id, (SELECT id FROM public.payments WHERE provider_payment_id = 'pay_prov_part_001'), 'pay_prov_part_001', v_synth_org_b, v_synth_fac_b,
+        1500.00, 265.00, 1235.00, 'matched'
     );
 
     -- Caller requests ₱999.00 when verified items sum is ₱1,235.00
@@ -904,10 +936,20 @@ BEGIN
     -- -------------------------------------------------------------------------
     -- TEST 18: Payout Disbursement Confirmation & Duplicate Idempotency (With Evidence)
     -- -------------------------------------------------------------------------
+    INSERT INTO public.provider_webhook_events (
+        provider_name, provider_event_id, event_type, signature_verification_status,
+        signature_header, processing_state, payload
+    ) VALUES (
+        'paymongo', 'evt_payout_paid_001', 'payout.paid', 'verified',
+        't=1700000000,li=valid_hmac_hex', 'pending',
+        jsonb_build_object('data', jsonb_build_object('id', 'payout_prov_ref_999', 'attributes', jsonb_build_object('amount', 60000, 'currency', 'PHP', 'status', 'paid')))
+    ) RETURNING id INTO v_wh_event_id;
+
     PERFORM public.confirm_owner_payout_disbursement(
         v_payout_id,
         'payout_prov_ref_999',
         jsonb_build_object(
+            'webhook_event_id', v_wh_event_id,
             'provider_reference', 'payout_prov_ref_999',
             'disbursement_status', 'succeeded',
             'amount', 600.00,
@@ -924,7 +966,7 @@ BEGIN
     PERFORM public.confirm_owner_payout_disbursement(
         v_payout_id,
         'payout_prov_ref_999',
-        jsonb_build_object('provider_reference', 'payout_prov_ref_999', 'disbursement_status', 'succeeded'),
+        jsonb_build_object('webhook_event_id', v_wh_event_id, 'provider_reference', 'payout_prov_ref_999', 'disbursement_status', 'succeeded'),
         'idem_disburse_001'
     );
     v_test_count := v_test_count + 1;
@@ -961,10 +1003,20 @@ BEGIN
     -- -------------------------------------------------------------------------
     -- TEST 19: Payout Failure & Reserve Fund Restoration (With Authoritative Evidence)
     -- -------------------------------------------------------------------------
+    INSERT INTO public.provider_webhook_events (
+        provider_name, provider_event_id, event_type, signature_verification_status,
+        signature_header, processing_state, payload
+    ) VALUES (
+        'paymongo', 'evt_payout_failed_001', 'payout.failed', 'verified',
+        't=1700000000,li=valid_hmac_hex', 'pending',
+        jsonb_build_object('data', jsonb_build_object('id', 'payout_prov_fail_001', 'attributes', jsonb_build_object('status', 'failed', 'failure_code', 'ACCOUNT_NUMBER_INVALID')))
+    ) RETURNING id INTO v_wh_event_id;
+
     PERFORM public.fail_owner_payout_release(
         v_payout_id,
         'Invalid bank account details',
         jsonb_build_object(
+            'webhook_event_id', v_wh_event_id,
             'failure_code', 'ACCOUNT_NUMBER_INVALID',
             'provider_status', 'failed',
             'failed_at', now()
@@ -1023,6 +1075,277 @@ BEGIN
     END IF;
     v_test_count := v_test_count + 1;
     RAISE NOTICE 'Test 25 PASSED: Fee policies confirmed undecided.';
+
+    -- -------------------------------------------------------------------------
+    -- TEST 37: Forged Refund Success JSON Rejected
+    -- -------------------------------------------------------------------------
+    BEGIN
+        PERFORM public.process_verified_refund_event(
+            v_pay_id,
+            100.00,
+            'Forged refund',
+            'ref_forged_json_001',
+            jsonb_build_object('status', 'succeeded', 'provider_refund_id', 'ref_forged_json_001'),
+            'idem_forged_refund_json_001',
+            true
+        );
+        RAISE EXCEPTION 'Test 37 Failed: Forged refund success JSON was not rejected!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Authoritative verified webhook_event_id is required%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 37 PASSED: Forged refund success JSON strictly rejected.';
+        ELSE
+            RAISE EXCEPTION 'Test 37 Failed: Unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    -- -------------------------------------------------------------------------
+    -- TEST 38: Forged Payout Success JSON Rejected
+    -- -------------------------------------------------------------------------
+    BEGIN
+        PERFORM public.confirm_owner_payout_disbursement(
+            v_payout_id,
+            'payout_forged_json_001',
+            jsonb_build_object('status', 'paid', 'disbursement_status', 'succeeded', 'provider_reference', 'payout_forged_json_001'),
+            'idem_forged_payout_json_001'
+        );
+        RAISE EXCEPTION 'Test 38 Failed: Forged payout success JSON was not rejected!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Authoritative verified webhook_event_id is required%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 38 PASSED: Forged payout success JSON strictly rejected.';
+        ELSE
+            RAISE EXCEPTION 'Test 38 Failed: Unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    -- -------------------------------------------------------------------------
+    -- TEST 39: Forged Payout Failure Evidence Rejected
+    -- -------------------------------------------------------------------------
+    BEGIN
+        PERFORM public.fail_owner_payout_release(
+            v_payout_id,
+            'Forged failure',
+            jsonb_build_object('status', 'failed', 'failure_code', 'FORGED_CODE'),
+            'idem_forged_payout_fail_001'
+        );
+        RAISE EXCEPTION 'Test 39 Failed: Forged payout failure evidence was not rejected!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Authoritative verified webhook_event_id is required%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 39 PASSED: Forged payout failure evidence strictly rejected.';
+        ELSE
+            RAISE EXCEPTION 'Test 39 Failed: Unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    -- -------------------------------------------------------------------------
+    -- TEST 40: Missing Webhook Payment Identity Rejected
+    -- -------------------------------------------------------------------------
+    INSERT INTO public.provider_webhook_events (
+        provider_name, provider_event_id, event_type, signature_verification_status,
+        signature_header, processing_state, payload
+    ) VALUES (
+        'paymongo', 'evt_missing_pay_id_001', 'payment.paid', 'verified',
+        't=1700000000,li=valid_hmac_hex', 'pending',
+        jsonb_build_object('data', jsonb_build_object('attributes', jsonb_build_object('amount', 35000, 'currency', 'PHP', 'status', 'paid', 'checkout_session_id', 'cs_paymongo_test_001')))
+    ) RETURNING id INTO v_wh_event_id;
+
+    BEGIN
+        PERFORM public.process_verified_payment_event(
+            v_wh_event_id, 'paymongo', 'evt_missing_pay_id_001', 'pay_caller_fallback_001',
+            'cs_paymongo_test_001', 350.00, 'PHP', 'idem_missing_pay_id_001'
+        );
+        RAISE EXCEPTION 'Test 40 Failed: Missing webhook payment identity was not rejected!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Missing trusted evidence: Webhook payload does not contain provider payment identity%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 40 PASSED: Missing webhook payment identity strictly rejected.';
+        ELSE
+            RAISE EXCEPTION 'Test 40 Failed: Unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    -- -------------------------------------------------------------------------
+    -- TEST 41: Missing Trusted Webhook Amount Rejected
+    -- -------------------------------------------------------------------------
+    INSERT INTO public.provider_webhook_events (
+        provider_name, provider_event_id, event_type, signature_verification_status,
+        signature_header, processing_state, payload
+    ) VALUES (
+        'paymongo', 'evt_missing_amt_001', 'payment.paid', 'verified',
+        't=1700000000,li=valid_hmac_hex', 'pending',
+        jsonb_build_object('data', jsonb_build_object('id', 'pay_prov_noamt_001', 'attributes', jsonb_build_object('currency', 'PHP', 'status', 'paid', 'checkout_session_id', 'cs_paymongo_test_001')))
+    ) RETURNING id INTO v_wh_event_id;
+
+    BEGIN
+        PERFORM public.process_verified_payment_event(
+            v_wh_event_id, 'paymongo', 'evt_missing_amt_001', 'pay_prov_noamt_001',
+            'cs_paymongo_test_001', 350.00, 'PHP', 'idem_missing_amt_001'
+        );
+        RAISE EXCEPTION 'Test 41 Failed: Missing trusted webhook amount was not rejected!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Missing trusted evidence: Webhook payload does not contain a valid positive amount%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 41 PASSED: Missing trusted webhook amount strictly rejected.';
+        ELSE
+            RAISE EXCEPTION 'Test 41 Failed: Unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    -- -------------------------------------------------------------------------
+    -- TEST 42: Incorrect Event Type Rejected
+    -- -------------------------------------------------------------------------
+    INSERT INTO public.provider_webhook_events (
+        provider_name, provider_event_id, event_type, signature_verification_status,
+        signature_header, processing_state, payload
+    ) VALUES (
+        'paymongo', 'evt_bad_type_001', 'payment.failed', 'verified',
+        't=1700000000,li=valid_hmac_hex', 'pending',
+        jsonb_build_object('data', jsonb_build_object('id', 'pay_prov_badtype_001', 'attributes', jsonb_build_object('amount', 35000, 'currency', 'PHP', 'status', 'paid', 'checkout_session_id', 'cs_paymongo_test_001')))
+    ) RETURNING id INTO v_wh_event_id;
+
+    BEGIN
+        PERFORM public.process_verified_payment_event(
+            v_wh_event_id, 'paymongo', 'evt_bad_type_001', 'pay_prov_badtype_001',
+            'cs_paymongo_test_001', 350.00, 'PHP', 'idem_bad_type_001'
+        );
+        RAISE EXCEPTION 'Test 42 Failed: Incorrect event type was not rejected!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Unsupported webhook event type%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 42 PASSED: Incorrect event type strictly rejected.';
+        ELSE
+            RAISE EXCEPTION 'Test 42 Failed: Unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    -- -------------------------------------------------------------------------
+    -- TEST 43: Mixed-Tenant Settlement Batch Rejected
+    -- -------------------------------------------------------------------------
+    INSERT INTO public.settlement_batches (
+        id, provider_name, provider_batch_id, settlement_date,
+        total_gross_amount, total_net_amount, total_fee_amount, status, verified_at
+    ) VALUES (
+        gen_random_uuid(), 'paymongo', 'batch_mixed_tenant_001', CURRENT_DATE,
+        1500.00, 1235.00, 265.00, 'pending_reconciliation', now()
+    ) RETURNING id INTO v_batch_id;
+
+    -- Insert item for Org A into batch, then try to clear for Org B
+    INSERT INTO public.settlement_items (
+        id, batch_id, payment_id, provider_payment_id, organization_id, facility_id,
+        gross_amount, provider_fee_amount, net_settled_amount, settlement_status
+    ) VALUES (
+        gen_random_uuid(), v_batch_id, NULL, 'pay_prov_org_a_001', v_synth_org_a, v_synth_fac_a,
+        1500.00, 265.00, 1235.00, 'matched'
+    );
+
+    BEGIN
+        PERFORM public.process_settlement_clearing(
+            v_batch_id, v_synth_org_b, v_synth_fac_b, 1235.00,
+            'batch_mixed_tenant_001', 'idem_mixed_tenant_001'
+        );
+        RAISE EXCEPTION 'Test 43 Failed: Mixed-tenant settlement batch was not rejected!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Cross-tenant settlement violation%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 43 PASSED: Mixed-tenant settlement batch strictly rejected.';
+        ELSE
+            RAISE EXCEPTION 'Test 43 Failed: Unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    -- -------------------------------------------------------------------------
+    -- TEST 44: Settlement Batch With Incorrect Provider Totals Rejected
+    -- -------------------------------------------------------------------------
+    INSERT INTO public.settlement_batches (
+        id, provider_name, provider_batch_id, settlement_date,
+        total_gross_amount, total_net_amount, total_fee_amount, status, verified_at
+    ) VALUES (
+        gen_random_uuid(), 'paymongo', 'batch_bad_totals_001', CURRENT_DATE,
+        9999.00, 9000.00, 999.00, 'pending_reconciliation', now()
+    ) RETURNING id INTO v_batch_id;
+
+    INSERT INTO public.settlement_items (
+        id, batch_id, payment_id, provider_payment_id, organization_id, facility_id,
+        gross_amount, provider_fee_amount, net_settled_amount, settlement_status
+    ) VALUES (
+        gen_random_uuid(), v_batch_id, (SELECT id FROM public.payments WHERE provider_payment_id = 'pay_prov_part_001'), 'pay_prov_part_001', v_synth_org_b, v_synth_fac_b,
+        1500.00, 265.00, 1235.00, 'matched'
+    );
+
+    BEGIN
+        PERFORM public.process_settlement_clearing(
+            v_batch_id, v_synth_org_b, v_synth_fac_b, 1235.00,
+            'batch_bad_totals_001', 'idem_bad_totals_001'
+        );
+        RAISE EXCEPTION 'Test 44 Failed: Settlement batch with incorrect provider totals was not rejected!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Settlement batch gross total mismatch%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 44 PASSED: Settlement batch with incorrect provider totals strictly rejected.';
+        ELSE
+            RAISE EXCEPTION 'Test 44 Failed: Unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    -- -------------------------------------------------------------------------
+    -- TEST 45: Checkout Binding Failure Recovery Without Duplicate Payable Sessions
+    -- -------------------------------------------------------------------------
+    v_checkout_res := public.create_booking_checkout_session(
+        'idem_recovery_test_001',
+        v_synth_fac_a,
+        v_synth_court_a,
+        'Recovery Booker',
+        '09175556677',
+        'recovery@example.com',
+        (v_test_date + interval '2 days')::date,
+        (((v_test_date + interval '2 days')::date)::text || ' 09:00:00 Asia/Manila')::timestamptz,
+        60,
+        'paymongo'
+    );
+    v_pay_id := (v_checkout_res->>'payment_id')::UUID;
+    v_res_id := (v_checkout_res->>'reservation_id')::UUID;
+
+    -- Retry with same idempotency key recovers the same payment_id/reservation_id without creating a duplicate
+    v_dup_checkout := public.create_booking_checkout_session(
+        'idem_recovery_test_001',
+        v_synth_fac_a,
+        v_synth_court_a,
+        'Recovery Booker',
+        '09175556677',
+        'recovery@example.com',
+        (v_test_date + interval '2 days')::date,
+        (((v_test_date + interval '2 days')::date)::text || ' 09:00:00 Asia/Manila')::timestamptz,
+        60,
+        'paymongo'
+    );
+
+    IF (v_dup_checkout->>'payment_id')::UUID != v_pay_id OR (v_dup_checkout->>'idempotent_replayed')::BOOLEAN != true THEN
+        RAISE EXCEPTION 'Test 45 Failed: Retry did not recover the same payment record!';
+    END IF;
+
+    -- Bind the recovered session
+    PERFORM public.bind_provider_checkout_session(
+        v_pay_id, v_res_id, 'paymongo', 'cs_paymongo_recovered_001',
+        'https://test.com/recovered', 'idem_bind_recovered_001'
+    );
+
+    -- Attempting to bind a second different session to the same payment is blocked
+    BEGIN
+        PERFORM public.bind_provider_checkout_session(
+            v_pay_id, v_res_id, 'paymongo', 'cs_paymongo_duplicate_002',
+            'https://test.com/duplicate', 'idem_bind_duplicate_002'
+        );
+        RAISE EXCEPTION 'Test 45 Failed: Duplicate session binding was not blocked!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Rebinding is prohibited%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 45 PASSED: Checkout binding recovery succeeded and duplicate payable session binding blocked.';
+        ELSE
+            RAISE EXCEPTION 'Test 45 Failed: Unexpected error: %', SQLERRM;
+        END IF;
+    END;
 
     RAISE NOTICE '=== ALL % DATABASE TESTS COMPLETED SUCCESSFULLY ===', v_test_count;
 END $$;

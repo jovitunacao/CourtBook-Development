@@ -557,6 +557,7 @@ DECLARE
     v_trusted_session_id TEXT;
     v_trusted_amount NUMERIC(10, 2);
     v_trusted_currency VARCHAR(10);
+    v_trusted_status TEXT;
     v_existing_idemp RECORD;
 BEGIN
     -- 1. Validate Required Webhook Evidence Record (Zero unverified execution)
@@ -615,33 +616,30 @@ BEGIN
             v_webhook.provider_event_id, p_provider_event_id;
     END IF;
 
-    -- Idempotent bypass if already successfully processed
-    IF v_webhook.processing_state = 'processed' THEN
-        RETURN jsonb_build_object(
-            'success', true,
-            'status', 'already_processed',
-            'idempotent_replayed', true,
-            'provider_event_id', p_provider_event_id,
-            'provider_payment_id', v_clean_payment_id
-        );
+    -- Validate supported payment-capture event types explicitly
+    IF v_webhook.event_type NOT IN ('payment.paid', 'checkout_session.payment.paid', 'payment.captured') THEN
+        RAISE EXCEPTION 'Unsupported webhook event type: "%". Only payment capture events are permitted.',
+            v_webhook.event_type;
     END IF;
 
-    -- 3. Extract and Verify Trusted Payload Evidence (Reject Caller Tampering)
-    v_trusted_payment_id := COALESCE(
+    -- 3. Extract and Verify Trusted Payload Evidence (No fallbacks to caller-supplied parameters)
+    v_trusted_payment_id := NULLIF(trim(COALESCE(
         v_webhook.payload->'data'->'attributes'->'data'->>'id',
         v_webhook.payload->'data'->>'id',
         v_webhook.payload->>'provider_payment_id',
-        v_webhook.payload->>'payment_id'
-    );
+        v_webhook.payload->>'payment_id',
+        ''
+    )), '');
 
-    v_trusted_session_id := COALESCE(
+    v_trusted_session_id := NULLIF(trim(COALESCE(
         v_webhook.payload->'data'->'attributes'->'data'->'attributes'->>'checkout_session_id',
         v_webhook.payload->'data'->'attributes'->'data'->'attributes'->'metadata'->>'checkout_session_id',
         v_webhook.payload->'data'->'attributes'->>'checkout_session_id',
         v_webhook.payload->'data'->'attributes'->'metadata'->>'checkout_session_id',
         v_webhook.payload->'data'->>'checkout_session_id',
-        v_webhook.payload->>'checkout_session_id'
-    );
+        v_webhook.payload->>'checkout_session_id',
+        ''
+    )), '');
 
     IF v_webhook.payload->'data'->'attributes'->'data'->'attributes' ? 'amount' THEN
         v_trusted_amount := ((v_webhook.payload->'data'->'attributes'->'data'->'attributes'->>'amount')::NUMERIC / 100.00);
@@ -657,31 +655,70 @@ BEGIN
         END IF;
     END IF;
 
-    v_trusted_currency := upper(COALESCE(
+    v_trusted_currency := upper(NULLIF(trim(COALESCE(
         v_webhook.payload->'data'->'attributes'->'data'->'attributes'->>'currency',
         v_webhook.payload->'data'->'attributes'->>'currency',
         v_webhook.payload->>'currency',
-        'PHP'
-    ));
+        ''
+    )), ''));
 
-    IF v_trusted_payment_id IS NOT NULL AND v_trusted_payment_id != v_clean_payment_id THEN
+    v_trusted_status := lower(NULLIF(trim(COALESCE(
+        v_webhook.payload->'data'->'attributes'->'data'->'attributes'->>'status',
+        v_webhook.payload->'data'->'attributes'->>'status',
+        v_webhook.payload->>'status',
+        ''
+    )), ''));
+
+    IF v_trusted_payment_id IS NULL THEN
+        RAISE EXCEPTION 'Missing trusted evidence: Webhook payload does not contain provider payment identity.';
+    END IF;
+
+    IF v_trusted_session_id IS NULL THEN
+        RAISE EXCEPTION 'Missing trusted evidence: Webhook payload does not contain checkout session identity.';
+    END IF;
+
+    IF v_trusted_amount IS NULL OR v_trusted_amount <= 0.00 THEN
+        RAISE EXCEPTION 'Missing trusted evidence: Webhook payload does not contain a valid positive amount.';
+    END IF;
+
+    IF v_trusted_currency IS NULL THEN
+        RAISE EXCEPTION 'Missing trusted evidence: Webhook payload does not contain currency.';
+    END IF;
+
+    IF v_trusted_status IS NULL OR v_trusted_status NOT IN ('paid', 'succeeded', 'captured') THEN
+        RAISE EXCEPTION 'Invalid provider payment status: Webhook payload status "%" is not terminal paid/captured.',
+            COALESCE(v_trusted_status, 'NULL');
+    END IF;
+
+    IF v_trusted_payment_id != v_clean_payment_id THEN
         RAISE EXCEPTION 'Evidence tampering detected: Caller provider_payment_id ("%") does not match verified webhook payload evidence ("%").',
             v_clean_payment_id, v_trusted_payment_id;
     END IF;
 
-    IF v_trusted_session_id IS NOT NULL AND v_trusted_session_id != v_clean_session_id THEN
+    IF v_trusted_session_id != v_clean_session_id THEN
         RAISE EXCEPTION 'Evidence tampering detected: Caller checkout_session_id ("%") does not match verified webhook payload evidence ("%").',
             v_clean_session_id, v_trusted_session_id;
     END IF;
 
-    IF v_trusted_amount IS NOT NULL AND v_trusted_amount != p_captured_amount THEN
+    IF v_trusted_amount != p_captured_amount THEN
         RAISE EXCEPTION 'Evidence tampering detected: Caller captured_amount (₱%) does not match verified webhook payload evidence (₱%).',
             p_captured_amount, v_trusted_amount;
     END IF;
 
-    IF v_trusted_currency IS NOT NULL AND v_trusted_currency != v_clean_currency THEN
+    IF v_trusted_currency != v_clean_currency THEN
         RAISE EXCEPTION 'Evidence tampering detected: Caller currency ("%") does not match verified webhook payload evidence ("%").',
             v_clean_currency, v_trusted_currency;
+    END IF;
+
+    -- Idempotent bypass if already successfully processed (after verifying replay values match)
+    IF v_webhook.processing_state = 'processed' THEN
+        RETURN jsonb_build_object(
+            'success', true,
+            'status', 'already_processed',
+            'idempotent_replayed', true,
+            'provider_event_id', p_provider_event_id,
+            'provider_payment_id', v_clean_payment_id
+        );
     END IF;
 
     -- 4. Idempotency Conflict Check: Prevent altering values under another event's identity
@@ -988,6 +1025,12 @@ BEGIN
             v_batch.provider_batch_id, v_clean_provider_batch_id;
     END IF;
 
+    -- Require authoritative provider settlement confirmation
+    IF v_batch.verified_at IS NULL THEN
+        RAISE EXCEPTION 'Unverified settlement batch: Batch % lacks authoritative provider settlement confirmation (verified_at IS NULL).',
+            p_batch_id;
+    END IF;
+
     -- 4. Duplicate Clearing Prevention & Idempotency
     IF v_batch.status = 'reconciled' THEN
         SELECT id INTO v_existing_tx
@@ -1007,27 +1050,27 @@ BEGIN
         RAISE EXCEPTION 'Settlement batch % has already been completely reconciled and cleared.', p_batch_id;
     END IF;
 
-    -- 5. Strict Settlement Items Verification (Zero reliance on caller-supplied amounts)
+    -- 5. Complete Settlement Batch Validation (Validate ALL items in batch BEFORE filtering)
     SELECT
         COUNT(*) as item_count,
         COALESCE(SUM(net_settled_amount), 0.00) as verified_net_amount,
         COALESCE(SUM(gross_amount), 0.00) as verified_gross_amount,
+        COALESCE(SUM(provider_fee_amount), 0.00) as verified_fee_amount,
         COUNT(*) FILTER (WHERE settlement_status != 'matched') as invalid_status_count,
         COUNT(*) FILTER (WHERE journal_transaction_id IS NOT NULL) as already_cleared_count,
-        COUNT(*) FILTER (WHERE organization_id != p_organization_id) as wrong_org_count
+        COUNT(*) FILTER (WHERE organization_id != p_organization_id OR facility_id != p_facility_id) as wrong_tenant_count
     INTO v_items_summary
     FROM public.settlement_items
-    WHERE batch_id = p_batch_id
-      AND organization_id = p_organization_id
-      AND facility_id = p_facility_id;
+    WHERE batch_id = p_batch_id;
 
     IF v_items_summary.item_count = 0 THEN
         RAISE EXCEPTION 'Settlement batch % contains zero settlement items for organization % and facility %.',
             p_batch_id, p_organization_id, p_facility_id;
     END IF;
 
-    IF v_items_summary.wrong_org_count > 0 THEN
-        RAISE EXCEPTION 'Cross-tenant settlement violation: Batch items belong to another organization.';
+    IF v_items_summary.wrong_tenant_count > 0 THEN
+        RAISE EXCEPTION 'Cross-tenant settlement violation: Batch % contains % items belonging to another organization or facility.',
+            p_batch_id, v_items_summary.wrong_tenant_count;
     END IF;
 
     IF v_items_summary.invalid_status_count > 0 THEN
@@ -1038,6 +1081,45 @@ BEGIN
     IF v_items_summary.already_cleared_count > 0 THEN
         RAISE EXCEPTION 'Settlement batch contains % items that have already been cleared.',
             v_items_summary.already_cleared_count;
+    END IF;
+
+    -- Reconcile provider batch totals and provider fees against items
+    IF (v_batch.total_gross_amount - v_batch.total_fee_amount) != v_batch.total_net_amount THEN
+        RAISE EXCEPTION 'Settlement batch accounting invariant violation: gross (₱%) - fee (₱%) != net (₱%).',
+            v_batch.total_gross_amount, v_batch.total_fee_amount, v_batch.total_net_amount;
+    END IF;
+
+    IF v_items_summary.verified_gross_amount != v_batch.total_gross_amount THEN
+        RAISE EXCEPTION 'Settlement batch gross total mismatch: Batch header ₱% != items total ₱%.',
+            v_batch.total_gross_amount, v_items_summary.verified_gross_amount;
+    END IF;
+
+    IF v_items_summary.verified_net_amount != v_batch.total_net_amount THEN
+        RAISE EXCEPTION 'Settlement batch net total mismatch: Batch header ₱% != items total ₱%.',
+            v_batch.total_net_amount, v_items_summary.verified_net_amount;
+    END IF;
+
+    IF v_items_summary.verified_fee_amount != v_batch.total_fee_amount THEN
+        RAISE EXCEPTION 'Settlement batch fee total mismatch: Batch header ₱% != items total ₱%.',
+            v_batch.total_fee_amount, v_items_summary.verified_fee_amount;
+    END IF;
+
+    -- Reconcile every item in the batch against captured payments
+    IF EXISTS (
+        SELECT 1
+        FROM public.settlement_items si
+        LEFT JOIN public.payments p ON p.id = si.payment_id
+        WHERE si.batch_id = p_batch_id
+          AND (
+              p.id IS NULL
+              OR p.status NOT IN ('captured', 'partially_refunded')
+              OR p.organization_id != si.organization_id
+              OR p.facility_id != si.facility_id
+              OR p.provider_payment_id IS DISTINCT FROM si.provider_payment_id
+              OR p.captured_amount != si.gross_amount
+          )
+    ) THEN
+        RAISE EXCEPTION 'Settlement item reconciliation failed: One or more items do not match a captured payment for this tenant.';
     END IF;
 
     -- Strict Amount Reconciliation: Caller amount must exactly match verified items total
@@ -1124,13 +1206,17 @@ DECLARE
     v_target_status VARCHAR(50);
     v_journal_res JSONB;
     v_evidence_status TEXT;
+    v_webhook_event_id UUID;
+    v_webhook RECORD;
+    v_trusted_refund_id TEXT;
+    v_trusted_amount NUMERIC(10, 2);
 BEGIN
     v_clean_key := NULLIF(trim(COALESCE(p_idempotency_key, '')), '');
     IF v_clean_key IS NULL THEN
         RAISE EXCEPTION 'Idempotency key is required for verified refund processing.';
     END IF;
 
-    -- Require authoritative provider refund evidence
+    -- Require authoritative provider refund evidence backed by a verified webhook event
     v_clean_refund_id := NULLIF(trim(COALESCE(p_provider_refund_id, '')), '');
     IF v_clean_refund_id IS NULL OR length(v_clean_refund_id) < 5 THEN
         RAISE EXCEPTION 'Authoritative provider_refund_id is required.';
@@ -1140,18 +1226,75 @@ BEGIN
         RAISE EXCEPTION 'Authoritative provider refund confirmation evidence is required to execute refund reversal.';
     END IF;
 
-    v_evidence_status := lower(COALESCE(p_refund_evidence->>'status', p_refund_evidence->>'refund_status', ''));
-    IF v_evidence_status NOT IN ('succeeded', 'completed', 'paid') THEN
-        RAISE EXCEPTION 'Unconfirmed refund evidence: Provider refund status "%" is not terminal succeeded.', v_evidence_status;
+    BEGIN
+        v_webhook_event_id := NULLIF(trim(COALESCE(p_refund_evidence->>'webhook_event_id', '')), '')::UUID;
+    EXCEPTION WHEN OTHERS THEN
+        v_webhook_event_id := NULL;
+    END;
+
+    IF v_webhook_event_id IS NULL THEN
+        RAISE EXCEPTION 'Authoritative verified webhook_event_id is required in refund evidence. Caller-supplied status JSON is not accepted.';
     END IF;
 
-    IF (p_refund_evidence ? 'provider_refund_id') AND (p_refund_evidence->>'provider_refund_id' != v_clean_refund_id) THEN
-        RAISE EXCEPTION 'Evidence mismatch: Evidence provider_refund_id "%" does not match parameter "%".',
-            p_refund_evidence->>'provider_refund_id', v_clean_refund_id;
+    SELECT * INTO v_webhook
+    FROM public.provider_webhook_events
+    WHERE id = v_webhook_event_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Referenced refund webhook event ID % does not exist in inbox.', v_webhook_event_id;
+    END IF;
+
+    IF v_webhook.signature_verification_status != 'verified' THEN
+        RAISE EXCEPTION 'Security rejection: Refund webhook event % has unverified signature status ("%").',
+            v_webhook_event_id, v_webhook.signature_verification_status;
+    END IF;
+
+    IF v_webhook.event_type NOT IN ('refund.succeeded', 'payment.refunded', 'charge.refunded') THEN
+        RAISE EXCEPTION 'Unsupported refund webhook event type: "%".', v_webhook.event_type;
+    END IF;
+
+    v_trusted_refund_id := NULLIF(trim(COALESCE(
+        v_webhook.payload->'data'->>'id',
+        v_webhook.payload->>'provider_refund_id',
+        v_webhook.payload->>'refund_id',
+        ''
+    )), '');
+
+    IF v_trusted_refund_id IS NULL OR v_trusted_refund_id != v_clean_refund_id THEN
+        RAISE EXCEPTION 'Evidence mismatch: Webhook refund ID ("%") does not match parameter ("%").',
+            COALESCE(v_trusted_refund_id, 'NULL'), v_clean_refund_id;
+    END IF;
+
+    v_evidence_status := lower(NULLIF(trim(COALESCE(
+        v_webhook.payload->'data'->'attributes'->>'status',
+        v_webhook.payload->>'status',
+        v_webhook.payload->>'refund_status',
+        ''
+    )), ''));
+
+    IF v_evidence_status IS NULL OR v_evidence_status NOT IN ('succeeded', 'completed', 'paid') THEN
+        RAISE EXCEPTION 'Unconfirmed refund evidence: Webhook refund status "%" is not terminal succeeded.',
+            COALESCE(v_evidence_status, 'NULL');
     END IF;
 
     IF p_refund_amount IS NULL OR p_refund_amount <= 0.00 THEN
         RAISE EXCEPTION 'Refund amount must be strictly positive. Got: ₱%', p_refund_amount;
+    END IF;
+
+    IF v_webhook.payload->'data'->'attributes' ? 'amount' THEN
+        v_trusted_amount := ((v_webhook.payload->'data'->'attributes'->>'amount')::NUMERIC / 100.00);
+    ELSIF v_webhook.payload ? 'amount' THEN
+        IF (v_webhook.payload->>'amount')::NUMERIC >= 10000 THEN
+            v_trusted_amount := ((v_webhook.payload->>'amount')::NUMERIC / 100.00);
+        ELSE
+            v_trusted_amount := (v_webhook.payload->>'amount')::NUMERIC;
+        END IF;
+    END IF;
+
+    IF v_trusted_amount IS NULL OR v_trusted_amount != p_refund_amount THEN
+        RAISE EXCEPTION 'Evidence mismatch: Webhook refund amount (₱%) does not match requested refund amount (₱%).',
+            v_trusted_amount, p_refund_amount;
     END IF;
 
     -- Lock and verify payment record
@@ -1380,6 +1523,10 @@ DECLARE
     v_payout RECORD;
     v_journal_res JSONB;
     v_evidence_status TEXT;
+    v_webhook_event_id UUID;
+    v_webhook RECORD;
+    v_trusted_ref TEXT;
+    v_trusted_amount NUMERIC(10, 2);
 BEGIN
     v_clean_key := NULLIF(trim(COALESCE(p_idempotency_key, '')), '');
     IF v_clean_key IS NULL THEN
@@ -1391,19 +1538,61 @@ BEGIN
         RAISE EXCEPTION 'Authoritative provider_reference (min 8 chars) is required.';
     END IF;
 
-    -- Require authoritative provider disbursement confirmation evidence
+    -- Require authoritative provider disbursement confirmation evidence backed by a verified webhook event
     IF p_disbursement_evidence IS NULL OR p_disbursement_evidence = '{}'::jsonb THEN
         RAISE EXCEPTION 'Authoritative provider disbursement confirmation evidence is required to disburse owner payout.';
     END IF;
 
-    v_evidence_status := lower(COALESCE(p_disbursement_evidence->>'disbursement_status', p_disbursement_evidence->>'status', ''));
-    IF v_evidence_status NOT IN ('succeeded', 'paid', 'completed', 'sent') THEN
-        RAISE EXCEPTION 'Unconfirmed disbursement evidence: Provider status "%" is not terminal succeeded.', v_evidence_status;
+    BEGIN
+        v_webhook_event_id := NULLIF(trim(COALESCE(p_disbursement_evidence->>'webhook_event_id', '')), '')::UUID;
+    EXCEPTION WHEN OTHERS THEN
+        v_webhook_event_id := NULL;
+    END;
+
+    IF v_webhook_event_id IS NULL THEN
+        RAISE EXCEPTION 'Authoritative verified webhook_event_id is required in disbursement evidence. Caller-supplied status JSON is not accepted.';
     END IF;
 
-    IF (p_disbursement_evidence ? 'provider_reference') AND (p_disbursement_evidence->>'provider_reference' != v_clean_ref) THEN
-        RAISE EXCEPTION 'Evidence mismatch: Evidence provider_reference "%" does not match parameter "%".',
-            p_disbursement_evidence->>'provider_reference', v_clean_ref;
+    SELECT * INTO v_webhook
+    FROM public.provider_webhook_events
+    WHERE id = v_webhook_event_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Referenced payout webhook event ID % does not exist in inbox.', v_webhook_event_id;
+    END IF;
+
+    IF v_webhook.signature_verification_status != 'verified' THEN
+        RAISE EXCEPTION 'Security rejection: Payout webhook event % has unverified signature status ("%").',
+            v_webhook_event_id, v_webhook.signature_verification_status;
+    END IF;
+
+    IF v_webhook.event_type NOT IN ('payout.paid', 'payout.succeeded', 'transfer.paid') THEN
+        RAISE EXCEPTION 'Unsupported payout disbursement webhook event type: "%".', v_webhook.event_type;
+    END IF;
+
+    v_trusted_ref := NULLIF(trim(COALESCE(
+        v_webhook.payload->'data'->>'id',
+        v_webhook.payload->>'provider_reference',
+        v_webhook.payload->>'provider_payout_id',
+        ''
+    )), '');
+
+    IF v_trusted_ref IS NULL OR v_trusted_ref != v_clean_ref THEN
+        RAISE EXCEPTION 'Evidence mismatch: Webhook provider_reference ("%") does not match parameter ("%").',
+            COALESCE(v_trusted_ref, 'NULL'), v_clean_ref;
+    END IF;
+
+    v_evidence_status := lower(NULLIF(trim(COALESCE(
+        v_webhook.payload->'data'->'attributes'->>'status',
+        v_webhook.payload->>'disbursement_status',
+        v_webhook.payload->>'status',
+        ''
+    )), ''));
+
+    IF v_evidence_status IS NULL OR v_evidence_status NOT IN ('succeeded', 'paid', 'completed', 'sent') THEN
+        RAISE EXCEPTION 'Unconfirmed disbursement evidence: Webhook status "%" is not terminal succeeded.',
+            COALESCE(v_evidence_status, 'NULL');
     END IF;
 
     -- Lock and verify payout
@@ -1414,6 +1603,21 @@ BEGIN
 
     IF NOT FOUND THEN
         RAISE EXCEPTION 'Payout ID % not found.', p_payout_id;
+    END IF;
+
+    IF v_webhook.payload->'data'->'attributes' ? 'amount' THEN
+        v_trusted_amount := ((v_webhook.payload->'data'->'attributes'->>'amount')::NUMERIC / 100.00);
+    ELSIF v_webhook.payload ? 'amount' THEN
+        IF (v_webhook.payload->>'amount')::NUMERIC >= 10000 THEN
+            v_trusted_amount := ((v_webhook.payload->>'amount')::NUMERIC / 100.00);
+        ELSE
+            v_trusted_amount := (v_webhook.payload->>'amount')::NUMERIC;
+        END IF;
+    END IF;
+
+    IF v_trusted_amount IS NULL OR v_trusted_amount != v_payout.amount THEN
+        RAISE EXCEPTION 'Evidence mismatch: Webhook payout amount (₱%) does not match payout record amount (₱%).',
+            v_trusted_amount, v_payout.amount;
     END IF;
 
     -- Idempotent bypass if already paid under same reference
@@ -1491,6 +1695,9 @@ DECLARE
     v_clean_reason TEXT;
     v_payout RECORD;
     v_journal_res JSONB;
+    v_webhook_event_id UUID;
+    v_webhook RECORD;
+    v_failure_status TEXT;
 BEGIN
     v_clean_key := NULLIF(trim(COALESCE(p_idempotency_key, '')), '');
     IF v_clean_key IS NULL THEN
@@ -1502,13 +1709,48 @@ BEGIN
         RAISE EXCEPTION 'A descriptive failure_reason (min 5 chars) is required.';
     END IF;
 
-    -- Require authoritative provider failure evidence
+    -- Require authoritative provider failure evidence backed by a verified webhook event
     IF p_failure_evidence IS NULL OR p_failure_evidence = '{}'::jsonb THEN
         RAISE EXCEPTION 'Authoritative provider failure evidence is required to release reserved payout funds.';
     END IF;
 
-    IF NOT (p_failure_evidence ? 'failure_code' OR p_failure_evidence ? 'provider_status' OR p_failure_evidence ? 'status') THEN
-        RAISE EXCEPTION 'Authoritative provider failure evidence must contain failure_code or provider_status.';
+    BEGIN
+        v_webhook_event_id := NULLIF(trim(COALESCE(p_failure_evidence->>'webhook_event_id', '')), '')::UUID;
+    EXCEPTION WHEN OTHERS THEN
+        v_webhook_event_id := NULL;
+    END;
+
+    IF v_webhook_event_id IS NULL THEN
+        RAISE EXCEPTION 'Authoritative verified webhook_event_id is required in payout failure evidence. Caller-supplied status JSON is not accepted.';
+    END IF;
+
+    SELECT * INTO v_webhook
+    FROM public.provider_webhook_events
+    WHERE id = v_webhook_event_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Referenced payout failure webhook event ID % does not exist in inbox.', v_webhook_event_id;
+    END IF;
+
+    IF v_webhook.signature_verification_status != 'verified' THEN
+        RAISE EXCEPTION 'Security rejection: Payout failure webhook event % has unverified signature status ("%").',
+            v_webhook_event_id, v_webhook.signature_verification_status;
+    END IF;
+
+    IF v_webhook.event_type NOT IN ('payout.failed', 'transfer.failed') THEN
+        RAISE EXCEPTION 'Unsupported payout failure webhook event type: "%".', v_webhook.event_type;
+    END IF;
+
+    v_failure_status := lower(NULLIF(trim(COALESCE(
+        v_webhook.payload->'data'->'attributes'->>'status',
+        v_webhook.payload->>'provider_status',
+        v_webhook.payload->>'status',
+        ''
+    )), ''));
+
+    IF v_failure_status != 'failed' AND NOT (v_webhook.payload ? 'failure_code' OR (v_webhook.payload->'data'->'attributes' ? 'failure_code')) THEN
+        RAISE EXCEPTION 'Authoritative provider failure webhook must contain failed status or failure_code.';
     END IF;
 
     -- Lock and verify payout

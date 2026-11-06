@@ -26,10 +26,21 @@ export class PayMongoAdapter implements PaymentProviderAdapter {
     secretKey?: string
   ): Promise<ProviderCheckoutSessionResult> {
     const key = secretKey || (typeof process !== 'undefined' ? process.env?.PAYMONGO_SECRET_KEY : '') || '';
+    const nodeEnv = (typeof process !== 'undefined' ? process.env?.NODE_ENV : 'development') || 'development';
+    const allowSimulationEnv = (typeof process !== 'undefined' ? process.env?.ALLOW_PAYMENT_SIMULATION === 'true' : false);
     const hasLiveOrTestKey = key.startsWith('sk_live_') || key.startsWith('sk_test_');
 
     if (!hasLiveOrTestKey) {
-      // Clearly separated simulated sandbox mode when real gateway secret is not configured
+      // In production or when simulation is not explicitly enabled, fail closed.
+      // Automatic simulation fallback when PAYMONGO_SECRET_KEY is absent/malformed is prohibited.
+      if (nodeEnv === 'production' || !allowSimulationEnv) {
+        throw new Error(
+          'PayMongo credentials error: Valid PAYMONGO_SECRET_KEY (sk_live_ or sk_test_) is required. ' +
+          'Automatic simulation fallback is disabled. Simulation requires explicit development configuration (ALLOW_PAYMENT_SIMULATION=true).'
+        );
+      }
+
+      // Explicit development-only simulated sandbox mode
       const simulatedId = `cs_sandbox_${params.referenceCode}_${crypto.randomBytes(4).toString('hex')}`;
       return {
         providerCheckoutId: simulatedId,
