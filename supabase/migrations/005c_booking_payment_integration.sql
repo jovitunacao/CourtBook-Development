@@ -1888,6 +1888,61 @@ BEGIN
         );
     END IF;
 
+    DECLARE
+        v_ev_payout_id TEXT;
+        v_ev_org_id TEXT;
+        v_ev_currency TEXT;
+        v_ev_destination TEXT;
+    BEGIN
+        v_ev_payout_id := NULLIF(trim(COALESCE(
+            v_webhook.payload->'data'->>'id',
+            v_webhook.payload->>'provider_payout_id',
+            v_webhook.payload->>'provider_reference',
+            ''
+        )), '');
+        IF v_ev_payout_id IS NULL OR (v_payout.provider_payout_id IS NOT NULL AND v_ev_payout_id != v_payout.provider_payout_id) THEN
+            RAISE EXCEPTION 'Evidence mismatch: Missing or mismatched provider payout ID ("%") for payout ("%").',
+                COALESCE(v_ev_payout_id, 'NULL'), COALESCE(v_payout.provider_payout_id, 'NULL');
+        END IF;
+
+        v_ev_org_id := NULLIF(trim(COALESCE(
+            v_webhook.payload->'data'->'attributes'->'metadata'->>'organization_id',
+            v_webhook.payload->'metadata'->>'organization_id',
+            v_webhook.payload->>'organization_id',
+            ''
+        )), '');
+        IF v_ev_org_id IS NULL OR v_ev_org_id::uuid != v_payout.organization_id THEN
+            RAISE EXCEPTION 'Evidence mismatch: Missing or mismatched organization ("%") for payout ("%").',
+                COALESCE(v_ev_org_id, 'NULL'), v_payout.organization_id;
+        END IF;
+
+        v_ev_currency := upper(NULLIF(trim(COALESCE(
+            v_webhook.payload->'data'->'attributes'->>'currency',
+            v_webhook.payload->>'currency',
+            ''
+        )), ''));
+        IF v_ev_currency IS NULL OR v_ev_currency != v_payout.currency THEN
+            RAISE EXCEPTION 'Evidence mismatch: Missing or mismatched currency ("%") for payout ("%").',
+                COALESCE(v_ev_currency, 'NULL'), v_payout.currency;
+        END IF;
+
+        v_ev_destination := NULLIF(trim(COALESCE(
+            v_webhook.payload->'data'->'attributes'->>'destination',
+            v_webhook.payload->>'payout_method_id',
+            v_webhook.payload->>'destination',
+            ''
+        )), '');
+        IF v_ev_destination IS NULL OR v_ev_destination::uuid != v_payout.payout_method_id THEN
+            RAISE EXCEPTION 'Evidence mismatch: Missing or mismatched payout destination ("%") for payout ("%").',
+                COALESCE(v_ev_destination, 'NULL'), v_payout.payout_method_id;
+        END IF;
+    END;
+
+    UPDATE public.provider_webhook_events
+    SET processing_state = 'processed',
+        processed_at = now()
+    WHERE id = v_webhook_event_id;
+
     IF v_payout.status NOT IN ('approved_reserved', 'submitted_to_provider') THEN
         RAISE EXCEPTION 'Cannot fail payout %: Current status is "%". Only reserved or submitted payouts can be failed.',
             p_payout_id, v_payout.status;
