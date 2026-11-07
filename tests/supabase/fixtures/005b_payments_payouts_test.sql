@@ -426,6 +426,11 @@ BEGIN
         gen_random_uuid(), v_synth_org_a, v_payout_method_id_a, 1000.00, 'pending_request', 'payout_prov_ref_001'
     ) RETURNING id INTO v_payout_id;
 
+    -- NOTE: In 005B tests, mock financial_transactions header rows are provisioned directly
+    -- to verify 005B foreign keys (fk_payouts_journal_reserve_org, fk_payouts_journal_terminal_org)
+    -- and payout state transition trigger validation (fn_validate_payout_status_transition).
+    -- Full double-entry ledger postings, 11-account balance equations, and running balances
+    -- are executed via post_journal_entry_internal() and verified in 005a2_journal_hardening_test.sql.
     DECLARE
         v_ft_test9_res UUID := gen_random_uuid();
         v_ft_test9_term UUID := gen_random_uuid();
@@ -1176,13 +1181,20 @@ BEGIN
         END IF;
 
         -- 23d: Fail closed if platform_billing_config(id = 1) is missing or unconfigured
+        -- NOTE: Uses row deletion and snapshot restoration to test missing singleton config (id = 1)
+        -- without violating the NOT NULL constraint on default_commission_rate.
         DECLARE
-            v_saved_comm NUMERIC(5, 4);
+            v_saved_config public.platform_billing_config%ROWTYPE;
+            v_err_msg TEXT;
+            v_err_state TEXT;
         BEGIN
-            SELECT default_commission_rate INTO v_saved_comm FROM public.platform_billing_config WHERE id = 1;
-            UPDATE public.platform_billing_config SET default_commission_rate = NULL WHERE id = 1;
+            -- Snapshot singleton billing configuration row before temporary deletion
+            SELECT * INTO v_saved_config FROM public.platform_billing_config WHERE id = 1;
+            DELETE FROM public.platform_billing_config WHERE id = 1;
 
             v_expected_failed := false;
+            v_err_msg := NULL;
+            v_err_state := NULL;
             BEGIN
                 INSERT INTO public.payments (
                     organization_id, facility_id, reservation_id, expected_amount,
@@ -1192,20 +1204,23 @@ BEGIN
                     400.00, 0.0500, 20.00, 380.00, 'pending'
                 );
             EXCEPTION WHEN OTHERS THEN
-                IF SQLERRM LIKE '%Authoritative platform billing configuration (id = 1) is missing or unconfigured%' THEN
+                v_err_msg := SQLERRM;
+                v_err_state := SQLSTATE;
+                IF v_err_msg LIKE '%Authoritative platform billing configuration (id = 1) is missing or unconfigured%' THEN
                     v_expected_failed := true;
-                    v_test_count := v_test_count + 1;
-                    RAISE NOTICE 'Test 23d PASSED: Missing/unconfigured platform billing config fails closed on payment INSERT.';
-                ELSE
-                    RAISE EXCEPTION 'Test 23d Failed with unexpected error [SQLSTATE %]: %', SQLSTATE, SQLERRM;
                 END IF;
             END;
 
-            -- Restore authoritative billing config
-            UPDATE public.platform_billing_config SET default_commission_rate = v_saved_comm WHERE id = 1;
+            -- Restore authoritative singleton configuration row immediately before evaluating assertions
+            INSERT INTO public.platform_billing_config VALUES (v_saved_config.*);
 
-            IF NOT v_expected_failed THEN
-                RAISE EXCEPTION 'Test 23d Failed: Payment insert succeeded despite unconfigured billing config!';
+            IF v_expected_failed THEN
+                v_test_count := v_test_count + 1;
+                RAISE NOTICE 'Test 23d PASSED: Missing platform billing config (id = 1) fails closed on payment INSERT.';
+            ELSIF v_err_msg IS NOT NULL THEN
+                RAISE EXCEPTION 'Test 23d Failed with unexpected error [SQLSTATE %]: %', v_err_state, v_err_msg;
+            ELSE
+                RAISE EXCEPTION 'Test 23d Failed: Payment insert succeeded despite missing billing config!';
             END IF;
         END;
 
@@ -1364,6 +1379,8 @@ BEGIN
                 v_ft_term_a UUID := gen_random_uuid();
             BEGIN
                 -- Provision mock financial transactions adhering to 005a1 schema
+                -- (validates 005B composite foreign keys and trigger transaction_type checks
+                -- without executing full post_journal_entry_internal() ledger calculations)
                 INSERT INTO public.financial_transactions (
                     id, organization_id, facility_id, transaction_type,
                     idempotency_key, reference_id, description, canonical_payload_hash
