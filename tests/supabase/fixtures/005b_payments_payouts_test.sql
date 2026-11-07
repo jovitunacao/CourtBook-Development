@@ -114,10 +114,19 @@ BEGIN
             v_synth_res_a,
             350.00, 0.0500, 17.50, 332.50, 'pending'
         );
-    EXCEPTION WHEN foreign_key_violation THEN
-        v_expected_failed := true;
-        v_test_count := v_test_count + 1;
-        RAISE NOTICE 'Test 1a PASSED: Cross-tenant facility/organization mismatch rejected by fk_payments_facility_org.';
+    EXCEPTION
+        WHEN foreign_key_violation THEN
+            v_expected_failed := true;
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 1a PASSED: Cross-tenant facility/organization mismatch rejected by fk_payments_facility_org.';
+        WHEN OTHERS THEN
+            IF SQLSTATE = '23503' THEN
+                v_expected_failed := true;
+                v_test_count := v_test_count + 1;
+                RAISE NOTICE 'Test 1a PASSED: Cross-tenant facility/organization mismatch rejected by fk_payments_facility_org.';
+            ELSE
+                RAISE EXCEPTION 'Test 1a Failed with unexpected error [SQLSTATE %]: %', SQLSTATE, SQLERRM;
+            END IF;
     END;
     IF NOT v_expected_failed THEN
         RAISE EXCEPTION 'Test 1a Failed: Cross-tenant facility-org linkage was not rejected!';
@@ -134,10 +143,19 @@ BEGIN
             v_synth_res_a, -- WRONG RESERVATION (belongs to Facility A)!
             350.00, 0.0500, 17.50, 332.50, 'pending'
         );
-    EXCEPTION WHEN foreign_key_violation THEN
-        v_expected_failed := true;
-        v_test_count := v_test_count + 1;
-        RAISE NOTICE 'Test 1b PASSED: Cross-tenant reservation/facility mismatch rejected by fk_payments_reservation_facility.';
+    EXCEPTION
+        WHEN foreign_key_violation THEN
+            v_expected_failed := true;
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 1b PASSED: Cross-tenant reservation/facility mismatch rejected by fk_payments_reservation_facility.';
+        WHEN OTHERS THEN
+            IF SQLSTATE = '23503' THEN
+                v_expected_failed := true;
+                v_test_count := v_test_count + 1;
+                RAISE NOTICE 'Test 1b PASSED: Cross-tenant reservation/facility mismatch rejected by fk_payments_reservation_facility.';
+            ELSE
+                RAISE EXCEPTION 'Test 1b Failed with unexpected error [SQLSTATE %]: %', SQLSTATE, SQLERRM;
+            END IF;
     END;
     IF NOT v_expected_failed THEN
         RAISE EXCEPTION 'Test 1b Failed: Cross-tenant reservation-facility linkage was not rejected!';
@@ -555,10 +573,19 @@ BEGIN
             v_payout_method_id_b,   -- Org B's method!
             500.00, 'pending_request'
         );
-    EXCEPTION WHEN foreign_key_violation THEN
-        v_expected_failed := true;
-        v_test_count := v_test_count + 1;
-        RAISE NOTICE 'Test 14 PASSED: Cross-tenant payout method reference rejected by fk_payouts_method_org.';
+    EXCEPTION
+        WHEN foreign_key_violation THEN
+            v_expected_failed := true;
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 14 PASSED: Cross-tenant payout method reference rejected by fk_payouts_method_org.';
+        WHEN OTHERS THEN
+            IF SQLSTATE = '23503' THEN
+                v_expected_failed := true;
+                v_test_count := v_test_count + 1;
+                RAISE NOTICE 'Test 14 PASSED: Cross-tenant payout method reference rejected by fk_payouts_method_org.';
+            ELSE
+                RAISE EXCEPTION 'Test 14 Failed with unexpected error [SQLSTATE %]: %', SQLSTATE, SQLERRM;
+            END IF;
     END;
     IF NOT v_expected_failed THEN
         RAISE EXCEPTION 'Test 14 Failed: Cross-tenant payout method was not rejected!';
@@ -581,10 +608,19 @@ BEGIN
             v_synth_fac_a,  -- Facility A!
             350.00, 15.00, 335.00, 'matched'
         );
-    EXCEPTION WHEN foreign_key_violation THEN
-        v_expected_failed := true;
-        v_test_count := v_test_count + 1;
-        RAISE NOTICE 'Test 15a PASSED: Cross-tenant settlement payment link rejected by fk_settlement_items_payment_org_fac.';
+    EXCEPTION
+        WHEN foreign_key_violation THEN
+            v_expected_failed := true;
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 15a PASSED: Cross-tenant settlement payment link rejected by fk_settlement_items_payment_org_fac.';
+        WHEN OTHERS THEN
+            IF SQLSTATE = '23503' THEN
+                v_expected_failed := true;
+                v_test_count := v_test_count + 1;
+                RAISE NOTICE 'Test 15a PASSED: Cross-tenant settlement payment link rejected by fk_settlement_items_payment_org_fac.';
+            ELSE
+                RAISE EXCEPTION 'Test 15 Failed with unexpected error [SQLSTATE %]: %', SQLSTATE, SQLERRM;
+            END IF;
     END;
     IF NOT v_expected_failed THEN
         RAISE EXCEPTION 'Test 15 Failed: Cross-tenant settlement item payment link was not rejected!';
@@ -1323,10 +1359,19 @@ BEGIN
                 ) VALUES (
                     v_log_id, v_payout_test_id, v_synth_org_b, 'pending_request', 'approved_reserved'
                 );
-            EXCEPTION WHEN foreign_key_violation THEN
-                v_expected_failed := true;
-                v_test_count := v_test_count + 1;
-                RAISE NOTICE 'Test 26a PASSED: Composite foreign key fk_payout_lifecycle_logs_payout_org rejected cross-tenant log.';
+            EXCEPTION
+                WHEN foreign_key_violation THEN
+                    v_expected_failed := true;
+                    v_test_count := v_test_count + 1;
+                    RAISE NOTICE 'Test 26a PASSED: Composite foreign key fk_payout_lifecycle_logs_payout_org rejected cross-tenant log.';
+                WHEN OTHERS THEN
+                    IF SQLSTATE = '23503' THEN
+                        v_expected_failed := true;
+                        v_test_count := v_test_count + 1;
+                        RAISE NOTICE 'Test 26a PASSED: Composite foreign key fk_payout_lifecycle_logs_payout_org rejected cross-tenant log.';
+                    ELSE
+                        RAISE EXCEPTION 'Test 26a Failed with unexpected error [SQLSTATE %]: %', SQLSTATE, SQLERRM;
+                    END IF;
             END;
             IF NOT v_expected_failed THEN
                 RAISE EXCEPTION 'Test 26a Failed: Cross-organization payout log was not rejected!';
@@ -1398,16 +1443,26 @@ BEGIN
                     'idem_ft_term_a_01', v_payout_test_id, 'Test Payout Disbursement Org A', md5('payload_term_a')
                 );
 
-                -- 27a: Cross-organization journal reserve reference must fail FK constraint
+                -- 27a: Cross-organization journal reserve reference must fail (trigger validation or composite FK)
                 v_expected_failed := false;
                 BEGIN
                     UPDATE public.payouts
                     SET status = 'approved_reserved', journal_reserve_tx_id = v_ft_res_b
                     WHERE id = v_payout_test_id;
-                EXCEPTION WHEN foreign_key_violation THEN
-                    v_expected_failed := true;
-                    v_test_count := v_test_count + 1;
-                    RAISE NOTICE 'Test 27a PASSED: Composite foreign key fk_payouts_journal_reserve_org rejected cross-tenant journal link.';
+                EXCEPTION
+                    WHEN foreign_key_violation THEN
+                        v_expected_failed := true;
+                        v_test_count := v_test_count + 1;
+                        RAISE NOTICE 'Test 27a PASSED: Composite foreign key fk_payouts_journal_reserve_org rejected cross-tenant journal link.';
+                    WHEN OTHERS THEN
+                        IF SQLERRM LIKE '%Invalid journal reserve transaction: Must reference an existing financial_transaction of type "payout_reserve" for organization%'
+                           OR SQLSTATE = '23503' THEN
+                            v_expected_failed := true;
+                            v_test_count := v_test_count + 1;
+                            RAISE NOTICE 'Test 27a PASSED: Cross-tenant journal reserve rejected by trigger validation (organization-scoped lookup) or composite FK.';
+                        ELSE
+                            RAISE EXCEPTION 'Test 27a Failed with unexpected error [SQLSTATE %]: %', SQLSTATE, SQLERRM;
+                        END IF;
                 END;
                 IF NOT v_expected_failed THEN
                     RAISE EXCEPTION 'Test 27a Failed: Cross-organization journal reserve was not rejected!';
