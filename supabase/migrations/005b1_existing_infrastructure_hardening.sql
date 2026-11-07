@@ -157,6 +157,32 @@ BEGIN
     RAISE NOTICE 'Preflight Check: All prerequisites and existing data validation passed successfully.';
 END $$;
 
+-- 1b. Capture Transaction-Scoped Payment Baseline Snapshot
+CREATE TEMP TABLE _migration_005b1_payment_baseline ON COMMIT DROP AS
+SELECT
+    id,
+    organization_id,
+    facility_id,
+    reservation_id,
+    expected_amount,
+    commission_rate,
+    commission_amount,
+    owner_gross_share,
+    captured_amount,
+    refunded_amount,
+    currency,
+    status,
+    provider_name,
+    provider_payment_id,
+    provider_payment_intent_id,
+    checkout_session_id,
+    capture_idempotency_key,
+    verified_capture_evidence,
+    created_at,
+    captured_at,
+    expires_at
+FROM public.payments;
+
 
 -- ==============================================================================
 -- 2. Non-Destructive Constraint & Index Hardening on Payouts & Payout Methods
@@ -1053,16 +1079,102 @@ REVOKE ALL ON FUNCTION public.post_journal_entry_internal(uuid,uuid,varchar,text
 -- ==============================================================================
 DO $$
 DECLARE
-    v_payment_count INT;
+    v_baseline_count INT;
+    v_current_count INT;
+    v_missing_count INT;
+    v_mismatch_count INT;
+    v_mismatch_detail RECORD;
     v_missing_con TEXT;
 BEGIN
     RAISE NOTICE '=== 005b1 Migration: Running Post-Upgrade Integrity Assertions ===';
 
-    -- Verify the 2 existing payment records are preserved
-    SELECT count(*) INTO v_payment_count FROM public.payments;
-    IF v_payment_count < 2 THEN
-        RAISE EXCEPTION 'Post-Migration Failure: Existing payments count dropped from >= 2 to %!', v_payment_count;
+    -- 1. Dynamic Payment Baseline Preservation Verification
+    SELECT count(*) INTO v_baseline_count FROM _migration_005b1_payment_baseline;
+    SELECT count(*) INTO v_current_count FROM public.payments;
+
+    RAISE NOTICE 'Post-Migration: Verifying % baseline payment record(s) against current % record(s)...',
+        v_baseline_count, v_current_count;
+
+    -- Ensure no baseline payment was dropped
+    SELECT count(*) INTO v_missing_count
+    FROM _migration_005b1_payment_baseline b
+    WHERE NOT EXISTS (
+        SELECT 1 FROM public.payments p WHERE p.id = b.id
+    );
+
+    IF v_missing_count > 0 THEN
+        RAISE EXCEPTION 'Post-Migration Failure: % baseline payment record(s) are missing from public.payments!', v_missing_count;
     END IF;
+
+    -- Ensure every baseline payment has 1:1 identical field values:
+    -- financial fields (expected_amount, commission_rate, commission_amount, owner_gross_share, captured_amount, refunded_amount),
+    -- organization_id, facility_id, reservation_id,
+    -- provider identity (provider_name, provider_payment_id, provider_payment_intent_id, checkout_session_id),
+    -- status, and protected timestamps (created_at, captured_at, expires_at),
+    -- plus evidence and idempotency key
+    SELECT count(*) INTO v_mismatch_count
+    FROM _migration_005b1_payment_baseline b
+    JOIN public.payments p ON p.id = b.id
+    WHERE p.organization_id IS DISTINCT FROM b.organization_id
+       OR p.facility_id IS DISTINCT FROM b.facility_id
+       OR p.reservation_id IS DISTINCT FROM b.reservation_id
+       OR p.expected_amount IS DISTINCT FROM b.expected_amount
+       OR p.commission_rate IS DISTINCT FROM b.commission_rate
+       OR p.commission_amount IS DISTINCT FROM b.commission_amount
+       OR p.owner_gross_share IS DISTINCT FROM b.owner_gross_share
+       OR p.captured_amount IS DISTINCT FROM b.captured_amount
+       OR p.refunded_amount IS DISTINCT FROM b.refunded_amount
+       OR p.currency IS DISTINCT FROM b.currency
+       OR p.status IS DISTINCT FROM b.status
+       OR p.provider_name IS DISTINCT FROM b.provider_name
+       OR p.provider_payment_id IS DISTINCT FROM b.provider_payment_id
+       OR p.provider_payment_intent_id IS DISTINCT FROM b.provider_payment_intent_id
+       OR p.checkout_session_id IS DISTINCT FROM b.checkout_session_id
+       OR p.capture_idempotency_key IS DISTINCT FROM b.capture_idempotency_key
+       OR p.verified_capture_evidence IS DISTINCT FROM b.verified_capture_evidence
+       OR p.created_at IS DISTINCT FROM b.created_at
+       OR p.captured_at IS DISTINCT FROM b.captured_at
+       OR p.expires_at IS DISTINCT FROM b.expires_at;
+
+    IF v_mismatch_count > 0 THEN
+        SELECT
+            b.id AS payment_id,
+            b.status AS exp_status, p.status AS act_status,
+            b.expected_amount AS exp_expected, p.expected_amount AS act_expected,
+            b.captured_amount AS exp_captured, p.captured_amount AS act_captured,
+            b.refunded_amount AS exp_refunded, p.refunded_amount AS act_refunded
+        INTO v_mismatch_detail
+        FROM _migration_005b1_payment_baseline b
+        JOIN public.payments p ON p.id = b.id
+        WHERE p.organization_id IS DISTINCT FROM b.organization_id
+           OR p.facility_id IS DISTINCT FROM b.facility_id
+           OR p.reservation_id IS DISTINCT FROM b.reservation_id
+           OR p.expected_amount IS DISTINCT FROM b.expected_amount
+           OR p.commission_rate IS DISTINCT FROM b.commission_rate
+           OR p.commission_amount IS DISTINCT FROM b.commission_amount
+           OR p.owner_gross_share IS DISTINCT FROM b.owner_gross_share
+           OR p.captured_amount IS DISTINCT FROM b.captured_amount
+           OR p.refunded_amount IS DISTINCT FROM b.refunded_amount
+           OR p.currency IS DISTINCT FROM b.currency
+           OR p.status IS DISTINCT FROM b.status
+           OR p.provider_name IS DISTINCT FROM b.provider_name
+           OR p.provider_payment_id IS DISTINCT FROM b.provider_payment_id
+           OR p.provider_payment_intent_id IS DISTINCT FROM b.provider_payment_intent_id
+           OR p.checkout_session_id IS DISTINCT FROM b.checkout_session_id
+           OR p.capture_idempotency_key IS DISTINCT FROM b.capture_idempotency_key
+           OR p.verified_capture_evidence IS DISTINCT FROM b.verified_capture_evidence
+           OR p.created_at IS DISTINCT FROM b.created_at
+           OR p.captured_at IS DISTINCT FROM b.captured_at
+           OR p.expires_at IS DISTINCT FROM b.expires_at
+        LIMIT 1;
+
+        RAISE EXCEPTION 'Post-Migration Failure: % existing payment(s) altered during migration! Offending payment ID: % (expected status %, got %; expected amt %, got %)',
+            v_mismatch_count, v_mismatch_detail.payment_id,
+            v_mismatch_detail.exp_status, v_mismatch_detail.act_status,
+            v_mismatch_detail.exp_expected, v_mismatch_detail.act_expected;
+    END IF;
+
+    RAISE NOTICE 'Post-Migration Verification: Successfully validated 1:1 field-level preservation of all % baseline payment record(s).', v_baseline_count;
 
     -- Verify that all required constraints exist on payouts
     FOREACH v_missing_con IN ARRAY ARRAY[
@@ -1111,7 +1223,7 @@ BEGIN
         RAISE EXCEPTION 'Post-Migration Failure: trg_validate_payout_status_transition missing on public.payouts.';
     END IF;
 
-    RAISE NOTICE 'Post-Migration Verification: All constraints, triggers, and % existing payment records verified successfully.', v_payment_count;
+    RAISE NOTICE 'Post-Migration Verification: All constraints, triggers, and % baseline payment records verified successfully.', v_baseline_count;
 END $$;
 
 COMMIT;
