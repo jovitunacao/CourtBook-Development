@@ -30,7 +30,7 @@
 --   24. SECURITY REVIEW 11: Payment Intent Identity & Capture Evidence Immutability
 --   25. SECURITY REVIEW 12: Terminal Payment Mutation Freeze
 --   26. SECURITY REVIEW 13: Payout Lifecycle Logs Composite Consistency & Append-Only Trigger
---   27. SECURITY REVIEW 14: Mandatory Payout Journal Linkages (approved_reserved reserve journal, paid disbursement journal, failed release journal)
+--   27. SECURITY REVIEW 14: Mandatory Payout Journal Linkages (approved_reserved reserve journal, paid disbursement journal, failed/cancelled release journals, unreserved terminal rejection)
 --   28. SECURITY REVIEW 15: Payout Terminal State Freeze
 -- ==============================================================================
 
@@ -1617,7 +1617,61 @@ BEGIN
                     RAISE NOTICE 'Test 27g2 PASSED: Reserved payout moved to failed with valid payout_failed_release journal.';
                 END;
 
-                -- 27i & 27j: Unreserved payout cancelling/failing rejects spurious release journal
+                -- 27h: Reserved payout transitioning to cancelled requires payout_failed_release journal
+                DECLARE
+                    v_payout_res_cancel UUID := gen_random_uuid();
+                    v_ft_res_cancel UUID := gen_random_uuid();
+                    v_ft_rel_cancel UUID := gen_random_uuid();
+                BEGIN
+                    INSERT INTO public.payouts (
+                        id, organization_id, payout_method_id, amount, status
+                    ) VALUES (
+                        v_payout_res_cancel, v_synth_org_a, v_payout_method_id_a, 450.00, 'pending_request'
+                    );
+
+                    INSERT INTO public.financial_transactions (
+                        id, organization_id, facility_id, transaction_type,
+                        idempotency_key, reference_id, description, canonical_payload_hash
+                    ) VALUES (
+                        v_ft_res_cancel, v_synth_org_a, v_synth_fac_a, 'payout_reserve',
+                        'idem_ft_res_cancel_01', v_payout_res_cancel, 'Test Reserve Cancel Hold', md5('payload_res_cancel')
+                    ), (
+                        v_ft_rel_cancel, v_synth_org_a, v_synth_fac_a, 'payout_failed_release',
+                        'idem_ft_rel_cancel_01', v_payout_res_cancel, 'Test Release Reserve Cancel', md5('payload_rel_cancel')
+                    );
+
+                    UPDATE public.payouts
+                    SET status = 'approved_reserved', journal_reserve_tx_id = v_ft_res_cancel
+                    WHERE id = v_payout_res_cancel;
+
+                    -- Attempt transition from approved_reserved to cancelled without release journal
+                    v_expected_failed := false;
+                    BEGIN
+                        UPDATE public.payouts
+                        SET status = 'cancelled', journal_terminal_tx_id = NULL
+                        WHERE id = v_payout_res_cancel;
+                    EXCEPTION WHEN OTHERS THEN
+                        IF SQLERRM LIKE '%Reserved payout % transitioning to "cancelled" requires a valid payout_failed_release journal transaction to release reserved funds%' THEN
+                            v_expected_failed := true;
+                            v_test_count := v_test_count + 1;
+                            RAISE NOTICE 'Test 27h PASSED: Reserved payout transitioning to cancelled without release journal rejected.';
+                        ELSE
+                            RAISE EXCEPTION 'Test 27h Failed with unexpected error [SQLSTATE %]: %', SQLSTATE, SQLERRM;
+                        END IF;
+                    END;
+                    IF NOT v_expected_failed THEN
+                        RAISE EXCEPTION 'Test 27h Failed: Reserved payout moved to cancelled without release journal!';
+                    END IF;
+
+                    -- Legitimate transition to cancelled with valid payout_failed_release journal
+                    UPDATE public.payouts
+                    SET status = 'cancelled', journal_terminal_tx_id = v_ft_rel_cancel
+                    WHERE id = v_payout_res_cancel;
+                    v_test_count := v_test_count + 1;
+                    RAISE NOTICE 'Test 27h2 PASSED: Reserved payout moved to cancelled with valid payout_failed_release journal.';
+                END;
+
+                -- 27i: Unreserved payout cancelling rejects spurious release journal
                 DECLARE
                     v_payout_unres UUID := gen_random_uuid();
                     v_ft_spurious UUID := gen_random_uuid();
@@ -1660,6 +1714,51 @@ BEGIN
                     WHERE id = v_payout_unres;
                     v_test_count := v_test_count + 1;
                     RAISE NOTICE 'Test 27i2 PASSED: Unreserved payout safely cancelled without journal links.';
+                END;
+
+                -- 27j: Unreserved payout failing rejects spurious release journal
+                DECLARE
+                    v_payout_unres_fail UUID := gen_random_uuid();
+                    v_ft_spurious_fail UUID := gen_random_uuid();
+                BEGIN
+                    INSERT INTO public.payouts (
+                        id, organization_id, payout_method_id, amount, status
+                    ) VALUES (
+                        v_payout_unres_fail, v_synth_org_a, v_payout_method_id_a, 250.00, 'pending_request'
+                    );
+
+                    INSERT INTO public.financial_transactions (
+                        id, organization_id, facility_id, transaction_type,
+                        idempotency_key, reference_id, description, canonical_payload_hash
+                    ) VALUES (
+                        v_ft_spurious_fail, v_synth_org_a, v_synth_fac_a, 'payout_failed_release',
+                        'idem_ft_spurious_fail_01', v_payout_unres_fail, 'Spurious release fail test', md5('payload_spurious_fail')
+                    );
+
+                    v_expected_failed := false;
+                    BEGIN
+                        UPDATE public.payouts
+                        SET status = 'failed', journal_terminal_tx_id = v_ft_spurious_fail
+                        WHERE id = v_payout_unres_fail;
+                    EXCEPTION WHEN OTHERS THEN
+                        IF SQLERRM LIKE '%Unreserved payout % transitioning to "failed" cannot specify a terminal release journal%' THEN
+                            v_expected_failed := true;
+                            v_test_count := v_test_count + 1;
+                            RAISE NOTICE 'Test 27j PASSED: Unreserved payout failing with spurious terminal journal rejected.';
+                        ELSE
+                            RAISE EXCEPTION 'Test 27j Failed with unexpected error [SQLSTATE %]: %', SQLSTATE, SQLERRM;
+                        END IF;
+                    END;
+                    IF NOT v_expected_failed THEN
+                        RAISE EXCEPTION 'Test 27j Failed: Unreserved payout failed with spurious terminal journal!';
+                    END IF;
+
+                    -- Legitimate unreserved failure
+                    UPDATE public.payouts
+                    SET status = 'failed', failure_reason = 'Rejected before reserve allocation'
+                    WHERE id = v_payout_unres_fail;
+                    v_test_count := v_test_count + 1;
+                    RAISE NOTICE 'Test 27j2 PASSED: Unreserved payout safely moved to failed without journal links.';
                 END;
 
                 -- -------------------------------------------------------------
