@@ -190,10 +190,19 @@ BEGIN
       AND hold_expires_at <= now();
 
     UPDATE public.payments
-    SET status = 'expired', updated_at = now()
+    SET status = 'cancelled', updated_at = now()
     WHERE facility_id = p_facility_id
       AND status = 'pending'
       AND expires_at <= now();
+
+    -- Authoritative Platform Commission Rate
+    SELECT default_commission_rate INTO v_commission_rate
+    FROM public.platform_billing_config
+    WHERE id = 1;
+
+    IF NOT FOUND OR v_commission_rate IS NULL THEN
+        v_commission_rate := 0.0500;
+    END IF;
 
     -- 5. Validate Facility
     SELECT * INTO v_facility
@@ -1575,12 +1584,7 @@ BEGIN
         'pending_request'
     );
 
-    -- Advance to approved_reserved
-    UPDATE public.payouts
-    SET status = 'approved_reserved'
-    WHERE id = v_payout_id;
-
-    -- Post Financial Journal via post_payout_reserve_event
+    -- Post Financial Journal via post_payout_reserve_event FIRST
     v_journal_res := public.post_payout_reserve_event(
         p_organization_id,
         v_payout_id,
@@ -1591,6 +1595,14 @@ BEGIN
             'payout_id', v_payout_id
         )
     );
+
+    -- Advance to approved_reserved atomically with journal_reserve_tx_id set
+    UPDATE public.payouts
+    SET status = 'approved_reserved',
+        journal_reserve_tx_id = (v_journal_res->>'transaction_id')::UUID,
+        reserved_at = now(),
+        updated_at = now()
+    WHERE id = v_payout_id;
 
     RETURN jsonb_build_object(
         'success', true,
@@ -1794,6 +1806,11 @@ BEGIN
     END IF;
 
     -- Ensure payout is in approved_reserved or submitted_to_provider
+    IF v_payout.status NOT IN ('approved_reserved', 'submitted_to_provider') THEN
+        RAISE EXCEPTION 'Cannot disburse payout %: Current status is "%". Only reserved or submitted payouts can be disbursed.',
+            p_payout_id, v_payout.status;
+    END IF;
+
     IF v_payout.status = 'approved_reserved' THEN
         UPDATE public.payouts
         SET status = 'submitted_to_provider',
@@ -1803,15 +1820,7 @@ BEGIN
         WHERE id = p_payout_id;
     END IF;
 
-    -- Advance to paid
-    UPDATE public.payouts
-    SET status = 'paid',
-        provider_payout_id = v_clean_ref,
-        completed_at = now(),
-        updated_at = now()
-    WHERE id = p_payout_id;
-
-    -- Post Financial Journal via post_payout_disbursement_event
+    -- Post Financial Journal via post_payout_disbursement_event FIRST
     v_journal_res := public.post_payout_disbursement_event(
         v_payout.organization_id,
         p_payout_id,
@@ -1822,6 +1831,15 @@ BEGIN
             'evidence', p_disbursement_evidence
         )
     );
+
+    -- Advance to paid atomically with journal_terminal_tx_id set
+    UPDATE public.payouts
+    SET status = 'paid',
+        provider_payout_id = v_clean_ref,
+        journal_terminal_tx_id = (v_journal_res->>'transaction_id')::UUID,
+        completed_at = now(),
+        updated_at = now()
+    WHERE id = p_payout_id;
 
     RETURN jsonb_build_object(
         'success', true,
@@ -1995,14 +2013,7 @@ BEGIN
             p_payout_id, v_payout.status;
     END IF;
 
-    -- Advance to failed
-    UPDATE public.payouts
-    SET status = 'failed',
-        failure_reason = v_clean_reason,
-        updated_at = now()
-    WHERE id = p_payout_id;
-
-    -- Post Financial Journal via post_payout_failed_release_event (Restores 2015 -> 2011)
+    -- Post Financial Journal via post_payout_failed_release_event FIRST (Restores 2015 -> 2011)
     v_journal_res := public.post_payout_failed_release_event(
         v_payout.organization_id,
         p_payout_id,
@@ -2013,6 +2024,15 @@ BEGIN
             'evidence', p_failure_evidence
         )
     );
+
+    -- Advance to failed atomically with journal_terminal_tx_id set
+    UPDATE public.payouts
+    SET status = 'failed',
+        failure_reason = v_clean_reason,
+        journal_terminal_tx_id = (v_journal_res->>'transaction_id')::UUID,
+        failed_at = now(),
+        updated_at = now()
+    WHERE id = p_payout_id;
 
     RETURN jsonb_build_object(
         'success', true,

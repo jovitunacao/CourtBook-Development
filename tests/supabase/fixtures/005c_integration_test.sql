@@ -14,6 +14,9 @@ DECLARE
     v_synth_fac_b UUID := gen_random_uuid();
     v_synth_court_a UUID := gen_random_uuid();
     v_synth_court_b UUID := gen_random_uuid();
+    v_synth_owner_b UUID := gen_random_uuid();
+    v_synth_staff_b UUID := gen_random_uuid();
+    v_synth_owner_a UUID := gen_random_uuid();
 
     v_checkout_res JSONB;
     v_res_id UUID;
@@ -65,6 +68,21 @@ BEGIN
     VALUES
         (v_synth_court_a, v_synth_fac_a, 'Court 005C A1', 'tennis', 350.00),
         (v_synth_court_b, v_synth_fac_b, 'Court 005C B1', 'squash', 1500.00);
+
+    -- Provision Synthetic auth users and organization members
+    INSERT INTO auth.users (id, email)
+    VALUES
+        (v_synth_owner_b, 'synth-owner-b-' || substr(v_synth_owner_b::text, 1, 8) || '@example.com'),
+        (v_synth_staff_b, 'synth-staff-b-' || substr(v_synth_staff_b::text, 1, 8) || '@example.com'),
+        (v_synth_owner_a, 'synth-owner-a-' || substr(v_synth_owner_a::text, 1, 8) || '@example.com')
+    ON CONFLICT (id) DO NOTHING;
+
+    INSERT INTO public.organization_members (organization_id, user_id, role)
+    VALUES
+        (v_synth_org_b, v_synth_owner_b, 'owner'),
+        (v_synth_org_b, v_synth_staff_b, 'staff'),
+        (v_synth_org_a, v_synth_owner_a, 'owner')
+    ON CONFLICT DO NOTHING;
 
     -- -------------------------------------------------------------------------
     -- TEST 23: Commission Calculation Correctness (5% Commission Snapshot)
@@ -895,7 +913,52 @@ BEGIN
     END;
 
     -- -------------------------------------------------------------------------
-    -- TEST 17: Valid Payout Reservation
+    -- TEST 24B: Role Guard Test - Staff Member Denied Payout Request
+    -- -------------------------------------------------------------------------
+    PERFORM set_config('request.jwt.claim.sub', v_synth_staff_b::text, true);
+    BEGIN
+        PERFORM public.request_owner_payout(
+            v_synth_org_b,
+            v_payout_method_id,
+            600.00,
+            'idem_payout_staff_denied_001'
+        );
+        RAISE EXCEPTION 'Test 24B Failed: Staff member was able to request payout!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Only organization owners and admins can request payouts%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 24B PASSED: Staff member blocked from requesting owner payout.';
+        ELSE
+            RAISE EXCEPTION 'Test 24B Failed with unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    -- -------------------------------------------------------------------------
+    -- TEST 24C: Cross-Tenant Guard Test - Org A Owner Denied Org B Payout Request
+    -- -------------------------------------------------------------------------
+    PERFORM set_config('request.jwt.claim.sub', v_synth_owner_a::text, true);
+    BEGIN
+        PERFORM public.request_owner_payout(
+            v_synth_org_b,
+            v_payout_method_id,
+            600.00,
+            'idem_payout_cross_org_denied_001'
+        );
+        RAISE EXCEPTION 'Test 24C Failed: Cross-tenant owner was able to request payout for Org B!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Only organization owners and admins can request payouts%' OR SQLERRM LIKE '%Access denied%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test 24C PASSED: Cross-tenant owner blocked from requesting payout for Org B.';
+        ELSE
+            RAISE EXCEPTION 'Test 24C Failed with unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    -- Switch to legitimate Owner B for valid payout operations
+    PERFORM set_config('request.jwt.claim.sub', v_synth_owner_b::text, true);
+
+    -- -------------------------------------------------------------------------
+    -- TEST 17: Valid Payout Reservation with Mandatory Journal Linkage
     -- -------------------------------------------------------------------------
     v_payout_res := public.request_owner_payout(
         v_synth_org_b,
@@ -905,13 +968,52 @@ BEGIN
     );
     v_payout_id := (v_payout_res->>'payout_id')::UUID;
 
+    -- Assert payouts table state and journal linkage after reservation
+    DECLARE
+        v_check_payout RECORD;
+    BEGIN
+        SELECT status, journal_reserve_tx_id, journal_terminal_tx_id, reserved_at
+        INTO v_check_payout
+        FROM public.payouts
+        WHERE id = v_payout_id;
+
+        IF v_check_payout.status != 'approved_reserved' THEN
+            RAISE EXCEPTION 'Test 17 Failed: Payout status is "%", expected "approved_reserved"!', v_check_payout.status;
+        END IF;
+
+        IF v_check_payout.journal_reserve_tx_id IS NULL THEN
+            RAISE EXCEPTION 'Test 17 Failed: journal_reserve_tx_id is NULL on approved_reserved payout!';
+        END IF;
+
+        IF v_check_payout.journal_reserve_tx_id != (v_payout_res->>'journal_transaction_id')::UUID THEN
+            RAISE EXCEPTION 'Test 17 Failed: journal_reserve_tx_id does not match returned transaction ID!';
+        END IF;
+
+        IF v_check_payout.journal_terminal_tx_id IS NOT NULL THEN
+            RAISE EXCEPTION 'Test 17 Failed: journal_terminal_tx_id must be NULL on approved_reserved payout!';
+        END IF;
+
+        -- Verify financial_transactions entry matches
+        IF NOT EXISTS (
+            SELECT 1 FROM public.financial_transactions
+            WHERE id = v_check_payout.journal_reserve_tx_id
+              AND organization_id = v_synth_org_b
+              AND transaction_type = 'payout_reserve'
+        ) THEN
+            RAISE EXCEPTION 'Test 17 Failed: journal_reserve_tx_id does not reference a valid payout_reserve transaction!';
+        END IF;
+    END;
+
+    -- Reset caller identity for backend operations
+    PERFORM set_config('request.jwt.claim.sub', '', true);
+
     SELECT * INTO v_org_bal FROM public.organization_balances WHERE organization_id = v_synth_org_b;
     IF v_org_bal.available_withdrawable_balance != 635.00 OR
        v_org_bal.pending_payout_amount != 600.00 THEN
         RAISE EXCEPTION 'Test 17 Failed: Balances not updated on payout reservation! %', v_org_bal;
     END IF;
     v_test_count := v_test_count + 1;
-    RAISE NOTICE 'Test 17 PASSED: Payout reserved funds safely locked in Account 2015.';
+    RAISE NOTICE 'Test 17 PASSED: Payout reserved funds safely locked in Account 2015 and verified in payouts catalog.';
 
     -- -------------------------------------------------------------------------
     -- TEST 35 (NEW): Payout Marked Paid Without Verified Provider Confirmation
@@ -958,9 +1060,32 @@ BEGIN
         'idem_disburse_001'
     );
 
-    IF (SELECT status FROM public.payouts WHERE id = v_payout_id) != 'paid' THEN
-        RAISE EXCEPTION 'Test 18 Failed: Payout status not paid!';
-    END IF;
+    -- Assert payouts table state and terminal journal linkage after disbursement
+    DECLARE
+        v_check_payout RECORD;
+    BEGIN
+        SELECT status, journal_reserve_tx_id, journal_terminal_tx_id, completed_at
+        INTO v_check_payout
+        FROM public.payouts
+        WHERE id = v_payout_id;
+
+        IF v_check_payout.status != 'paid' THEN
+            RAISE EXCEPTION 'Test 18 Failed: Payout status is "%", expected "paid"!', v_check_payout.status;
+        END IF;
+
+        IF v_check_payout.journal_terminal_tx_id IS NULL THEN
+            RAISE EXCEPTION 'Test 18 Failed: journal_terminal_tx_id is NULL on paid payout!';
+        END IF;
+
+        IF NOT EXISTS (
+            SELECT 1 FROM public.financial_transactions
+            WHERE id = v_check_payout.journal_terminal_tx_id
+              AND organization_id = v_synth_org_b
+              AND transaction_type = 'payout_disbursement'
+        ) THEN
+            RAISE EXCEPTION 'Test 18 Failed: journal_terminal_tx_id does not reference a valid payout_disbursement transaction!';
+        END IF;
+    END;
 
     -- Replaying confirmation is idempotent
     PERFORM public.confirm_owner_payout_disbursement(
@@ -970,7 +1095,7 @@ BEGIN
         'idem_disburse_001'
     );
     v_test_count := v_test_count + 1;
-    RAISE NOTICE 'Test 18 PASSED: Payout disbursement confirmed with verified evidence and replayed idempotently.';
+    RAISE NOTICE 'Test 18 PASSED: Payout disbursement confirmed with verified evidence and terminal journal linked.';
 
     -- -------------------------------------------------------------------------
     -- TEST 36 (NEW): Payout Reserve Released Without Failed-Provider Evidence Rejection
@@ -1024,13 +1149,40 @@ BEGIN
         'idem_payout_fail_001'
     );
 
+    -- Assert payouts table state and failure terminal journal linkage
+    DECLARE
+        v_check_payout RECORD;
+    BEGIN
+        SELECT status, journal_reserve_tx_id, journal_terminal_tx_id, failed_at
+        INTO v_check_payout
+        FROM public.payouts
+        WHERE id = v_payout_id;
+
+        IF v_check_payout.status != 'failed' THEN
+            RAISE EXCEPTION 'Test 19 Failed: Payout status is "%", expected "failed"!', v_check_payout.status;
+        END IF;
+
+        IF v_check_payout.journal_terminal_tx_id IS NULL THEN
+            RAISE EXCEPTION 'Test 19 Failed: journal_terminal_tx_id is NULL on failed payout!';
+        END IF;
+
+        IF NOT EXISTS (
+            SELECT 1 FROM public.financial_transactions
+            WHERE id = v_check_payout.journal_terminal_tx_id
+              AND organization_id = v_synth_org_b
+              AND transaction_type = 'payout_failed_release'
+        ) THEN
+            RAISE EXCEPTION 'Test 19 Failed: journal_terminal_tx_id does not reference a valid payout_failed_release transaction!';
+        END IF;
+    END;
+
     SELECT * INTO v_org_bal FROM public.organization_balances WHERE organization_id = v_synth_org_b;
     IF v_org_bal.available_withdrawable_balance != 635.00 OR
        v_org_bal.pending_payout_amount != 0.00 THEN
         RAISE EXCEPTION 'Test 19 Failed: Reserved funds were not restored on payout failure! %', v_org_bal;
     END IF;
     v_test_count := v_test_count + 1;
-    RAISE NOTICE 'Test 19 PASSED: Payout failure safely released reserve funds back to available balance.';
+    RAISE NOTICE 'Test 19 PASSED: Payout failure safely released reserve funds and linked failure terminal journal.';
 
     -- -------------------------------------------------------------------------
     -- TEST 21: Journal Debits Equal Credits Across All Transactions
@@ -1466,4 +1618,5 @@ BEGIN
     RAISE NOTICE '=== ALL % DATABASE TESTS COMPLETED SUCCESSFULLY ===', v_test_count;
 END $$;
 
-COMMIT;
+-- Strictly rollback all synthetic operations to leave database completely pristine
+ROLLBACK;
