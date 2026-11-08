@@ -74,6 +74,31 @@ SELECT
     END AS is_balanced
 FROM public.financial_transactions ft
 LEFT JOIN public.ledger_entries le ON le.transaction_id = ft.id
+WHERE (
+    -- Direct superuser session (postgres / supabase_admin) ONLY when NOT operating under an unprivileged role or JWT
+    (
+        session_user IN ('postgres', 'supabase_admin') AND
+        COALESCE(NULLIF(current_setting('role', true), 'none'), '') = '' AND
+        COALESCE(NULLIF(current_setting('request.jwt.claim.role', true), ''), '') = '' AND
+        auth.uid() IS NULL
+    ) OR
+    -- Genuine service_role: MUST have database role service_role AND claim service_role
+    (
+        current_setting('role', true) = 'service_role' AND
+        current_setting('request.jwt.claim.role', true) = 'service_role' AND
+        session_user IN ('authenticator', 'postgres', 'supabase_admin')
+    ) OR
+    -- Verified owner or admin of the organization (fails closed for anon, outsider, staff, cross-tenant)
+    (
+        auth.uid() IS NOT NULL AND
+        EXISTS (
+            SELECT 1 FROM public.organization_members om
+            WHERE om.organization_id = ft.organization_id
+              AND om.user_id = auth.uid()
+              AND om.role IN ('owner', 'admin')
+        )
+    )
+)
 GROUP BY ft.id, ft.transaction_number, ft.organization_id, ft.facility_id,
          ft.transaction_type, ft.reference_id, ft.idempotency_key, ft.created_at;
 
@@ -111,15 +136,28 @@ SELECT
     p.captured_at
 FROM public.payments p
 WHERE (
-    -- Trustworthy backend administrator session or service-role claim
-    session_user IN ('postgres', 'supabase_admin') OR
-    current_setting('request.jwt.claim.role', true) = 'service_role' OR
-    -- Sensitive financial commission splits restricted strictly to verified owners & admins of that organization
-    EXISTS (
-        SELECT 1 FROM public.organization_members om
-        WHERE om.organization_id = p.organization_id
-          AND om.user_id = auth.uid()
-          AND om.role IN ('owner', 'admin')
+    -- Direct superuser session (postgres / supabase_admin) ONLY when NOT operating under an unprivileged role or JWT
+    (
+        session_user IN ('postgres', 'supabase_admin') AND
+        COALESCE(NULLIF(current_setting('role', true), 'none'), '') = '' AND
+        COALESCE(NULLIF(current_setting('request.jwt.claim.role', true), ''), '') = '' AND
+        auth.uid() IS NULL
+    ) OR
+    -- Genuine service_role: MUST have database role service_role AND claim service_role
+    (
+        current_setting('role', true) = 'service_role' AND
+        current_setting('request.jwt.claim.role', true) = 'service_role' AND
+        session_user IN ('authenticator', 'postgres', 'supabase_admin')
+    ) OR
+    -- Verified owner or admin of the organization (fails closed for anon, outsider, staff, cross-tenant)
+    (
+        auth.uid() IS NOT NULL AND
+        EXISTS (
+            SELECT 1 FROM public.organization_members om
+            WHERE om.organization_id = p.organization_id
+              AND om.user_id = auth.uid()
+              AND om.role IN ('owner', 'admin')
+        )
     )
 );
 
@@ -169,7 +207,32 @@ SELECT
     p.failed_at
 FROM public.payouts p
 LEFT JOIN public.financial_transactions res_ft ON res_ft.id = p.journal_reserve_tx_id
-LEFT JOIN public.financial_transactions term_ft ON term_ft.id = p.journal_terminal_tx_id;
+LEFT JOIN public.financial_transactions term_ft ON term_ft.id = p.journal_terminal_tx_id
+WHERE (
+    -- Direct superuser session (postgres / supabase_admin) ONLY when NOT operating under an unprivileged role or JWT
+    (
+        session_user IN ('postgres', 'supabase_admin') AND
+        COALESCE(NULLIF(current_setting('role', true), 'none'), '') = '' AND
+        COALESCE(NULLIF(current_setting('request.jwt.claim.role', true), ''), '') = '' AND
+        auth.uid() IS NULL
+    ) OR
+    -- Genuine service_role: MUST have database role service_role AND claim service_role
+    (
+        current_setting('role', true) = 'service_role' AND
+        current_setting('request.jwt.claim.role', true) = 'service_role' AND
+        session_user IN ('authenticator', 'postgres', 'supabase_admin')
+    ) OR
+    -- Verified owner or admin of the organization (fails closed for anon, outsider, staff, cross-tenant)
+    (
+        auth.uid() IS NOT NULL AND
+        EXISTS (
+            SELECT 1 FROM public.organization_members om
+            WHERE om.organization_id = p.organization_id
+              AND om.user_id = auth.uid()
+              AND om.role IN ('owner', 'admin')
+        )
+    )
+);
 
 COMMENT ON VIEW public.v_payout_lifecycle_reconciliation IS 'Audit view verifying mandatory journal linkage and lifecycle status invariants for owner payouts.';
 
@@ -318,15 +381,28 @@ JOIN public.organization_balances ob ON ob.organization_id = o.id
 LEFT JOIN ledger_summary ls ON ls.organization_id = o.id
 LEFT JOIN payout_summary ps ON ps.organization_id = o.id
 WHERE (
-    -- Trustworthy backend administrator session or service-role claim
-    session_user IN ('postgres', 'supabase_admin') OR
-    current_setting('request.jwt.claim.role', true) = 'service_role' OR
-    -- Sensitive balance sheet overview restricted strictly to verified owners & admins of that organization
-    EXISTS (
-        SELECT 1 FROM public.organization_members om
-        WHERE om.organization_id = o.id
-          AND om.user_id = auth.uid()
-          AND om.role IN ('owner', 'admin')
+    -- Direct superuser session (postgres / supabase_admin) ONLY when NOT operating under an unprivileged role or JWT
+    (
+        session_user IN ('postgres', 'supabase_admin') AND
+        COALESCE(NULLIF(current_setting('role', true), 'none'), '') = '' AND
+        COALESCE(NULLIF(current_setting('request.jwt.claim.role', true), ''), '') = '' AND
+        auth.uid() IS NULL
+    ) OR
+    -- Genuine service_role: MUST have database role service_role AND claim service_role
+    (
+        current_setting('role', true) = 'service_role' AND
+        current_setting('request.jwt.claim.role', true) = 'service_role' AND
+        session_user IN ('authenticator', 'postgres', 'supabase_admin')
+    ) OR
+    -- Verified owner or admin of the organization (fails closed for anon, outsider, staff, cross-tenant)
+    (
+        auth.uid() IS NOT NULL AND
+        EXISTS (
+            SELECT 1 FROM public.organization_members om
+            WHERE om.organization_id = o.id
+              AND om.user_id = auth.uid()
+              AND om.role IN ('owner', 'admin')
+        )
     )
 );
 
@@ -359,25 +435,42 @@ SET search_path = public, pg_temp
 AS $$
 DECLARE
     v_session_user TEXT;
+    v_active_role TEXT;
     v_jwt_role TEXT;
-    v_is_trusted_service BOOLEAN := false;
     v_caller_uid UUID;
+    v_is_trusted_service BOOLEAN := false;
 BEGIN
     -- Reliable caller identification (immune to SECURITY DEFINER function owner substitution)
     v_session_user := session_user;
+    v_active_role := NULLIF(current_setting('role', true), 'none');
     v_jwt_role := NULLIF(current_setting('request.jwt.claim.role', true), '');
+    v_caller_uid := auth.uid();
 
-    -- 1. Unconditional rejection of anonymous clients
-    IF v_session_user = 'anon' OR v_jwt_role = 'anon' OR current_setting('role', true) = 'anon' THEN
+    -- 1. Anti-impersonation: An authenticated database role cannot claim service_role
+    IF v_active_role = 'authenticated' AND v_jwt_role = 'service_role' THEN
+        RAISE EXCEPTION 'Access denied: Authenticated role cannot claim service_role privileges.';
+    END IF;
+
+    -- 2. Unconditional rejection of anonymous clients
+    IF v_active_role = 'anon' OR
+       v_jwt_role = 'anon' OR
+       v_session_user = 'anon' OR
+       (v_active_role IS NULL AND v_jwt_role IS NULL AND v_caller_uid IS NULL AND v_session_user NOT IN ('postgres', 'supabase_admin')) THEN
         RAISE EXCEPTION 'Access denied: Anonymous clients cannot access financial reconciliation.';
     END IF;
 
-    -- 2. Reliable identification of privileged service / superuser operations
-    -- Only true when:
-    --   a) The direct connection session_user is postgres or supabase_admin, OR
-    --   b) The API request has an authoritative 'service_role' claim and was dispatched via trusted authenticator/postgres
-    IF (v_session_user IN ('postgres', 'supabase_admin')) OR
-       (v_jwt_role = 'service_role' AND v_session_user IN ('authenticator', 'postgres', 'supabase_admin')) THEN
+    -- 3. Reliable identification of privileged service / superuser operations
+    -- Avoid broad trust in session_user when the session switches to a less-privileged effective role.
+    -- Trusted service is ONLY recognized when:
+    --   a) Direct superuser session (postgres / supabase_admin) WITHOUT an active unprivileged role, claim, or client identity
+    --   b) Genuine service_role dispatched via PostgREST (active role = 'service_role' AND jwt role = 'service_role')
+    IF (v_session_user IN ('postgres', 'supabase_admin') AND
+        v_active_role IS NULL AND
+        v_jwt_role IS NULL AND
+        v_caller_uid IS NULL) OR
+       (v_active_role = 'service_role' AND
+        v_jwt_role = 'service_role' AND
+        v_session_user IN ('authenticator', 'postgres', 'supabase_admin')) THEN
         v_is_trusted_service := true;
     END IF;
 
@@ -936,9 +1029,10 @@ SET search_path = public, pg_temp
 AS $$
 DECLARE
     v_session_user TEXT;
+    v_active_role TEXT;
     v_jwt_role TEXT;
-    v_is_trusted_service BOOLEAN := false;
     v_caller_uid UUID;
+    v_is_trusted_service BOOLEAN := false;
     v_total_discrepancies INT := 0;
     v_critical_count INT := 0;
     v_error_count INT := 0;
@@ -953,16 +1047,35 @@ DECLARE
 BEGIN
     -- Reliable caller identification (immune to SECURITY DEFINER function owner substitution)
     v_session_user := session_user;
+    v_active_role := NULLIF(current_setting('role', true), 'none');
     v_jwt_role := NULLIF(current_setting('request.jwt.claim.role', true), '');
+    v_caller_uid := auth.uid();
 
-    -- 1. Unconditionally reject anonymous clients
-    IF v_session_user = 'anon' OR v_jwt_role = 'anon' OR current_setting('role', true) = 'anon' THEN
+    -- 1. Anti-impersonation: An authenticated database role cannot claim service_role
+    IF v_active_role = 'authenticated' AND v_jwt_role = 'service_role' THEN
+        RAISE EXCEPTION 'Access denied: Authenticated role cannot claim service_role privileges.';
+    END IF;
+
+    -- 2. Unconditional rejection of anonymous clients
+    IF v_active_role = 'anon' OR
+       v_jwt_role = 'anon' OR
+       v_session_user = 'anon' OR
+       (v_active_role IS NULL AND v_jwt_role IS NULL AND v_caller_uid IS NULL AND v_session_user NOT IN ('postgres', 'supabase_admin')) THEN
         RAISE EXCEPTION 'Access denied: Anonymous clients cannot access financial reconciliation.';
     END IF;
 
-    -- 2. Reliable identification of privileged service / superuser operations
-    IF (v_session_user IN ('postgres', 'supabase_admin')) OR
-       (v_jwt_role = 'service_role' AND v_session_user IN ('authenticator', 'postgres', 'supabase_admin')) THEN
+    -- 3. Reliable identification of privileged service / superuser operations
+    -- Avoid broad trust in session_user when the session switches to a less-privileged effective role.
+    -- Trusted service is ONLY recognized when:
+    --   a) Direct superuser session (postgres / supabase_admin) WITHOUT an active unprivileged role, claim, or client identity
+    --   b) Genuine service_role dispatched via PostgREST (active role = 'service_role' AND jwt role = 'service_role')
+    IF (v_session_user IN ('postgres', 'supabase_admin') AND
+        v_active_role IS NULL AND
+        v_jwt_role IS NULL AND
+        v_caller_uid IS NULL) OR
+       (v_active_role = 'service_role' AND
+        v_jwt_role = 'service_role' AND
+        v_session_user IN ('authenticator', 'postgres', 'supabase_admin')) THEN
         v_is_trusted_service := true;
     END IF;
 

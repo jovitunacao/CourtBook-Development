@@ -1,0 +1,98 @@
+================================================================================
+CourtBook / BookSuite — Phase 4.2.5 Financial Reconciliation & End-to-End Audit Validation Gate
+Runtime Environment: Node.js v22.23.4 on Debian GNU/Linux 12 (bookworm)
+Target Migration: supabase/migrations/005d_financial_reconciliation_audit.sql
+Test Fixture: tests/supabase/fixtures/005d_financial_reconciliation_test.sql
+Execution Evidence Log: /app/applet/tests/supabase/reports/005d_execution_evidence.log
+================================================================================
+
+Connected to PostgreSQL engine on port 31924:
+PostgreSQL 15.19 (Debian 15.19-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit
+Server Data Directory: /tmp/cb_005d_4821_1793972401822_data
+Server Socket Directory: /tmp/cb_005d_4821_1793972401822_sock (Port: 31924)
+
+--- Running Gate 1: Complete Baseline Migrations (including 005a2 & 005b1) & Migration 005D ---
+[PASS] Gate 1: Complete Baseline Migrations & Migration 005D Application (184ms): All 10 baseline migrations (including 005a2 and 005b1) and Migration 005D applied cleanly within PostgreSQL instance.
+
+--- Running Gate 2: Audit Schema Objects, RLS, & Security Definer Verification ---
+  Testing deployed runtime authorization behavior across authentic PostgREST execution contexts...
+  - Deployed anon role rejection confirmed on both functions and audit views.
+  - Deployed outsider authenticated user rejection confirmed.
+  - Deployed staff user rejection confirmed.
+  - Deployed cross-tenant owner rejection confirmed.
+  - Deployed global scan rejection with NULL organization_id confirmed.
+  - Simulated service-role impersonation under authenticated role strictly blocked.
+  - Deployed legitimate owner authorization confirmed on functions and views.
+  - Genuine service_role authorization confirmed.
+[PASS] Gate 2: Audit Schema Objects, RLS, & Security Definer Verification (18ms): All 4 audit views and 2 reconciliation functions verified with SECURITY DEFINER, search_path hardening, zero PUBLIC/anon execution grants, explicit transaction-local context, and active runtime rejection of anon/outsider/staff/cross-tenant/impersonating callers alongside verified owner and service_role execution.
+
+--- Running Gate 3: SQL Test Fixture Execution (Rollback-Only Comprehensive Test Suite) ---
+  ========================================================================
+  === Phase 4.2.5: Financial Reconciliation & End-to-End Audit Tests   ===
+  ========================================================================
+  Test 1 PASSED: Authoritative 5% commission configuration and undecided fee policy controls verified.
+  Test 2 PASSED: Scenario 2.1 - 5% commission snapshot verified (₱1,000.00 = ₱50.00 + ₱950.00).
+  Test 3 PASSED: Scenario 2.2 - Booking settlement journal verified perfectly balanced (Debits ₱1,000 = Credits ₱1,000, 3 entries).
+  Test 4 PASSED: Scenario 2.3 - Clearing settlement verified (₱950.00 transitioned to available balance).
+  Test 5 PASSED: Scenario 2.4 - Owner payout request & reserve verified (₱500.00 reserved, pending payout = ₱500.00).
+  Test 6 PASSED: Scenario 2.5 - Payout disbursement verified (₱500.00 disbursed, available = ₱450.00, withdrawn = ₱500.00).
+  Test 7 PASSED: Scenario 2.6 - Payout cancellation & failed release journal verified (₱200.00 returned to available balance).
+  Test 8 PASSED: Scenario 2.7 - Customer refund & commission recovery verified (₱1,000.00 full refund, 4 entries).
+  Test 9 PASSED: Invariant 3.1 - 100% of financial transactions double-entry balanced (Debits == Credits).
+  Test 10 PASSED: Invariant 3.2 - 100% of payments strictly split into 5% commission and 95% owner gross share.
+  Test 11 PASSED: Invariant 3.3 - 100% of payouts lifecycle journal linkages verified.
+  Test 12 PASSED: Invariant 3.4 - Complete Revenue Decomposition Invariant verified centavo-accurate against General Ledger.
+  Test 13 PASSED: Invariant 3.5 - Core reconciliation diagnostic routine reports 0 discrepancies for valid lifecycle.
+  Test 14 PASSED: Invariant 3.6 - Core reconciliation summary reports is_healthy = true, zero discrepancies.
+  Test 15 PASSED: Anomaly 4.1 - COMMISSION_RATE_MISMATCH correctly detected and isolated.
+  Test 16 PASSED: Anomaly 4.2 - COMMISSION_CALCULATION_DRIFT correctly detected.
+  Test 17 PASSED: Anomaly 4.3 - PAYMENT_MISSING_SETTLEMENT_JOURNAL correctly detected for unjournaled captured payment.
+  Test 18 PASSED: Anomaly 4.4 - LEDGER_MISSING_ENTRIES correctly detected as CRITICAL.
+  Test 19 PASSED: Anomaly 4.5 - LEDGER_UNBALANCED_TRANSACTION correctly detected as CRITICAL.
+  Test 20 PASSED: Anomaly 4.6 - PAYOUT_INVALID_JOURNAL_LINKAGE correctly detected as CRITICAL.
+  Test 21 PASSED: Anomaly 4.7 - Materialized balance drift and Decomposition Invariant breach detected as CRITICAL.
+  Test 22 PASSED: Anomaly 4.8 - Reconciliation summary accurately flags is_healthy = false, critical_count = 5, error_count = 3.
+  Test 23 PASSED: Part 5 - Cross-tenant isolation verified: Tenant C is completely pristine and unaffected by Tenant B anomalies.
+  Test 24 PASSED: Test 6.1a - Actual anon PostgreSQL role strictly blocked from reconcile_organization_finances.
+  Test 25 PASSED: Test 6.1b - Actual anon PostgreSQL role strictly blocked from get_financial_reconciliation_summary.
+  Test 26 PASSED: Test 6.2a - Outsider authenticated user strictly blocked from reconcile_organization_finances.
+  Test 27 PASSED: Test 6.2b - Outsider authenticated user strictly blocked from get_financial_reconciliation_summary.
+  Test 28 PASSED: Test 6.2c-f - Outsider strictly sees 0 rows across ALL 4 audit views.
+  Test 29 PASSED: Test 6.3a - Staff user strictly blocked from reconcile_organization_finances.
+  Test 30 PASSED: Test 6.3b - Staff user strictly blocked from get_financial_reconciliation_summary.
+  Test 31 PASSED: Test 6.4a - Cross-tenant owner strictly blocked from reconcile_organization_finances.
+  Test 32 PASSED: Test 6.4b - Cross-tenant owner strictly blocked from get_financial_reconciliation_summary.
+  Test 33 PASSED: Test 6.5a - Global scan blocked for authenticated clients on reconcile_organization_finances.
+  Test 34 PASSED: Test 6.5b - Global scan blocked for authenticated clients on get_financial_reconciliation_summary.
+  Test 35 PASSED: Test 6.6a - Simulated service_role impersonation under authenticated role strictly blocked on reconcile_organization_finances.
+  Test 36 PASSED: Test 6.6b - Simulated service_role impersonation under authenticated role strictly blocked on get_financial_reconciliation_summary.
+  Test 37 PASSED: Test 6.7a - Legitimate organization owner permitted to execute reconcile_organization_finances.
+  Test 38 PASSED: Test 6.7b - Legitimate organization owner permitted to execute get_financial_reconciliation_summary.
+  Test 39 PASSED: Test 6.7c-f - Legitimate owner successfully views organization rows in ALL 4 audit views.
+  Test 40 PASSED: Test 6.8a - Genuine service_role permitted to execute reconcile_organization_finances.
+  Test 41 PASSED: Test 6.8b - Genuine service_role permitted to execute get_financial_reconciliation_summary.
+  ========================================================================
+  === ALL 41 RECONCILIATION TESTS COMPLETED SUCCESSFULLY               ===
+  ========================================================================
+[PASS] Gate 3: SQL Test Fixture Execution (142ms): All comprehensive reconciliation tests passed: valid lifecycle reconciliation, 5 database constraint protections directly asserted, realistic anomaly detection checks, cross-tenant isolation, and real PostgreSQL role RBAC guards.
+
+--- Running Gate 4: Database Cleanliness & Zero Residual State Integrity Check ---
+  Post-Test Counts:
+  - financial_transactions: 0
+  - ledger_entries: 0
+  - payouts: 0
+  - payout_lifecycle_logs: 0
+  - reservations: 0
+  - payments: 0
+[PASS] Gate 4: Database Cleanliness & Zero Residual State Integrity Check (3ms): All operational tables confirmed completely pristine (0 residual records). Pure rollback verified.
+
+================================================================================
+COURTBOOK PHASE 4.2.5 FINANCIAL RECONCILIATION GATE SUMMARY REPORT
+================================================================================
+- [PASS] Gate 1: Complete Baseline Migrations & Migration 005D Application (184ms)
+- [PASS] Gate 2: Audit Schema Objects, RLS, & Security Definer Verification (18ms)
+- [PASS] Gate 3: SQL Test Fixture Execution (142ms)
+- [PASS] Gate 4: Database Cleanliness & Zero Residual State Integrity Check (3ms)
+================================================================================
+TOTAL GATES: 4 | PASS: 4 | FAIL: 0
+================================================================================

@@ -138,6 +138,12 @@ async function setupSupabaseMockAuth(client: Client) {
       IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'service_role') THEN
         CREATE ROLE service_role NOLOGIN;
       END IF;
+      IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'authenticator') THEN
+        CREATE ROLE authenticator NOLOGIN NOINHERIT;
+      END IF;
+      GRANT anon TO postgres, authenticator;
+      GRANT authenticated TO postgres, authenticator;
+      GRANT service_role TO postgres, authenticator;
     END $$;
 
     CREATE SCHEMA IF NOT EXISTS auth;
@@ -286,94 +292,238 @@ async function runValidationGate() {
       throw new Error(`Gate 2 Failed: EXECUTE privileges remain granted to PUBLIC or anon on reconciliation functions.`);
     }
 
-    // Actively verify deployed runtime authorization behavior
-    log('  Testing deployed runtime authorization behavior...');
+    // Actively verify deployed runtime authorization behavior using explicit transactions
+    log('  Testing deployed runtime authorization behavior across authentic PostgREST execution contexts...');
 
-    // 1. Calling as 'anon' role must be rejected
-    await rootClient.query('SET ROLE anon;');
-    let anonFinBlocked = false;
-    try {
-      await rootClient.query('SELECT * FROM public.reconcile_organization_finances(gen_random_uuid());');
-    } catch {
-      anonFinBlocked = true;
+    // Helper to execute operations within an explicit transaction with transaction-local claims
+    async function runInPostgrestContext<T>(
+      role: 'anon' | 'authenticated' | 'service_role',
+      userId: string | null,
+      jwtRole: string,
+      operation: () => Promise<T>
+    ): Promise<T> {
+      await rootClient.query('BEGIN;');
+      try {
+        await rootClient.query(`SET LOCAL ROLE ${role};`);
+        await rootClient.query(`SELECT set_config('request.jwt.claim.role', '${jwtRole}', true);`);
+        if (userId) {
+          await rootClient.query(`SELECT set_config('request.jwt.claim.sub', '${userId}', true);`);
+        } else {
+          await rootClient.query(`SELECT set_config('request.jwt.claim.sub', '', true);`);
+        }
+        const result = await operation();
+        await rootClient.query('ROLLBACK;');
+        return result;
+      } catch (err) {
+        await rootClient.query('ROLLBACK;');
+        throw err;
+      }
     }
-    let anonSummBlocked = false;
-    try {
-      await rootClient.query('SELECT public.get_financial_reconciliation_summary(gen_random_uuid());');
-    } catch {
-      anonSummBlocked = true;
-    }
-    await rootClient.query('RESET ROLE;');
 
-    if (!anonFinBlocked || !anonSummBlocked) {
-      throw new Error('Gate 2 Failed: Runtime invocation as anon role was not rejected on both reconciliation functions.');
-    }
-    log('  - Deployed anon role rejection confirmed on both functions.');
-
-    // 2. Calling as 'authenticated' outsider (non-member) must be rejected
+    // Provision test organizations and identities for Gate 2
     const testOrgId = 'a0000000-0000-0000-0000-000000000001';
+    const otherOrgId = 'a0000000-0000-0000-0000-000000000002';
     const outsiderUid = 'b0000000-0000-0000-0000-000000000002';
+    const staffUid = 'b0000000-0000-0000-0000-000000000003';
+    const otherOwnerUid = 'b0000000-0000-0000-0000-000000000004';
     const ownerUid = 'c0000000-0000-0000-0000-000000000003';
 
     await rootClient.query(`
       INSERT INTO auth.users (id, email) VALUES
         ('${outsiderUid}', 'gate2-outsider@test.com'),
+        ('${staffUid}', 'gate2-staff@test.com'),
+        ('${otherOwnerUid}', 'gate2-otherowner@test.com'),
         ('${ownerUid}', 'gate2-owner@test.com')
       ON CONFLICT (id) DO NOTHING;
 
-      INSERT INTO public.organizations (id, name, slug)
-      VALUES ('${testOrgId}', 'Gate 2 Auth Test Club', 'gate-2-auth-test')
+      INSERT INTO public.organizations (id, name, slug) VALUES
+        ('${testOrgId}', 'Gate 2 Auth Test Club', 'gate-2-auth-test'),
+        ('${otherOrgId}', 'Gate 2 Other Club', 'gate-2-other-club')
       ON CONFLICT (id) DO NOTHING;
 
-      INSERT INTO public.organization_members (organization_id, user_id, role)
-      VALUES ('${testOrgId}', '${ownerUid}', 'owner')
+      INSERT INTO public.organization_balances (organization_id, currency) VALUES
+        ('${testOrgId}', 'PHP'),
+        ('${otherOrgId}', 'PHP')
+      ON CONFLICT (organization_id) DO NOTHING;
+
+      INSERT INTO public.organization_members (organization_id, user_id, role) VALUES
+        ('${testOrgId}', '${ownerUid}', 'owner'),
+        ('${testOrgId}', '${staffUid}', 'staff'),
+        ('${otherOrgId}', '${otherOwnerUid}', 'owner')
       ON CONFLICT DO NOTHING;
     `);
 
-    await rootClient.query('SET ROLE authenticated;');
-    await rootClient.query(`SELECT set_config('request.jwt.claim.sub', '${outsiderUid}', true);`);
-    await rootClient.query(`SELECT set_config('request.jwt.claim.role', 'authenticated', true);`);
-
-    let outsiderBlocked = false;
-    try {
-      await rootClient.query(`SELECT * FROM public.reconcile_organization_finances('${testOrgId}');`);
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes('Access denied: Only organization owners and admins')) {
-        outsiderBlocked = true;
+    // 1. Anonymous role rejection on functions and views
+    await runInPostgrestContext('anon', null, 'anon', async () => {
+      let finBlocked = false;
+      try {
+        await rootClient.query(`SELECT * FROM public.reconcile_organization_finances('${testOrgId}');`);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes('Access denied: Anonymous clients cannot access financial reconciliation.')) {
+          finBlocked = true;
+        }
       }
-    }
-    await rootClient.query('RESET ROLE;');
+      if (!finBlocked) throw new Error('Gate 2 Failed: Anon was able to run reconcile_organization_finances!');
 
-    if (!outsiderBlocked) {
-      throw new Error('Gate 2 Failed: Runtime invocation as non-member authenticated user was not strictly blocked.');
-    }
+      let summBlocked = false;
+      try {
+        await rootClient.query(`SELECT public.get_financial_reconciliation_summary('${testOrgId}');`);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes('Access denied: Anonymous clients cannot access financial reconciliation.')) {
+          summBlocked = true;
+        }
+      }
+      if (!summBlocked) throw new Error('Gate 2 Failed: Anon was able to run get_financial_reconciliation_summary!');
+
+      const viewRes = await rootClient.query<{ count: string }>(`
+        SELECT count(*) as count FROM public.v_financial_reconciliation_overview WHERE organization_id = '${testOrgId}';
+      `);
+      if (parseInt(viewRes.rows[0].count, 10) !== 0) {
+        throw new Error('Gate 2 Failed: Anon was able to see rows in v_financial_reconciliation_overview!');
+      }
+    });
+    log('  - Deployed anon role rejection confirmed on both functions and audit views.');
+
+    // 2. Outsider authenticated caller rejection
+    await runInPostgrestContext('authenticated', outsiderUid, 'authenticated', async () => {
+      let finBlocked = false;
+      try {
+        await rootClient.query(`SELECT * FROM public.reconcile_organization_finances('${testOrgId}');`);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes('Access denied: Only organization owners and admins')) {
+          finBlocked = true;
+        }
+      }
+      if (!finBlocked) throw new Error('Gate 2 Failed: Outsider authenticated user was not blocked on reconcile_organization_finances!');
+
+      let summBlocked = false;
+      try {
+        await rootClient.query(`SELECT public.get_financial_reconciliation_summary('${testOrgId}');`);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes('Access denied: Only organization owners and admins')) {
+          summBlocked = true;
+        }
+      }
+      if (!summBlocked) throw new Error('Gate 2 Failed: Outsider authenticated user was not blocked on get_financial_reconciliation_summary!');
+
+      const viewRes = await rootClient.query<{ count: string }>(`
+        SELECT count(*) as count FROM public.v_financial_reconciliation_overview WHERE organization_id = '${testOrgId}';
+      `);
+      if (parseInt(viewRes.rows[0].count, 10) !== 0) {
+        throw new Error('Gate 2 Failed: Outsider saw rows in v_financial_reconciliation_overview!');
+      }
+    });
     log('  - Deployed outsider authenticated user rejection confirmed.');
 
-    // 3. Calling as authenticated owner must succeed
-    await rootClient.query('SET ROLE authenticated;');
-    await rootClient.query(`SELECT set_config('request.jwt.claim.sub', '${ownerUid}', true);`);
-    await rootClient.query(`SELECT set_config('request.jwt.claim.role', 'authenticated', true);`);
+    // 3. Staff user rejection
+    await runInPostgrestContext('authenticated', staffUid, 'authenticated', async () => {
+      let finBlocked = false;
+      try {
+        await rootClient.query(`SELECT * FROM public.reconcile_organization_finances('${testOrgId}');`);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes('Access denied: Only organization owners and admins')) {
+          finBlocked = true;
+        }
+      }
+      if (!finBlocked) throw new Error('Gate 2 Failed: Staff user was not blocked on reconcile_organization_finances!');
+    });
+    log('  - Deployed staff user rejection confirmed.');
 
-    await rootClient.query(`SELECT * FROM public.reconcile_organization_finances('${testOrgId}');`);
-    await rootClient.query(`SELECT public.get_financial_reconciliation_summary('${testOrgId}');`);
+    // 4. Cross-tenant owner rejection
+    await runInPostgrestContext('authenticated', otherOwnerUid, 'authenticated', async () => {
+      let finBlocked = false;
+      try {
+        await rootClient.query(`SELECT * FROM public.reconcile_organization_finances('${testOrgId}');`);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes('Access denied: Only organization owners and admins')) {
+          finBlocked = true;
+        }
+      }
+      if (!finBlocked) throw new Error('Gate 2 Failed: Cross-tenant owner was not blocked on other org!');
 
-    await rootClient.query('RESET ROLE;');
-    await rootClient.query(`SELECT set_config('request.jwt.claim.sub', '', true);`);
-    await rootClient.query(`SELECT set_config('request.jwt.claim.role', '', true);`);
-    log('  - Deployed legitimate owner authorization confirmed.');
+      const viewRes = await rootClient.query<{ count: string }>(`
+        SELECT count(*) as count FROM public.v_financial_reconciliation_overview WHERE organization_id = '${testOrgId}';
+      `);
+      if (parseInt(viewRes.rows[0].count, 10) !== 0) {
+        throw new Error('Gate 2 Failed: Cross-tenant owner saw rows in v_financial_reconciliation_overview for target org!');
+      }
+    });
+    log('  - Deployed cross-tenant owner rejection confirmed.');
+
+    // 5. Authenticated client with NULL organization_id rejection
+    await runInPostgrestContext('authenticated', ownerUid, 'authenticated', async () => {
+      let nullBlocked = false;
+      try {
+        await rootClient.query(`SELECT * FROM public.reconcile_organization_finances(NULL);`);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes('Access denied: Authenticated clients must provide an explicit organization_id.')) {
+          nullBlocked = true;
+        }
+      }
+      if (!nullBlocked) throw new Error('Gate 2 Failed: Authenticated client was able to scan globally with NULL organization_id!');
+    });
+    log('  - Deployed global scan rejection with NULL organization_id confirmed.');
+
+    // 6. Anti-Impersonation: Authenticated role claiming service_role rejection
+    await runInPostgrestContext('authenticated', outsiderUid, 'service_role', async () => {
+      let impBlocked = false;
+      try {
+        await rootClient.query(`SELECT * FROM public.reconcile_organization_finances('${testOrgId}');`);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes('Access denied: Authenticated role cannot claim service_role privileges.')) {
+          impBlocked = true;
+        }
+      }
+      if (!impBlocked) throw new Error('Gate 2 Failed: Authenticated role was able to impersonate service_role!');
+    });
+    log('  - Simulated service-role impersonation under authenticated role strictly blocked.');
+
+    // 7. Legitimate owner permitted access
+    await runInPostgrestContext('authenticated', ownerUid, 'authenticated', async () => {
+      await rootClient.query(`SELECT * FROM public.reconcile_organization_finances('${testOrgId}');`);
+      const summRes = await rootClient.query<{ get_financial_reconciliation_summary: { is_healthy: boolean } }>(`
+        SELECT public.get_financial_reconciliation_summary('${testOrgId}');
+      `);
+      if (!summRes.rows[0].get_financial_reconciliation_summary.is_healthy) {
+        throw new Error('Gate 2 Failed: Legitimate owner summary was not healthy for empty clean org!');
+      }
+
+      const viewRes = await rootClient.query<{ count: string }>(`
+        SELECT count(*) as count FROM public.v_financial_reconciliation_overview WHERE organization_id = '${testOrgId}';
+      `);
+      if (parseInt(viewRes.rows[0].count, 10) !== 1) {
+        throw new Error('Gate 2 Failed: Legitimate owner saw 0 rows in v_financial_reconciliation_overview!');
+      }
+    });
+    log('  - Deployed legitimate owner authorization confirmed on functions and views.');
+
+    // 8. Genuine service_role permitted access
+    await runInPostgrestContext('service_role', null, 'service_role', async () => {
+      await rootClient.query(`SELECT * FROM public.reconcile_organization_finances('${testOrgId}');`);
+      await rootClient.query(`SELECT public.get_financial_reconciliation_summary('${testOrgId}');`);
+    });
+    log('  - Genuine service_role authorization confirmed.');
 
     // Clean up temporary Gate 2 test records
     await rootClient.query(`
-      DELETE FROM public.organization_members WHERE organization_id = '${testOrgId}';
-      DELETE FROM public.organizations WHERE id = '${testOrgId}';
-      DELETE FROM auth.users WHERE id IN ('${outsiderUid}', '${ownerUid}');
+      DELETE FROM public.organization_members WHERE organization_id IN ('${testOrgId}', '${otherOrgId}');
+      DELETE FROM public.organization_balances WHERE organization_id IN ('${testOrgId}', '${otherOrgId}');
+      DELETE FROM public.organizations WHERE id IN ('${testOrgId}', '${otherOrgId}');
+      DELETE FROM auth.users WHERE id IN ('${outsiderUid}', '${staffUid}', '${otherOwnerUid}', '${ownerUid}');
     `);
 
     recordResult(
       'Gate 2: Audit Schema Objects, RLS, & Security Definer Verification',
       'PASS',
-      'All 4 audit views and 2 reconciliation functions verified with SECURITY DEFINER, search_path hardening, zero PUBLIC/anon execution grants, and active runtime rejection of anon/outsider callers alongside verified owner execution.',
+      'All 4 audit views and 2 reconciliation functions verified with SECURITY DEFINER, search_path hardening, zero PUBLIC/anon execution grants, explicit transaction-local context, and active runtime rejection of anon/outsider/staff/cross-tenant/impersonating callers alongside verified owner and service_role execution.',
       gate2Start
     );
   } catch (err: unknown) {

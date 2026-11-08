@@ -1108,19 +1108,40 @@ BEGIN
         END IF;
     END;
 
-    -- Audit view isolation for outsider
+    -- Audit view isolation for outsider across ALL 4 audit views
     DECLARE
         v_view_row_count INT;
     BEGIN
         SELECT count(*) INTO v_view_row_count
+        FROM public.v_transaction_double_entry_audit
+        WHERE organization_id = v_synth_org_valid;
+        IF v_view_row_count != 0 THEN
+            RAISE EXCEPTION 'Test 6.2c Failed: Outsider viewed v_transaction_double_entry_audit!';
+        END IF;
+
+        SELECT count(*) INTO v_view_row_count
+        FROM public.v_payment_commission_audit
+        WHERE organization_id = v_synth_org_valid;
+        IF v_view_row_count != 0 THEN
+            RAISE EXCEPTION 'Test 6.2d Failed: Outsider viewed v_payment_commission_audit!';
+        END IF;
+
+        SELECT count(*) INTO v_view_row_count
+        FROM public.v_payout_lifecycle_reconciliation
+        WHERE organization_id = v_synth_org_valid;
+        IF v_view_row_count != 0 THEN
+            RAISE EXCEPTION 'Test 6.2e Failed: Outsider viewed v_payout_lifecycle_reconciliation!';
+        END IF;
+
+        SELECT count(*) INTO v_view_row_count
         FROM public.v_financial_reconciliation_overview
         WHERE organization_id = v_synth_org_valid;
-
         IF v_view_row_count != 0 THEN
-            RAISE EXCEPTION 'Test 6.2c Failed: Outsider was able to view organization overview via v_financial_reconciliation_overview!';
+            RAISE EXCEPTION 'Test 6.2f Failed: Outsider viewed v_financial_reconciliation_overview!';
         END IF;
+
         v_test_count := v_test_count + 1;
-        RAISE NOTICE 'Test % PASSED: Test 6.2c - Outsider sees 0 rows in v_financial_reconciliation_overview.', v_test_count;
+        RAISE NOTICE 'Test % PASSED: Test 6.2c-f - Outsider strictly sees 0 rows across ALL 4 audit views.', v_test_count;
     END;
 
     -- -------------------------------------------------------------------------
@@ -1217,7 +1238,38 @@ BEGIN
     END;
 
     -- -------------------------------------------------------------------------
-    -- Test 6.6: Legitimate Owner Permitted Access to Both Functions & Views
+    -- Test 6.6: Anti-Impersonation: Authenticated Role Claiming service_role Rejected
+    -- -------------------------------------------------------------------------
+    SET ROLE authenticated;
+    PERFORM set_config('request.jwt.claim.sub', v_outsider_user::text, true);
+    PERFORM set_config('request.jwt.claim.role', 'service_role', true);
+
+    BEGIN
+        PERFORM * FROM public.reconcile_organization_finances(v_synth_org_valid);
+        RAISE EXCEPTION 'Test 6.6a Failed: Simulated service_role impersonation succeeded under authenticated role!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Authenticated role cannot claim service_role privileges%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test % PASSED: Test 6.6a - Simulated service_role impersonation under authenticated role strictly blocked on reconcile_organization_finances.', v_test_count;
+        ELSE
+            RAISE EXCEPTION 'Test 6.6a Failed with unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    BEGIN
+        PERFORM public.get_financial_reconciliation_summary(v_synth_org_valid);
+        RAISE EXCEPTION 'Test 6.6b Failed: Simulated service_role impersonation succeeded under authenticated role!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Authenticated role cannot claim service_role privileges%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test % PASSED: Test 6.6b - Simulated service_role impersonation under authenticated role strictly blocked on get_financial_reconciliation_summary.', v_test_count;
+        ELSE
+            RAISE EXCEPTION 'Test 6.6b Failed with unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    -- -------------------------------------------------------------------------
+    -- Test 6.7: Legitimate Owner Permitted Access to Both Functions & All Views
     -- -------------------------------------------------------------------------
     SET ROLE authenticated;
     PERFORM set_config('request.jwt.claim.sub', v_owner_valid::text, true);
@@ -1227,32 +1279,72 @@ BEGIN
     FROM public.reconcile_organization_finances(v_synth_org_valid);
 
     IF v_disc_count != 0 THEN
-        RAISE EXCEPTION 'Test 6.6a Failed: Legitimate owner returned % discrepancies!', v_disc_count;
+        RAISE EXCEPTION 'Test 6.7a Failed: Legitimate owner returned % discrepancies!', v_disc_count;
     END IF;
     v_test_count := v_test_count + 1;
-    RAISE NOTICE 'Test % PASSED: Test 6.6a - Legitimate organization owner permitted to execute reconcile_organization_finances.', v_test_count;
+    RAISE NOTICE 'Test % PASSED: Test 6.7a - Legitimate organization owner permitted to execute reconcile_organization_finances.', v_test_count;
 
     v_summary := public.get_financial_reconciliation_summary(v_synth_org_valid);
     IF (v_summary->>'is_healthy')::BOOLEAN IS NOT TRUE THEN
-        RAISE EXCEPTION 'Test 6.6b Failed: Legitimate owner get_financial_reconciliation_summary not healthy! Got: %', v_summary;
+        RAISE EXCEPTION 'Test 6.7b Failed: Legitimate owner get_financial_reconciliation_summary not healthy! Got: %', v_summary;
     END IF;
     v_test_count := v_test_count + 1;
-    RAISE NOTICE 'Test % PASSED: Test 6.6b - Legitimate organization owner permitted to execute get_financial_reconciliation_summary.', v_test_count;
+    RAISE NOTICE 'Test % PASSED: Test 6.7b - Legitimate organization owner permitted to execute get_financial_reconciliation_summary.', v_test_count;
 
-    -- Audit view visibility for legitimate owner
+    -- Audit view visibility for legitimate owner across ALL 4 views
     DECLARE
         v_view_row_count INT;
     BEGIN
         SELECT count(*) INTO v_view_row_count
+        FROM public.v_transaction_double_entry_audit
+        WHERE organization_id = v_synth_org_valid;
+        IF v_view_row_count = 0 THEN
+            RAISE EXCEPTION 'Test 6.7c Failed: Legitimate owner saw 0 rows in v_transaction_double_entry_audit!';
+        END IF;
+
+        SELECT count(*) INTO v_view_row_count
+        FROM public.v_payment_commission_audit
+        WHERE organization_id = v_synth_org_valid;
+        IF v_view_row_count = 0 THEN
+            RAISE EXCEPTION 'Test 6.7d Failed: Legitimate owner saw 0 rows in v_payment_commission_audit!';
+        END IF;
+
+        SELECT count(*) INTO v_view_row_count
+        FROM public.v_payout_lifecycle_reconciliation
+        WHERE organization_id = v_synth_org_valid;
+        IF v_view_row_count = 0 THEN
+            RAISE EXCEPTION 'Test 6.7e Failed: Legitimate owner saw 0 rows in v_payout_lifecycle_reconciliation!';
+        END IF;
+
+        SELECT count(*) INTO v_view_row_count
         FROM public.v_financial_reconciliation_overview
         WHERE organization_id = v_synth_org_valid;
-
         IF v_view_row_count != 1 THEN
-            RAISE EXCEPTION 'Test 6.6c Failed: Legitimate owner could not view organization overview via v_financial_reconciliation_overview! Count: %', v_view_row_count;
+            RAISE EXCEPTION 'Test 6.7f Failed: Legitimate owner could not view organization overview via v_financial_reconciliation_overview! Count: %', v_view_row_count;
         END IF;
+
         v_test_count := v_test_count + 1;
-        RAISE NOTICE 'Test % PASSED: Test 6.6c - Legitimate owner successfully views organization row in v_financial_reconciliation_overview.', v_test_count;
+        RAISE NOTICE 'Test % PASSED: Test 6.7c-f - Legitimate owner successfully views organization rows in ALL 4 audit views.', v_test_count;
     END;
+
+    -- -------------------------------------------------------------------------
+    -- Test 6.8: Genuine service_role Permitted Access to Both Functions
+    -- -------------------------------------------------------------------------
+    SET ROLE service_role;
+    PERFORM set_config('request.jwt.claim.sub', '', true);
+    PERFORM set_config('request.jwt.claim.role', 'service_role', true);
+
+    SELECT count(*) INTO v_disc_count
+    FROM public.reconcile_organization_finances(v_synth_org_valid);
+    v_test_count := v_test_count + 1;
+    RAISE NOTICE 'Test % PASSED: Test 6.8a - Genuine service_role permitted to execute reconcile_organization_finances.', v_test_count;
+
+    v_summary := public.get_financial_reconciliation_summary(v_synth_org_valid);
+    IF (v_summary->>'is_healthy')::BOOLEAN IS NOT TRUE THEN
+        RAISE EXCEPTION 'Test 6.8b Failed: service_role get_financial_reconciliation_summary not healthy! Got: %', v_summary;
+    END IF;
+    v_test_count := v_test_count + 1;
+    RAISE NOTICE 'Test % PASSED: Test 6.8b - Genuine service_role permitted to execute get_financial_reconciliation_summary.', v_test_count;
 
     -- Reset role to privileged backend session
     RESET ROLE;
