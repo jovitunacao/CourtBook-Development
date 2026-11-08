@@ -13,6 +13,7 @@
     "test:005a1": "tsx tests/supabase/run-005a1-validation-gate.ts",
     "test:005b": "tsx tests/supabase/run-005b-validation-gate.ts",
     "test:005c": "tsx tests/supabase/run-005c-validation-gate.ts",
+    "test:005d": "tsx tests/supabase/run-005d-validation-gate.ts",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit"
   },

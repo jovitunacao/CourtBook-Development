@@ -15,7 +15,13 @@ const ROOT_DIR = path.resolve(__dirname, '../..');
 
 const REPORT_DIR = path.join(ROOT_DIR, 'tests/supabase/reports');
 const REPORT_FILE = path.join(REPORT_DIR, '005d_execution_evidence.log');
-const ARTIFACT_DIR = '/.aistudio/artifacts/brain/d31f6d16-618d-4fb1-93bb-7151c73b2135';
+const ROOT_ARTIFACT_DIR = path.join(ROOT_DIR, '.aistudio/artifacts/brain/d31f6d16-618d-4fb1-93bb-7151c73b2135');
+const SYSTEM_ARTIFACT_DIR = '/.aistudio/artifacts/brain/d31f6d16-618d-4fb1-93bb-7151c73b2135';
+const ARTIFACT_DIR = fs.existsSync(ROOT_ARTIFACT_DIR)
+  ? ROOT_ARTIFACT_DIR
+  : fs.existsSync(SYSTEM_ARTIFACT_DIR)
+  ? SYSTEM_ARTIFACT_DIR
+  : ROOT_ARTIFACT_DIR;
 const ARTIFACT_FILE = path.join(ARTIFACT_DIR, '005d_execution_evidence.log');
 
 if (!fs.existsSync(REPORT_DIR)) {
