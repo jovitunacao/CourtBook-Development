@@ -286,10 +286,94 @@ async function runValidationGate() {
       throw new Error(`Gate 2 Failed: EXECUTE privileges remain granted to PUBLIC or anon on reconciliation functions.`);
     }
 
+    // Actively verify deployed runtime authorization behavior
+    log('  Testing deployed runtime authorization behavior...');
+
+    // 1. Calling as 'anon' role must be rejected
+    await rootClient.query('SET ROLE anon;');
+    let anonFinBlocked = false;
+    try {
+      await rootClient.query('SELECT * FROM public.reconcile_organization_finances(gen_random_uuid());');
+    } catch {
+      anonFinBlocked = true;
+    }
+    let anonSummBlocked = false;
+    try {
+      await rootClient.query('SELECT public.get_financial_reconciliation_summary(gen_random_uuid());');
+    } catch {
+      anonSummBlocked = true;
+    }
+    await rootClient.query('RESET ROLE;');
+
+    if (!anonFinBlocked || !anonSummBlocked) {
+      throw new Error('Gate 2 Failed: Runtime invocation as anon role was not rejected on both reconciliation functions.');
+    }
+    log('  - Deployed anon role rejection confirmed on both functions.');
+
+    // 2. Calling as 'authenticated' outsider (non-member) must be rejected
+    const testOrgId = 'a0000000-0000-0000-0000-000000000001';
+    const outsiderUid = 'b0000000-0000-0000-0000-000000000002';
+    const ownerUid = 'c0000000-0000-0000-0000-000000000003';
+
+    await rootClient.query(`
+      INSERT INTO auth.users (id, email) VALUES
+        ('${outsiderUid}', 'gate2-outsider@test.com'),
+        ('${ownerUid}', 'gate2-owner@test.com')
+      ON CONFLICT (id) DO NOTHING;
+
+      INSERT INTO public.organizations (id, name, slug)
+      VALUES ('${testOrgId}', 'Gate 2 Auth Test Club', 'gate-2-auth-test')
+      ON CONFLICT (id) DO NOTHING;
+
+      INSERT INTO public.organization_members (organization_id, user_id, role)
+      VALUES ('${testOrgId}', '${ownerUid}', 'owner')
+      ON CONFLICT DO NOTHING;
+    `);
+
+    await rootClient.query('SET ROLE authenticated;');
+    await rootClient.query(`SELECT set_config('request.jwt.claim.sub', '${outsiderUid}', true);`);
+    await rootClient.query(`SELECT set_config('request.jwt.claim.role', 'authenticated', true);`);
+
+    let outsiderBlocked = false;
+    try {
+      await rootClient.query(`SELECT * FROM public.reconcile_organization_finances('${testOrgId}');`);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('Access denied: Only organization owners and admins')) {
+        outsiderBlocked = true;
+      }
+    }
+    await rootClient.query('RESET ROLE;');
+
+    if (!outsiderBlocked) {
+      throw new Error('Gate 2 Failed: Runtime invocation as non-member authenticated user was not strictly blocked.');
+    }
+    log('  - Deployed outsider authenticated user rejection confirmed.');
+
+    // 3. Calling as authenticated owner must succeed
+    await rootClient.query('SET ROLE authenticated;');
+    await rootClient.query(`SELECT set_config('request.jwt.claim.sub', '${ownerUid}', true);`);
+    await rootClient.query(`SELECT set_config('request.jwt.claim.role', 'authenticated', true);`);
+
+    await rootClient.query(`SELECT * FROM public.reconcile_organization_finances('${testOrgId}');`);
+    await rootClient.query(`SELECT public.get_financial_reconciliation_summary('${testOrgId}');`);
+
+    await rootClient.query('RESET ROLE;');
+    await rootClient.query(`SELECT set_config('request.jwt.claim.sub', '', true);`);
+    await rootClient.query(`SELECT set_config('request.jwt.claim.role', '', true);`);
+    log('  - Deployed legitimate owner authorization confirmed.');
+
+    // Clean up temporary Gate 2 test records
+    await rootClient.query(`
+      DELETE FROM public.organization_members WHERE organization_id = '${testOrgId}';
+      DELETE FROM public.organizations WHERE id = '${testOrgId}';
+      DELETE FROM auth.users WHERE id IN ('${outsiderUid}', '${ownerUid}');
+    `);
+
     recordResult(
       'Gate 2: Audit Schema Objects, RLS, & Security Definer Verification',
       'PASS',
-      'All 4 audit views and 2 reconciliation functions verified with SECURITY DEFINER, search_path hardening, and zero PUBLIC/anon execution grants.',
+      'All 4 audit views and 2 reconciliation functions verified with SECURITY DEFINER, search_path hardening, zero PUBLIC/anon execution grants, and active runtime rejection of anon/outsider callers alongside verified owner execution.',
       gate2Start
     );
   } catch (err: unknown) {

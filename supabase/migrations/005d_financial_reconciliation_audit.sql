@@ -9,14 +9,17 @@
 -- ARCHITECTURAL PRINCIPLES & GOALS:
 --   1. Strict Read-Only Audit: Purely analytical; NEVER alters financial records,
 --      balances, ledger lines, or payment states.
---   2. Strict Authorization & Zero-Trust Security:
+--   2. Trustworthy, Fail-Closed Authorization:
+--      * Both reconciliation functions are SECURITY DEFINER with search_path pinned to 'public, pg_temp'.
+--      * Does NOT rely on current_user (which resolves to the function owner in SECURITY DEFINER).
+--      * Uses reliable caller context: session_user, request.jwt.claim.role, and auth.uid().
 --      * Anonymous clients and unauthenticated roles are unconditionally blocked.
 --      * Direct EXECUTE revoked from PUBLIC and anon on all reconciliation routines.
 --      * Authenticated clients must provide an explicit organization_id and possess
 --        verified owner or admin role within that organization.
---      * Privileged service/backend operations (service_role, postgres, supabase_admin)
---        are explicitly authorized for global or tenant-scoped operational audits.
---      * All audit views enforce security_invoker = true and tenant RLS isolation.
+--      * Privileged service/backend operations (direct superuser session_user 'postgres'/'supabase_admin',
+--        or validated 'service_role' claim with trusted authenticator session) are authorized for operational audits.
+--      * All audit views enforce security_invoker = true and tenant RLS isolation without cross-tenant leaks.
 --   3. Double-Entry Reconciliation: Verifies sum(debits) = sum(credits) for every
 --      posted transaction and checks account running balances against the general ledger.
 --   4. Revenue Split Integrity: Verifies 5% platform commission and 95% owner gross
@@ -108,10 +111,10 @@ SELECT
     p.captured_at
 FROM public.payments p
 WHERE (
-    -- Privileged service/backend caller
-    current_user IN ('postgres', 'service_role', 'supabase_admin') OR
-    current_setting('role', true) IN ('service_role', 'postgres', 'supabase_admin') OR
-    -- Sensitive financial commission splits restricted strictly to verified owners & admins
+    -- Trustworthy backend administrator session or service-role claim
+    session_user IN ('postgres', 'supabase_admin') OR
+    current_setting('request.jwt.claim.role', true) = 'service_role' OR
+    -- Sensitive financial commission splits restricted strictly to verified owners & admins of that organization
     EXISTS (
         SELECT 1 FROM public.organization_members om
         WHERE om.organization_id = p.organization_id
@@ -315,10 +318,10 @@ JOIN public.organization_balances ob ON ob.organization_id = o.id
 LEFT JOIN ledger_summary ls ON ls.organization_id = o.id
 LEFT JOIN payout_summary ps ON ps.organization_id = o.id
 WHERE (
-    -- Privileged service/backend caller
-    current_user IN ('postgres', 'service_role', 'supabase_admin') OR
-    current_setting('role', true) IN ('service_role', 'postgres', 'supabase_admin') OR
-    -- Sensitive balance sheet overview restricted strictly to verified owners & admins
+    -- Trustworthy backend administrator session or service-role claim
+    session_user IN ('postgres', 'supabase_admin') OR
+    current_setting('request.jwt.claim.role', true) = 'service_role' OR
+    -- Sensitive balance sheet overview restricted strictly to verified owners & admins of that organization
     EXISTS (
         SELECT 1 FROM public.organization_members om
         WHERE om.organization_id = o.id
@@ -355,32 +358,33 @@ SECURITY DEFINER
 SET search_path = public, pg_temp
 AS $$
 DECLARE
-    v_caller_role TEXT;
-    v_caller_id UUID;
-    v_is_service_or_superuser BOOLEAN;
+    v_session_user TEXT;
+    v_jwt_role TEXT;
+    v_is_trusted_service BOOLEAN := false;
+    v_caller_uid UUID;
 BEGIN
-    -- Determine execution role context
-    v_caller_role := current_setting('role', true);
-    IF v_caller_role IS NULL OR v_caller_role = '' THEN
-        v_caller_role := current_user;
-    END IF;
+    -- Reliable caller identification (immune to SECURITY DEFINER function owner substitution)
+    v_session_user := session_user;
+    v_jwt_role := NULLIF(current_setting('request.jwt.claim.role', true), '');
 
-    -- 1. Unconditionally reject anonymous callers
-    IF v_caller_role = 'anon' OR current_user = 'anon' THEN
+    -- 1. Unconditional rejection of anonymous clients
+    IF v_session_user = 'anon' OR v_jwt_role = 'anon' OR current_setting('role', true) = 'anon' THEN
         RAISE EXCEPTION 'Access denied: Anonymous clients cannot access financial reconciliation.';
     END IF;
 
-    -- Check if running in privileged backend context (postgres, service_role, supabase_admin)
-    v_is_service_or_superuser := (
-        v_caller_role IN ('service_role', 'postgres', 'supabase_admin') OR
-        current_user IN ('postgres', 'service_role', 'supabase_admin')
-    );
+    -- 2. Reliable identification of privileged service / superuser operations
+    -- Only true when:
+    --   a) The direct connection session_user is postgres or supabase_admin, OR
+    --   b) The API request has an authoritative 'service_role' claim and was dispatched via trusted authenticator/postgres
+    IF (v_session_user IN ('postgres', 'supabase_admin')) OR
+       (v_jwt_role = 'service_role' AND v_session_user IN ('authenticator', 'postgres', 'supabase_admin')) THEN
+        v_is_trusted_service := true;
+    END IF;
 
-    v_caller_id := auth.uid();
-
-    -- Client callers (authenticated users) MUST authenticate and provide an explicit organization_id
-    IF NOT v_is_service_or_superuser THEN
-        IF v_caller_id IS NULL THEN
+    -- 3. If NOT a verified service caller, strictly enforce authenticated owner/admin customer checks
+    IF NOT v_is_trusted_service THEN
+        v_caller_uid := auth.uid();
+        IF v_caller_uid IS NULL THEN
             RAISE EXCEPTION 'Access denied: Unauthenticated clients cannot access financial reconciliation.';
         END IF;
 
@@ -391,7 +395,7 @@ BEGIN
         IF NOT EXISTS (
             SELECT 1 FROM public.organization_members om
             WHERE om.organization_id = p_organization_id
-              AND om.user_id = v_caller_id
+              AND om.user_id = v_caller_uid
               AND om.role IN ('owner', 'admin')
         ) THEN
             RAISE EXCEPTION 'Access denied: Only organization owners and admins can run financial reconciliation.';
@@ -931,9 +935,10 @@ SECURITY DEFINER
 SET search_path = public, pg_temp
 AS $$
 DECLARE
-    v_caller_role TEXT;
-    v_caller_id UUID;
-    v_is_service_or_superuser BOOLEAN;
+    v_session_user TEXT;
+    v_jwt_role TEXT;
+    v_is_trusted_service BOOLEAN := false;
+    v_caller_uid UUID;
     v_total_discrepancies INT := 0;
     v_critical_count INT := 0;
     v_error_count INT := 0;
@@ -946,28 +951,25 @@ DECLARE
     v_discrepancies JSONB := '[]'::jsonb;
     v_disc RECORD;
 BEGIN
-    -- Determine execution role context
-    v_caller_role := current_setting('role', true);
-    IF v_caller_role IS NULL OR v_caller_role = '' THEN
-        v_caller_role := current_user;
-    END IF;
+    -- Reliable caller identification (immune to SECURITY DEFINER function owner substitution)
+    v_session_user := session_user;
+    v_jwt_role := NULLIF(current_setting('request.jwt.claim.role', true), '');
 
-    -- 1. Unconditionally reject anonymous callers
-    IF v_caller_role = 'anon' OR current_user = 'anon' THEN
+    -- 1. Unconditionally reject anonymous clients
+    IF v_session_user = 'anon' OR v_jwt_role = 'anon' OR current_setting('role', true) = 'anon' THEN
         RAISE EXCEPTION 'Access denied: Anonymous clients cannot access financial reconciliation.';
     END IF;
 
-    -- Check if running in privileged backend context (postgres, service_role, supabase_admin)
-    v_is_service_or_superuser := (
-        v_caller_role IN ('service_role', 'postgres', 'supabase_admin') OR
-        current_user IN ('postgres', 'service_role', 'supabase_admin')
-    );
+    -- 2. Reliable identification of privileged service / superuser operations
+    IF (v_session_user IN ('postgres', 'supabase_admin')) OR
+       (v_jwt_role = 'service_role' AND v_session_user IN ('authenticator', 'postgres', 'supabase_admin')) THEN
+        v_is_trusted_service := true;
+    END IF;
 
-    v_caller_id := auth.uid();
-
-    -- Client callers (authenticated users) MUST authenticate and provide an explicit organization_id
-    IF NOT v_is_service_or_superuser THEN
-        IF v_caller_id IS NULL THEN
+    -- 3. If NOT a verified service caller, strictly enforce authenticated owner/admin customer checks
+    IF NOT v_is_trusted_service THEN
+        v_caller_uid := auth.uid();
+        IF v_caller_uid IS NULL THEN
             RAISE EXCEPTION 'Access denied: Unauthenticated clients cannot access financial reconciliation.';
         END IF;
 
@@ -978,7 +980,7 @@ BEGIN
         IF NOT EXISTS (
             SELECT 1 FROM public.organization_members om
             WHERE om.organization_id = p_organization_id
-              AND om.user_id = v_caller_id
+              AND om.user_id = v_caller_uid
               AND om.role IN ('owner', 'admin')
         ) THEN
             RAISE EXCEPTION 'Access denied: Only organization owners and admins can run financial reconciliation.';

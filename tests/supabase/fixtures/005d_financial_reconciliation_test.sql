@@ -1050,18 +1050,30 @@ BEGIN
     -- =========================================================================
 
     -- -------------------------------------------------------------------------
-    -- Test 6.1: Real PostgreSQL 'anon' Role Rejected
+    -- Test 6.1: Real PostgreSQL 'anon' Role Rejected on Both Functions & Views
     -- -------------------------------------------------------------------------
     SET ROLE anon;
     BEGIN
         PERFORM * FROM public.reconcile_organization_finances(v_synth_org_valid);
-        RAISE EXCEPTION 'Test 6.1 Failed: Actual anon PostgreSQL role was able to run financial reconciliation!';
+        RAISE EXCEPTION 'Test 6.1a Failed: Actual anon PostgreSQL role was able to run reconcile_organization_finances!';
     EXCEPTION WHEN OTHERS THEN
         IF SQLERRM LIKE '%Access denied%' OR SQLERRM LIKE '%permission denied%' THEN
             v_test_count := v_test_count + 1;
-            RAISE NOTICE 'Test % PASSED: Test 6.1 - Actual anon PostgreSQL role strictly blocked from reconciliation.', v_test_count;
+            RAISE NOTICE 'Test % PASSED: Test 6.1a - Actual anon PostgreSQL role strictly blocked from reconcile_organization_finances.', v_test_count;
         ELSE
-            RAISE EXCEPTION 'Test 6.1 Failed with unexpected error: %', SQLERRM;
+            RAISE EXCEPTION 'Test 6.1a Failed with unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    BEGIN
+        PERFORM public.get_financial_reconciliation_summary(v_synth_org_valid);
+        RAISE EXCEPTION 'Test 6.1b Failed: Actual anon PostgreSQL role was able to run get_financial_reconciliation_summary!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Access denied%' OR SQLERRM LIKE '%permission denied%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test % PASSED: Test 6.1b - Actual anon PostgreSQL role strictly blocked from get_financial_reconciliation_summary.', v_test_count;
+        ELSE
+            RAISE EXCEPTION 'Test 6.1b Failed with unexpected error: %', SQLERRM;
         END IF;
     END;
 
@@ -1070,16 +1082,45 @@ BEGIN
     -- -------------------------------------------------------------------------
     SET ROLE authenticated;
     PERFORM set_config('request.jwt.claim.sub', v_outsider_user::text, true);
+    PERFORM set_config('request.jwt.claim.role', 'authenticated', true);
+
     BEGIN
         PERFORM * FROM public.reconcile_organization_finances(v_synth_org_valid);
-        RAISE EXCEPTION 'Test 6.2 Failed: Outsider authenticated user was able to run financial reconciliation!';
+        RAISE EXCEPTION 'Test 6.2a Failed: Outsider authenticated user was able to run reconcile_organization_finances!';
     EXCEPTION WHEN OTHERS THEN
         IF SQLERRM LIKE '%Access denied: Only organization owners and admins%' THEN
             v_test_count := v_test_count + 1;
-            RAISE NOTICE 'Test % PASSED: Test 6.2 - Outsider authenticated user strictly blocked.', v_test_count;
+            RAISE NOTICE 'Test % PASSED: Test 6.2a - Outsider authenticated user strictly blocked from reconcile_organization_finances.', v_test_count;
         ELSE
-            RAISE EXCEPTION 'Test 6.2 Failed with unexpected error: %', SQLERRM;
+            RAISE EXCEPTION 'Test 6.2a Failed with unexpected error: %', SQLERRM;
         END IF;
+    END;
+
+    BEGIN
+        PERFORM public.get_financial_reconciliation_summary(v_synth_org_valid);
+        RAISE EXCEPTION 'Test 6.2b Failed: Outsider authenticated user was able to run get_financial_reconciliation_summary!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Access denied: Only organization owners and admins%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test % PASSED: Test 6.2b - Outsider authenticated user strictly blocked from get_financial_reconciliation_summary.', v_test_count;
+        ELSE
+            RAISE EXCEPTION 'Test 6.2b Failed with unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    -- Audit view isolation for outsider
+    DECLARE
+        v_view_row_count INT;
+    BEGIN
+        SELECT count(*) INTO v_view_row_count
+        FROM public.v_financial_reconciliation_overview
+        WHERE organization_id = v_synth_org_valid;
+
+        IF v_view_row_count != 0 THEN
+            RAISE EXCEPTION 'Test 6.2c Failed: Outsider was able to view organization overview via v_financial_reconciliation_overview!';
+        END IF;
+        v_test_count := v_test_count + 1;
+        RAISE NOTICE 'Test % PASSED: Test 6.2c - Outsider sees 0 rows in v_financial_reconciliation_overview.', v_test_count;
     END;
 
     -- -------------------------------------------------------------------------
@@ -1087,15 +1128,29 @@ BEGIN
     -- -------------------------------------------------------------------------
     SET ROLE authenticated;
     PERFORM set_config('request.jwt.claim.sub', v_staff_valid::text, true);
+    PERFORM set_config('request.jwt.claim.role', 'authenticated', true);
+
     BEGIN
         PERFORM * FROM public.reconcile_organization_finances(v_synth_org_valid);
-        RAISE EXCEPTION 'Test 6.3 Failed: Staff user was able to run financial reconciliation!';
+        RAISE EXCEPTION 'Test 6.3a Failed: Staff user was able to run reconcile_organization_finances!';
     EXCEPTION WHEN OTHERS THEN
         IF SQLERRM LIKE '%Access denied: Only organization owners and admins%' THEN
             v_test_count := v_test_count + 1;
-            RAISE NOTICE 'Test % PASSED: Test 6.3 - Staff user strictly blocked from sensitive financial reconciliation.', v_test_count;
+            RAISE NOTICE 'Test % PASSED: Test 6.3a - Staff user strictly blocked from reconcile_organization_finances.', v_test_count;
         ELSE
-            RAISE EXCEPTION 'Test 6.3 Failed with unexpected error: %', SQLERRM;
+            RAISE EXCEPTION 'Test 6.3a Failed with unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    BEGIN
+        PERFORM public.get_financial_reconciliation_summary(v_synth_org_valid);
+        RAISE EXCEPTION 'Test 6.3b Failed: Staff user was able to run get_financial_reconciliation_summary!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Access denied: Only organization owners and admins%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test % PASSED: Test 6.3b - Staff user strictly blocked from get_financial_reconciliation_summary.', v_test_count;
+        ELSE
+            RAISE EXCEPTION 'Test 6.3b Failed with unexpected error: %', SQLERRM;
         END IF;
     END;
 
@@ -1104,15 +1159,29 @@ BEGIN
     -- -------------------------------------------------------------------------
     SET ROLE authenticated;
     PERFORM set_config('request.jwt.claim.sub', v_owner_injected::text, true);
+    PERFORM set_config('request.jwt.claim.role', 'authenticated', true);
+
     BEGIN
         PERFORM * FROM public.reconcile_organization_finances(v_synth_org_valid);
-        RAISE EXCEPTION 'Test 6.4 Failed: Cross-tenant owner was able to run financial reconciliation on another organization!';
+        RAISE EXCEPTION 'Test 6.4a Failed: Cross-tenant owner was able to run reconcile_organization_finances on another organization!';
     EXCEPTION WHEN OTHERS THEN
         IF SQLERRM LIKE '%Access denied: Only organization owners and admins%' THEN
             v_test_count := v_test_count + 1;
-            RAISE NOTICE 'Test % PASSED: Test 6.4 - Cross-tenant owner strictly blocked from other organizations.', v_test_count;
+            RAISE NOTICE 'Test % PASSED: Test 6.4a - Cross-tenant owner strictly blocked from reconcile_organization_finances.', v_test_count;
         ELSE
-            RAISE EXCEPTION 'Test 6.4 Failed with unexpected error: %', SQLERRM;
+            RAISE EXCEPTION 'Test 6.4a Failed with unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    BEGIN
+        PERFORM public.get_financial_reconciliation_summary(v_synth_org_valid);
+        RAISE EXCEPTION 'Test 6.4b Failed: Cross-tenant owner was able to run get_financial_reconciliation_summary on another organization!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Access denied: Only organization owners and admins%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test % PASSED: Test 6.4b - Cross-tenant owner strictly blocked from get_financial_reconciliation_summary.', v_test_count;
+        ELSE
+            RAISE EXCEPTION 'Test 6.4b Failed with unexpected error: %', SQLERRM;
         END IF;
     END;
 
@@ -1121,35 +1190,74 @@ BEGIN
     -- -------------------------------------------------------------------------
     SET ROLE authenticated;
     PERFORM set_config('request.jwt.claim.sub', v_owner_valid::text, true);
+    PERFORM set_config('request.jwt.claim.role', 'authenticated', true);
+
     BEGIN
         PERFORM * FROM public.reconcile_organization_finances(NULL);
-        RAISE EXCEPTION 'Test 6.5 Failed: Authenticated client was able to run global reconciliation without organization_id!';
+        RAISE EXCEPTION 'Test 6.5a Failed: Authenticated client was able to run global reconcile_organization_finances without organization_id!';
     EXCEPTION WHEN OTHERS THEN
         IF SQLERRM LIKE '%Access denied: Authenticated clients must provide an explicit organization_id%' THEN
             v_test_count := v_test_count + 1;
-            RAISE NOTICE 'Test % PASSED: Test 6.5 - Global scan blocked for authenticated clients.', v_test_count;
+            RAISE NOTICE 'Test % PASSED: Test 6.5a - Global scan blocked for authenticated clients on reconcile_organization_finances.', v_test_count;
         ELSE
-            RAISE EXCEPTION 'Test 6.5 Failed with unexpected error: %', SQLERRM;
+            RAISE EXCEPTION 'Test 6.5a Failed with unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    BEGIN
+        PERFORM public.get_financial_reconciliation_summary(NULL);
+        RAISE EXCEPTION 'Test 6.5b Failed: Authenticated client was able to run global get_financial_reconciliation_summary without organization_id!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Access denied: Authenticated clients must provide an explicit organization_id%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test % PASSED: Test 6.5b - Global scan blocked for authenticated clients on get_financial_reconciliation_summary.', v_test_count;
+        ELSE
+            RAISE EXCEPTION 'Test 6.5b Failed with unexpected error: %', SQLERRM;
         END IF;
     END;
 
     -- -------------------------------------------------------------------------
-    -- Test 6.6: Legitimate Owner Permitted Access
+    -- Test 6.6: Legitimate Owner Permitted Access to Both Functions & Views
     -- -------------------------------------------------------------------------
     SET ROLE authenticated;
     PERFORM set_config('request.jwt.claim.sub', v_owner_valid::text, true);
+    PERFORM set_config('request.jwt.claim.role', 'authenticated', true);
+
     SELECT count(*) INTO v_disc_count
     FROM public.reconcile_organization_finances(v_synth_org_valid);
 
     IF v_disc_count != 0 THEN
-        RAISE EXCEPTION 'Test 6.6 Failed: Legitimate owner returned % discrepancies!', v_disc_count;
+        RAISE EXCEPTION 'Test 6.6a Failed: Legitimate owner returned % discrepancies!', v_disc_count;
     END IF;
     v_test_count := v_test_count + 1;
-    RAISE NOTICE 'Test % PASSED: Test 6.6 - Legitimate organization owner permitted to execute reconciliation audit.', v_test_count;
+    RAISE NOTICE 'Test % PASSED: Test 6.6a - Legitimate organization owner permitted to execute reconcile_organization_finances.', v_test_count;
+
+    v_summary := public.get_financial_reconciliation_summary(v_synth_org_valid);
+    IF (v_summary->>'is_healthy')::BOOLEAN IS NOT TRUE THEN
+        RAISE EXCEPTION 'Test 6.6b Failed: Legitimate owner get_financial_reconciliation_summary not healthy! Got: %', v_summary;
+    END IF;
+    v_test_count := v_test_count + 1;
+    RAISE NOTICE 'Test % PASSED: Test 6.6b - Legitimate organization owner permitted to execute get_financial_reconciliation_summary.', v_test_count;
+
+    -- Audit view visibility for legitimate owner
+    DECLARE
+        v_view_row_count INT;
+    BEGIN
+        SELECT count(*) INTO v_view_row_count
+        FROM public.v_financial_reconciliation_overview
+        WHERE organization_id = v_synth_org_valid;
+
+        IF v_view_row_count != 1 THEN
+            RAISE EXCEPTION 'Test 6.6c Failed: Legitimate owner could not view organization overview via v_financial_reconciliation_overview! Count: %', v_view_row_count;
+        END IF;
+        v_test_count := v_test_count + 1;
+        RAISE NOTICE 'Test % PASSED: Test 6.6c - Legitimate owner successfully views organization row in v_financial_reconciliation_overview.', v_test_count;
+    END;
 
     -- Reset role to privileged backend session
     RESET ROLE;
     PERFORM set_config('request.jwt.claim.sub', '', true);
+    PERFORM set_config('request.jwt.claim.role', '', true);
 
     RAISE NOTICE '========================================================================';
     RAISE NOTICE '=== ALL % RECONCILIATION TESTS COMPLETED SUCCESSFULLY               ===', v_test_count;
