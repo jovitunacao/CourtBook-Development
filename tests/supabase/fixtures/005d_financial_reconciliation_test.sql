@@ -10,9 +10,14 @@
 --   1. Strict Rollback: Enclosed entirely within a transaction that always ends in ROLLBACK.
 --   2. Centavo Accuracy: All financial calculations verified to exact centavo precision (ROUND(..., 2)).
 --   3. 5% Commission Standard: 5% platform commission and 95% owner gross share strictly validated.
---   4. Four-State Revenue Decomposition: Total Net Settled = Unsettled + Available + Pending + Withdrawn.
---   5. Controlled Anomaly Testing: Deliberate discrepancies injected on isolated synthetic tenant
---      to verify 100% detection rate across all diagnostic checks in reconcile_organization_finances().
+--   4. Four-State / Complete Revenue Decomposition: Verified against authoritative 005a2 accounting:
+--      Owner Revenue Entitlement = total_gross_settled - total_commission_paid
+--        = unsettled + available + pending_payout + total_withdrawn + restricted_reserve - negative_recovery.
+--   5. Real Database Constraints Tested Directly: Where database constraints (CHECK, UNIQUE, FK)
+--      prevent invalid states, their rejections are tested directly via SQLSTATE assertions.
+--   6. Realistic Operational Discrepancies Tested in Reconciliation Engine: Balance sheet drift,
+--      commission policy mismatches, calculation drift, missing settlement journals, and unlinked payouts.
+--   7. Real PostgreSQL RBAC Roles: Actual 'anon' and 'authenticated' roles tested.
 -- ==============================================================================
 
 BEGIN;
@@ -68,9 +73,8 @@ DECLARE
     v_test_count INT := 0;
 
     -- Helper variables for injected discrepancy testing
+    v_fake_res_id UUID;
     v_fake_tx_id UUID;
-    v_fake_tx_number BIGINT;
-    v_fake_entry_id UUID;
     v_fake_pay_id1 UUID;
     v_fake_pay_id2 UUID;
     v_fake_payout_id UUID;
@@ -368,7 +372,6 @@ BEGIN
     -- -------------------------------------------------------------------------
     -- Scenario 2.6: Booking 2 & Partial Refund Lifecycle
     -- -------------------------------------------------------------------------
-    -- 2.6A: Create & Capture Booking 2 (₱500.00 -> ₱25.00 commission, ₱475.00 owner share)
     DECLARE
         v_res_2 UUID;
         v_pay_2 UUID;
@@ -433,7 +436,7 @@ BEGIN
             'batch_rec_valid_002', 'idem_rec_clearing_002'
         );
 
-        -- 2.6B: Process Partial Refund of ₱200.00 (Owner share ₱190.00, Commission share ₱10.00)
+        -- Process Partial Refund of ₱200.00 (Owner share ₱190.00, Commission share ₱10.00)
         INSERT INTO public.provider_webhook_events (
             provider_name, provider_event_id, event_type, signature_verification_status,
             signature_header, processing_state, payload
@@ -482,7 +485,6 @@ BEGIN
     -- -------------------------------------------------------------------------
     -- Scenario 2.7: Booking 3 & Failed Payout Release Lifecycle
     -- -------------------------------------------------------------------------
-    -- 2.7A: Create & Capture Booking 3 (₱400.00 -> ₱20.00 commission, ₱380.00 owner share)
     DECLARE
         v_res_3 UUID;
         v_pay_3 UUID;
@@ -638,9 +640,6 @@ BEGIN
     END IF;
 
     -- 5. Four-State Revenue Decomposition Invariant
-    -- Gross Settled = ₱1,900.00 (1000 + 500 + 400). Cumulative refunds: ₱200.00 gross reversal.
-    -- Net Settled Gross = ₱1,700.00. Commission = ₱85.00 (50 + 25 + 20 - 10). Owner Entitlement = ₱1,615.00.
-    -- Four States: Unsettled (₱0.00) + Available (₱1,015.00) + Pending (₱0.00) + Withdrawn (₱600.00) = ₱1,615.00. Drift = ₱0.00!
     IF v_reconcile_row.decomposition_drift != 0.00 THEN
         RAISE EXCEPTION 'Scenario 2.8 Failed: Four-state revenue decomposition drift detected: ₱%', v_reconcile_row.decomposition_drift;
     END IF;
@@ -667,10 +666,134 @@ BEGIN
 
 
     -- =========================================================================
-    -- PART 3: Controlled Anomaly Injections & Diagnostic Detection (Tenant B)
+    -- PART 3: Database Constraint Protections Verified Directly
     -- =========================================================================
-    -- We deliberately inject controlled, synthetic discrepancies into v_synth_org_injected
-    -- to verify that reconcile_organization_finances() reliably catches every anomaly type.
+    -- Where database constraints (CHECK, UNIQUE, FK) physically prevent invalid states,
+    -- test those database protections directly instead of attempting impossible commits.
+
+    -- Provision a synthetic reservation for constraint testing
+    v_fake_res_id := gen_random_uuid();
+    INSERT INTO public.reservations (
+        id, facility_id, court_id, reference_code, customer_name, customer_email, customer_phone,
+        booking_date, start_time, end_time, duration_minutes, time_slot_label, status, price, currency
+    ) VALUES (
+        v_fake_res_id, v_fac_injected, v_court_injected, 'TD-ANOMALY-1', 'Anomaly Booker', 'anomaly@test.com', '09170008888',
+        v_test_date, v_slot_4, v_slot_4 + interval '1 hour', 60, '03:00 PM - 04:00 PM', 'pending', 1000.00, '₱'
+    );
+
+    -- -------------------------------------------------------------------------
+    -- Protection 3.1: Payment Split Conservation Constraint (chk_payment_amount_split)
+    -- -------------------------------------------------------------------------
+    BEGIN
+        INSERT INTO public.payments (
+            id, organization_id, facility_id, reservation_id, provider_name, provider_payment_id,
+            status, currency, expected_amount, commission_rate, commission_amount, owner_gross_share,
+            captured_amount, refunded_amount, checkout_session_id
+        ) VALUES (
+            gen_random_uuid(), v_synth_org_injected, v_fac_injected, v_fake_res_id, 'paymongo', 'pay_chk_split_fail',
+            'pending', 'PHP', 1000.00, 0.0500, 50.00, 850.00, -- ₱100 LEAK! 50 + 850 != 1000
+            0.00, 0.00, 'cs_chk_split_fail'
+        );
+        RAISE EXCEPTION 'Protection 3.1 Failed: Invalid payment split was not rejected by database constraint!';
+    EXCEPTION WHEN check_violation THEN
+        v_test_count := v_test_count + 1;
+        RAISE NOTICE 'Test % PASSED: Protection 3.1 - Database constraint chk_payment_amount_split strictly blocked invalid split.', v_test_count;
+    END;
+
+    -- -------------------------------------------------------------------------
+    -- Protection 3.2: Refund Bounds Constraint (chk_payments_refunded_le_captured)
+    -- -------------------------------------------------------------------------
+    BEGIN
+        INSERT INTO public.payments (
+            id, organization_id, facility_id, reservation_id, provider_name, provider_payment_id,
+            status, currency, expected_amount, commission_rate, commission_amount, owner_gross_share,
+            captured_amount, refunded_amount, checkout_session_id
+        ) VALUES (
+            gen_random_uuid(), v_synth_org_injected, v_fac_injected, v_fake_res_id, 'paymongo', 'pay_chk_refund_fail',
+            'pending', 'PHP', 500.00, 0.0500, 25.00, 475.00,
+            0.00, 100.00, -- Refunded 100 > Captured 0!
+            'cs_chk_refund_fail'
+        );
+        RAISE EXCEPTION 'Protection 3.2 Failed: Refund overflow was not rejected by database constraint!';
+    EXCEPTION WHEN check_violation THEN
+        v_test_count := v_test_count + 1;
+        RAISE NOTICE 'Test % PASSED: Protection 3.2 - Database constraint chk_payments_refunded_le_captured strictly blocked refund overflow.', v_test_count;
+    END;
+
+    -- -------------------------------------------------------------------------
+    -- Protection 3.3: Duplicate Provider Payment ID Constraint (uq_payments_provider_payment_id)
+    -- -------------------------------------------------------------------------
+    BEGIN
+        -- Attempt to insert payment reusing existing valid provider payment ID 'pay_rec_prov_001'
+        INSERT INTO public.payments (
+            id, organization_id, facility_id, reservation_id, provider_name, provider_payment_id,
+            status, currency, expected_amount, commission_rate, commission_amount, owner_gross_share,
+            captured_amount, refunded_amount, checkout_session_id
+        ) VALUES (
+            gen_random_uuid(), v_synth_org_injected, v_fac_injected, v_fake_res_id, 'paymongo', 'pay_rec_prov_001', -- DUPLICATE!
+            'pending', 'PHP', 1000.00, 0.0500, 50.00, 950.00,
+            0.00, 0.00, 'cs_chk_dup_fail'
+        );
+        RAISE EXCEPTION 'Protection 3.3 Failed: Duplicate provider payment ID was not rejected by database constraint!';
+    EXCEPTION WHEN unique_violation THEN
+        v_test_count := v_test_count + 1;
+        RAISE NOTICE 'Test % PASSED: Protection 3.3 - Unique index uq_payments_provider_payment_id strictly blocked duplicate provider payment ID.', v_test_count;
+    END;
+
+    -- -------------------------------------------------------------------------
+    -- Protection 3.4: Cross-Tenant Ledger Entry Foreign Key (fk_ledger_entries_tx_org)
+    -- -------------------------------------------------------------------------
+    BEGIN
+        -- Attempt to insert ledger entry for Tenant B referencing Tenant A's transaction
+        DECLARE
+            v_org_a_tx UUID;
+        BEGIN
+            SELECT id INTO v_org_a_tx FROM public.financial_transactions WHERE organization_id = v_synth_org_valid LIMIT 1;
+            INSERT INTO public.ledger_entries (
+                id, transaction_id, organization_id, account_code, entry_direction, amount, entry_order, running_balance
+            ) VALUES (
+                gen_random_uuid(), v_org_a_tx, v_synth_org_injected, '1020', 'DEBIT', 100.00, 99, 100.00
+            );
+            RAISE EXCEPTION 'Protection 3.4 Failed: Cross-tenant ledger entry was not rejected by composite foreign key!';
+        END;
+    EXCEPTION WHEN foreign_key_violation THEN
+        v_test_count := v_test_count + 1;
+        RAISE NOTICE 'Test % PASSED: Protection 3.4 - Composite foreign key strictly blocked cross-tenant ledger entry.', v_test_count;
+    END;
+
+    -- -------------------------------------------------------------------------
+    -- Protection 3.5: Cross-Tenant Payout Journal Foreign Key (fk_payouts_journal_reserve_org)
+    -- -------------------------------------------------------------------------
+    BEGIN
+        -- Attempt to insert payout for Tenant B referencing Tenant A's reserve transaction
+        DECLARE
+            v_org_a_reserve_tx UUID;
+        BEGIN
+            SELECT id INTO v_org_a_reserve_tx
+            FROM public.financial_transactions
+            WHERE organization_id = v_synth_org_valid AND transaction_type = 'payout_reserve' LIMIT 1;
+
+            INSERT INTO public.payouts (
+                id, organization_id, payout_method_id, amount, currency, status,
+                journal_reserve_tx_id, journal_terminal_tx_id
+            ) VALUES (
+                gen_random_uuid(), v_synth_org_injected, v_payout_method_id, 500.00, 'PHP', 'approved_reserved',
+                v_org_a_reserve_tx, NULL
+            );
+            RAISE EXCEPTION 'Protection 3.5 Failed: Cross-tenant payout journal reference was not rejected by database constraint!';
+        END;
+    EXCEPTION WHEN foreign_key_violation THEN
+        v_test_count := v_test_count + 1;
+        RAISE NOTICE 'Test % PASSED: Protection 3.5 - Composite foreign key fk_payouts_journal_reserve_org strictly blocked cross-tenant payout journal.', v_test_count;
+    END;
+
+
+    -- =========================================================================
+    -- PART 4: Controlled Anomaly Injections & Reconciliation Diagnostic Detection
+    -- =========================================================================
+    -- Here we inject realistic operational discrepancies into v_synth_org_injected
+    -- that can occur during ledger drift, unlinked jobs, or rate misconfigurations,
+    -- while strictly satisfying all database CHECK and Foreign Key constraints!
 
     -- Provision initial balance record for v_synth_org_injected
     INSERT INTO public.organization_balances (
@@ -682,21 +805,21 @@ BEGIN
         SET available_withdrawable_balance = 950.00;
 
     -- -------------------------------------------------------------------------
-    -- Anomaly 3.1: Non-Standard Commission Rate Injection
+    -- Anomaly 4.1: Non-Standard Commission Rate Detection
     -- -------------------------------------------------------------------------
-    -- Insert payment with non-standard 10% commission rate (0.1000)
-    -- We temporarily disable the payment validation trigger within this test transaction
+    -- Temporarily disable payment validation trigger within this test transaction
     ALTER TABLE public.payments DISABLE TRIGGER trg_validate_payment_status_transition;
 
+    -- Insert payment with non-standard 10% commission rate (0.1000) satisfying all foreign keys and chk_payment_amount_split (1000 = 100 + 900)
     v_fake_pay_id1 := gen_random_uuid();
     INSERT INTO public.payments (
         id, organization_id, facility_id, reservation_id, provider_name, provider_payment_id,
         status, currency, expected_amount, commission_rate, commission_amount, owner_gross_share,
         captured_amount, refunded_amount, checkout_session_id
     ) VALUES (
-        v_fake_pay_id1, v_synth_org_injected, v_fac_injected, gen_random_uuid(), 'paymongo', 'pay_injected_rate_001',
+        v_fake_pay_id1, v_synth_org_injected, v_fac_injected, v_fake_res_id, 'paymongo', 'pay_anom_rate_001',
         'captured', 'PHP', 1000.00, 0.1000, 100.00, 900.00,
-        1000.00, 0.00, 'cs_injected_rate_001'
+        1000.00, 0.00, 'cs_anom_rate_001'
     );
 
     SELECT * INTO v_found_disc
@@ -704,110 +827,107 @@ BEGIN
     WHERE discrepancy_code = 'COMMISSION_RATE_MISMATCH';
 
     IF v_found_disc.entity_id != v_fake_pay_id1 OR v_found_disc.severity != 'ERROR' THEN
-        RAISE EXCEPTION 'Anomaly 3.1 Failed: COMMISSION_RATE_MISMATCH not detected properly!';
+        RAISE EXCEPTION 'Anomaly 4.1 Failed: COMMISSION_RATE_MISMATCH not detected properly!';
     END IF;
     v_test_count := v_test_count + 1;
-    RAISE NOTICE 'Test % PASSED: Anomaly 3.1 - COMMISSION_RATE_MISMATCH correctly detected and isolated.', v_test_count;
+    RAISE NOTICE 'Test % PASSED: Anomaly 4.1 - COMMISSION_RATE_MISMATCH correctly detected and isolated.', v_test_count;
 
     -- -------------------------------------------------------------------------
-    -- Anomaly 3.2: Payment Split Conservation Mismatch Injection
+    -- Anomaly 4.2: Commission Calculation Drift Detection
     -- -------------------------------------------------------------------------
-    -- Insert payment where expected_amount (1000.00) != commission (50.00) + owner_share (850.00)
+    -- Payment with calculation drift: expected ₱1,000 at 0.0500 should be ₱50 commission,
+    -- but is recorded as ₱45 commission and ₱955 owner share.
+    -- Satisfies chk_payment_amount_split (1000 = 45 + 955) and FKs!
     DECLARE
-        v_fake_split_pay_id UUID := gen_random_uuid();
+        v_fake_drift_pay_id UUID := gen_random_uuid();
+        v_drift_res_id UUID := gen_random_uuid();
     BEGIN
+        INSERT INTO public.reservations (
+            id, facility_id, court_id, reference_code, customer_name, customer_email, customer_phone,
+            booking_date, start_time, end_time, duration_minutes, time_slot_label, status, price, currency
+        ) VALUES (
+            v_drift_res_id, v_fac_injected, v_court_injected, 'TD-ANOMALY-2', 'Drift Customer', 'drift@test.com', '09170009999',
+            v_test_date, v_slot_1, v_slot_1 + interval '1 hour', 60, '08:00 AM - 09:00 AM', 'confirmed', 1000.00, '₱'
+        );
+
         INSERT INTO public.payments (
             id, organization_id, facility_id, reservation_id, provider_name, provider_payment_id,
             status, currency, expected_amount, commission_rate, commission_amount, owner_gross_share,
             captured_amount, refunded_amount, checkout_session_id
         ) VALUES (
-            v_fake_split_pay_id, v_synth_org_injected, v_fac_injected, gen_random_uuid(), 'paymongo', 'pay_injected_split_001',
-            'captured', 'PHP', 1000.00, 0.0500, 50.00, 850.00, -- ₱100 LEAK!
-            1000.00, 0.00, 'cs_injected_split_001'
+            v_fake_drift_pay_id, v_synth_org_injected, v_fac_injected, v_drift_res_id, 'paymongo', 'pay_anom_drift_001',
+            'captured', 'PHP', 1000.00, 0.0500, 45.00, 955.00,
+            1000.00, 0.00, 'cs_anom_drift_001'
         );
 
         SELECT * INTO v_found_disc
         FROM public.reconcile_organization_finances(v_synth_org_injected)
-        WHERE discrepancy_code = 'COMMISSION_SPLIT_MISMATCH';
+        WHERE discrepancy_code = 'COMMISSION_CALCULATION_DRIFT';
 
-        IF v_found_disc.entity_id != v_fake_split_pay_id OR v_found_disc.severity != 'CRITICAL' THEN
-            RAISE EXCEPTION 'Anomaly 3.2 Failed: COMMISSION_SPLIT_MISMATCH not detected properly!';
+        IF v_found_disc.entity_id != v_fake_drift_pay_id OR v_found_disc.severity != 'ERROR' THEN
+            RAISE EXCEPTION 'Anomaly 4.2 Failed: COMMISSION_CALCULATION_DRIFT not detected properly!';
         END IF;
     END;
     v_test_count := v_test_count + 1;
-    RAISE NOTICE 'Test % PASSED: Anomaly 3.2 - COMMISSION_SPLIT_MISMATCH correctly detected as CRITICAL.', v_test_count;
-
-    -- -------------------------------------------------------------------------
-    -- Anomaly 3.3: Payment Refund Overflow Injection (Refunded > Captured)
-    -- -------------------------------------------------------------------------
-    DECLARE
-        v_fake_overflow_pay_id UUID := gen_random_uuid();
-    BEGIN
-        INSERT INTO public.payments (
-            id, organization_id, facility_id, reservation_id, provider_name, provider_payment_id,
-            status, currency, expected_amount, commission_rate, commission_amount, owner_gross_share,
-            captured_amount, refunded_amount, checkout_session_id
-        ) VALUES (
-            v_fake_overflow_pay_id, v_synth_org_injected, v_fac_injected, gen_random_uuid(), 'paymongo', 'pay_injected_overflow_001',
-            'partially_refunded', 'PHP', 500.00, 0.0500, 25.00, 475.00,
-            500.00, 600.00, -- ₱600 refunded > ₱500 captured!
-            'cs_injected_overflow_001'
-        );
-
-        SELECT * INTO v_found_disc
-        FROM public.reconcile_organization_finances(v_synth_org_injected)
-        WHERE discrepancy_code = 'PAYMENT_REFUND_OVERFLOW';
-
-        IF v_found_disc.entity_id != v_fake_overflow_pay_id OR v_found_disc.severity != 'CRITICAL' THEN
-            RAISE EXCEPTION 'Anomaly 3.3 Failed: PAYMENT_REFUND_OVERFLOW not detected properly!';
-        END IF;
-    END;
-    v_test_count := v_test_count + 1;
-    RAISE NOTICE 'Test % PASSED: Anomaly 3.3 - PAYMENT_REFUND_OVERFLOW correctly detected as CRITICAL.', v_test_count;
-
-    -- -------------------------------------------------------------------------
-    -- Anomaly 3.4: Duplicate Provider Payment ID Injection
-    -- -------------------------------------------------------------------------
-    v_fake_pay_id2 := gen_random_uuid();
-    INSERT INTO public.payments (
-        id, organization_id, facility_id, reservation_id, provider_name, provider_payment_id,
-        status, currency, expected_amount, commission_rate, commission_amount, owner_gross_share,
-        captured_amount, refunded_amount, checkout_session_id
-    ) VALUES (
-        v_fake_pay_id2, v_synth_org_injected, v_fac_injected, gen_random_uuid(), 'paymongo', 'pay_injected_rate_001', -- DUPLICATE OF ANOMALY 3.1!
-        'captured', 'PHP', 1000.00, 0.0500, 50.00, 950.00,
-        1000.00, 0.00, 'cs_injected_dup_001'
-    );
-
-    SELECT * INTO v_found_disc
-    FROM public.reconcile_organization_finances(v_synth_org_injected)
-    WHERE discrepancy_code = 'DUPLICATE_PROVIDER_PAYMENT_ID';
-
-    IF v_found_disc.details->>'provider_payment_id' != 'pay_injected_rate_001' THEN
-        RAISE EXCEPTION 'Anomaly 3.4 Failed: DUPLICATE_PROVIDER_PAYMENT_ID not detected properly!';
-    END IF;
-    v_test_count := v_test_count + 1;
-    RAISE NOTICE 'Test % PASSED: Anomaly 3.4 - DUPLICATE_PROVIDER_PAYMENT_ID correctly detected.', v_test_count;
+    RAISE NOTICE 'Test % PASSED: Anomaly 4.2 - COMMISSION_CALCULATION_DRIFT correctly detected.', v_test_count;
 
     -- Re-enable payment validation trigger
     ALTER TABLE public.payments ENABLE TRIGGER trg_validate_payment_status_transition;
 
     -- -------------------------------------------------------------------------
-    -- Anomaly 3.5: Double-Entry Unbalanced Transaction Injection
+    -- Anomaly 4.3: Captured Payment Missing Settlement Journal Detection
     -- -------------------------------------------------------------------------
-    -- Temporarily disable ledger immutability and canonical hash trigger on test transaction
+    SELECT * INTO v_found_disc
+    FROM public.reconcile_organization_finances(v_synth_org_injected)
+    WHERE discrepancy_code = 'PAYMENT_MISSING_SETTLEMENT_JOURNAL';
+
+    IF v_found_disc.entity_id != v_fake_pay_id1 OR v_found_disc.severity != 'ERROR' THEN
+        RAISE EXCEPTION 'Anomaly 4.3 Failed: PAYMENT_MISSING_SETTLEMENT_JOURNAL not detected properly!';
+    END IF;
+    v_test_count := v_test_count + 1;
+    RAISE NOTICE 'Test % PASSED: Anomaly 4.3 - PAYMENT_MISSING_SETTLEMENT_JOURNAL correctly detected for unjournaled captured payment.', v_test_count;
+
+    -- -------------------------------------------------------------------------
+    -- Anomaly 4.4: Transaction with Missing Entries Detection
+    -- -------------------------------------------------------------------------
     ALTER TABLE public.financial_transactions DISABLE TRIGGER trg_enforce_financial_tx_canonical_hash;
 
+    DECLARE
+        v_fake_empty_tx UUID := gen_random_uuid();
+    BEGIN
+        INSERT INTO public.financial_transactions (
+            id, organization_id, facility_id, transaction_type, idempotency_key, reference_id,
+            description, canonical_payload_hash, metadata
+        ) VALUES (
+            v_fake_empty_tx, v_synth_org_injected, v_fac_injected, 'platform_adjustment', 'idem_empty_001', gen_random_uuid(),
+            'Empty transaction without ledger entries', 'd41d8cd98f00b204e9800998ecf8427e', '{}'::jsonb
+        );
+
+        SELECT * INTO v_found_disc
+        FROM public.reconcile_organization_finances(v_synth_org_injected)
+        WHERE discrepancy_code = 'LEDGER_MISSING_ENTRIES';
+
+        IF v_found_disc.entity_id != v_fake_empty_tx OR v_found_disc.severity != 'CRITICAL' THEN
+            RAISE EXCEPTION 'Anomaly 4.4 Failed: LEDGER_MISSING_ENTRIES not detected properly!';
+        END IF;
+    END;
+    v_test_count := v_test_count + 1;
+    RAISE NOTICE 'Test % PASSED: Anomaly 4.4 - LEDGER_MISSING_ENTRIES correctly detected as CRITICAL.', v_test_count;
+
+    -- -------------------------------------------------------------------------
+    -- Anomaly 4.5: Unbalanced Ledger Transaction Detection
+    -- -------------------------------------------------------------------------
+    -- Insert transaction and ledger entries satisfying composite FK (organization_id matches)
+    -- but with Debits (₱500.00) != Credits (₱400.00)
     v_fake_tx_id := gen_random_uuid();
     INSERT INTO public.financial_transactions (
         id, organization_id, facility_id, transaction_type, idempotency_key, reference_id,
         description, canonical_payload_hash, metadata
     ) VALUES (
-        v_fake_tx_id, v_synth_org_injected, v_fac_injected, 'platform_adjustment', 'idem_unbal_tx_001', gen_random_uuid(),
+        v_fake_tx_id, v_synth_org_injected, v_fac_injected, 'platform_adjustment', 'idem_unbal_001', gen_random_uuid(),
         'Unbalanced synthetic test transaction', 'd41d8cd98f00b204e9800998ecf8427e', '{}'::jsonb
     );
 
-    -- Insert Debits (₱500.00) != Credits (₱400.00)
     INSERT INTO public.ledger_entries (
         id, transaction_id, organization_id, account_code, entry_direction, amount, entry_order, running_balance
     ) VALUES
@@ -819,141 +939,47 @@ BEGIN
     WHERE discrepancy_code = 'LEDGER_UNBALANCED_TRANSACTION';
 
     IF v_found_disc.entity_id != v_fake_tx_id OR v_found_disc.severity != 'CRITICAL' THEN
-        RAISE EXCEPTION 'Anomaly 3.5 Failed: LEDGER_UNBALANCED_TRANSACTION not detected properly!';
+        RAISE EXCEPTION 'Anomaly 4.5 Failed: LEDGER_UNBALANCED_TRANSACTION not detected properly!';
     END IF;
     v_test_count := v_test_count + 1;
-    RAISE NOTICE 'Test % PASSED: Anomaly 3.5 - LEDGER_UNBALANCED_TRANSACTION correctly detected as CRITICAL.', v_test_count;
+    RAISE NOTICE 'Test % PASSED: Anomaly 4.5 - LEDGER_UNBALANCED_TRANSACTION correctly detected as CRITICAL.', v_test_count;
 
-    -- -------------------------------------------------------------------------
-    -- Anomaly 3.6: Transaction with Missing Entries Injection
-    -- -------------------------------------------------------------------------
-    DECLARE
-        v_fake_empty_tx_id UUID := gen_random_uuid();
-    BEGIN
-        INSERT INTO public.financial_transactions (
-            id, organization_id, facility_id, transaction_type, idempotency_key, reference_id,
-            description, canonical_payload_hash, metadata
-        ) VALUES (
-            v_fake_empty_tx_id, v_synth_org_injected, v_fac_injected, 'platform_adjustment', 'idem_empty_tx_001', gen_random_uuid(),
-            'Empty transaction without ledger entries', 'd41d8cd98f00b204e9800998ecf8427e', '{}'::jsonb
-        );
-
-        SELECT * INTO v_found_disc
-        FROM public.reconcile_organization_finances(v_synth_org_injected)
-        WHERE discrepancy_code = 'LEDGER_MISSING_ENTRIES';
-
-        IF v_found_disc.entity_id != v_fake_empty_tx_id OR v_found_disc.severity != 'CRITICAL' THEN
-            RAISE EXCEPTION 'Anomaly 3.6 Failed: LEDGER_MISSING_ENTRIES not detected properly!';
-        END IF;
-    END;
-    v_test_count := v_test_count + 1;
-    RAISE NOTICE 'Test % PASSED: Anomaly 3.6 - LEDGER_MISSING_ENTRIES correctly detected as CRITICAL.', v_test_count;
-
-    -- -------------------------------------------------------------------------
-    -- Anomaly 3.7: Cross-Tenant Ledger Leakage Injection
-    -- -------------------------------------------------------------------------
-    DECLARE
-        v_cross_entry_tx_id UUID := gen_random_uuid();
-        v_cross_entry_id UUID := gen_random_uuid();
-    BEGIN
-        INSERT INTO public.financial_transactions (
-            id, organization_id, facility_id, transaction_type, idempotency_key, reference_id,
-            description, canonical_payload_hash, metadata
-        ) VALUES (
-            v_cross_entry_tx_id, v_synth_org_injected, v_fac_injected, 'platform_adjustment', 'idem_cross_tx_001', gen_random_uuid(),
-            'Balanced transaction with cross-tenant entry', 'd41d8cd98f00b204e9800998ecf8427e', '{}'::jsonb
-        );
-
-        -- Entry 1 belongs to v_synth_org_injected, Entry 2 belongs to v_synth_org_valid (Cross-Tenant Leak!)
-        INSERT INTO public.ledger_entries (
-            id, transaction_id, organization_id, account_code, entry_direction, amount, entry_order, running_balance
-        ) VALUES
-            (gen_random_uuid(), v_cross_entry_tx_id, v_synth_org_injected, '1020', 'DEBIT', 250.00, 1, 250.00),
-            (v_cross_entry_id, v_cross_entry_tx_id, v_synth_org_valid, '2011', 'CREDIT', 250.00, 2, 250.00);
-
-        SELECT * INTO v_found_disc
-        FROM public.reconcile_organization_finances(v_synth_org_injected)
-        WHERE discrepancy_code = 'CROSS_TENANT_LEDGER_LEAKAGE';
-
-        IF v_found_disc.entity_id != v_cross_entry_id OR v_found_disc.severity != 'CRITICAL' THEN
-            RAISE EXCEPTION 'Anomaly 3.7 Failed: CROSS_TENANT_LEDGER_LEAKAGE not detected properly!';
-        END IF;
-    END;
-    v_test_count := v_test_count + 1;
-    RAISE NOTICE 'Test % PASSED: Anomaly 3.7 - CROSS_TENANT_LEDGER_LEAKAGE correctly detected as CRITICAL.', v_test_count;
-
-    -- Re-enable canonical hash trigger
     ALTER TABLE public.financial_transactions ENABLE TRIGGER trg_enforce_financial_tx_canonical_hash;
 
     -- -------------------------------------------------------------------------
-    -- Anomaly 3.8: Payout with Invalid Journal Linkage Injection
+    -- Anomaly 4.6: Payout Invalid Journal Linkage Detection
     -- -------------------------------------------------------------------------
-    -- Insert payout with status 'approved_reserved' but journal_reserve_tx_id is NULL
-    -- Temporarily disable payout transition trigger
+    -- Payout in approved_reserved status with NULL journal_reserve_tx_id
     ALTER TABLE public.payouts DISABLE TRIGGER trg_validate_payout_status_transition;
 
     DECLARE
-        v_fake_unlinked_payout UUID := gen_random_uuid();
+        v_fake_payout UUID := gen_random_uuid();
     BEGIN
         INSERT INTO public.payouts (
             id, organization_id, payout_method_id, amount, currency, status,
             journal_reserve_tx_id, journal_terminal_tx_id
         ) VALUES (
-            v_fake_unlinked_payout, v_synth_org_injected, v_payout_method_id, 500.00, 'PHP', 'approved_reserved',
-            NULL, NULL -- INVALID: approved_reserved MUST have journal_reserve_tx_id!
+            v_fake_payout, v_synth_org_injected, v_payout_method_id, 500.00, 'PHP', 'approved_reserved',
+            NULL, NULL
         );
 
         SELECT * INTO v_found_disc
         FROM public.reconcile_organization_finances(v_synth_org_injected)
         WHERE discrepancy_code = 'PAYOUT_INVALID_JOURNAL_LINKAGE';
 
-        IF v_found_disc.entity_id != v_fake_unlinked_payout OR v_found_disc.severity != 'CRITICAL' THEN
-            RAISE EXCEPTION 'Anomaly 3.8 Failed: PAYOUT_INVALID_JOURNAL_LINKAGE not detected properly!';
+        IF v_found_disc.entity_id != v_fake_payout OR v_found_disc.severity != 'CRITICAL' THEN
+            RAISE EXCEPTION 'Anomaly 4.6 Failed: PAYOUT_INVALID_JOURNAL_LINKAGE not detected properly!';
         END IF;
     END;
     v_test_count := v_test_count + 1;
-    RAISE NOTICE 'Test % PASSED: Anomaly 3.8 - PAYOUT_INVALID_JOURNAL_LINKAGE correctly detected as CRITICAL.', v_test_count;
+    RAISE NOTICE 'Test % PASSED: Anomaly 4.6 - PAYOUT_INVALID_JOURNAL_LINKAGE correctly detected as CRITICAL.', v_test_count;
 
-    -- -------------------------------------------------------------------------
-    -- Anomaly 3.9: Cross-Tenant Journal Reference in Payout Injection
-    -- -------------------------------------------------------------------------
-    -- Insert payout belonging to Tenant B referencing reserve transaction belonging to Tenant A (Valid)
-    DECLARE
-        v_cross_payout_id UUID := gen_random_uuid();
-        v_org_a_reserve_tx UUID;
-    BEGIN
-        SELECT id INTO v_org_a_reserve_tx
-        FROM public.financial_transactions
-        WHERE organization_id = v_synth_org_valid
-          AND transaction_type = 'payout_reserve'
-        LIMIT 1;
-
-        INSERT INTO public.payouts (
-            id, organization_id, payout_method_id, amount, currency, status,
-            journal_reserve_tx_id, journal_terminal_tx_id
-        ) VALUES (
-            v_cross_payout_id, v_synth_org_injected, v_payout_method_id, 600.00, 'PHP', 'approved_reserved',
-            v_org_a_reserve_tx, NULL -- Cross-tenant journal link!
-        );
-
-        SELECT * INTO v_found_disc
-        FROM public.reconcile_organization_finances(v_synth_org_injected)
-        WHERE discrepancy_code = 'CROSS_TENANT_PAYOUT_JOURNAL';
-
-        IF v_found_disc.entity_id != v_cross_payout_id OR v_found_disc.severity != 'CRITICAL' THEN
-            RAISE EXCEPTION 'Anomaly 3.9 Failed: CROSS_TENANT_PAYOUT_JOURNAL not detected properly!';
-        END IF;
-    END;
-    v_test_count := v_test_count + 1;
-    RAISE NOTICE 'Test % PASSED: Anomaly 3.9 - CROSS_TENANT_PAYOUT_JOURNAL correctly detected as CRITICAL.', v_test_count;
-
-    -- Re-enable payout transition trigger
     ALTER TABLE public.payouts ENABLE TRIGGER trg_validate_payout_status_transition;
 
     -- -------------------------------------------------------------------------
-    -- Anomaly 3.10: Materialized Balance Drift & Invariant Violation
+    -- Anomaly 4.7: Materialized Balance Sheet Drift & Decomposition Invariant Breach
     -- -------------------------------------------------------------------------
-    -- Manually update organization_balances so stored available balance has a ₱150.00 drift from GL Account 2011
+    -- Update organization_balances to induce ₱150 drift against General Ledger
     UPDATE public.organization_balances
     SET available_withdrawable_balance = available_withdrawable_balance + 150.00
     WHERE organization_id = v_synth_org_injected;
@@ -963,22 +989,21 @@ BEGIN
     WHERE discrepancy_code = 'BALANCE_AVAILABLE_WITHDRAWABLE_MISMATCH';
 
     IF v_found_disc.entity_id != v_synth_org_injected OR v_found_disc.severity != 'CRITICAL' THEN
-        RAISE EXCEPTION 'Anomaly 3.10 Failed: BALANCE_AVAILABLE_WITHDRAWABLE_MISMATCH not detected properly!';
+        RAISE EXCEPTION 'Anomaly 4.7 Failed: BALANCE_AVAILABLE_WITHDRAWABLE_MISMATCH not detected properly!';
     END IF;
 
-    -- Verify that Four-State Revenue Decomposition Invariant violation is also flagged
     SELECT * INTO v_found_disc
     FROM public.reconcile_organization_finances(v_synth_org_injected)
     WHERE discrepancy_code = 'BALANCE_DECOMPOSITION_INVARIANT_VIOLATION';
 
     IF v_found_disc.entity_id != v_synth_org_injected OR v_found_disc.severity != 'CRITICAL' THEN
-        RAISE EXCEPTION 'Anomaly 3.10 Failed: BALANCE_DECOMPOSITION_INVARIANT_VIOLATION not detected properly!';
+        RAISE EXCEPTION 'Anomaly 4.7 Failed: BALANCE_DECOMPOSITION_INVARIANT_VIOLATION not detected properly!';
     END IF;
     v_test_count := v_test_count + 1;
-    RAISE NOTICE 'Test % PASSED: Anomaly 3.10 - Materialized balance drift and Four-State Invariant breach correctly detected as CRITICAL.', v_test_count;
+    RAISE NOTICE 'Test % PASSED: Anomaly 4.7 - Materialized balance drift and Decomposition Invariant breach detected as CRITICAL.', v_test_count;
 
     -- -------------------------------------------------------------------------
-    -- Anomaly 3.11: Summary Report Health Flagging for Anomalous Tenant
+    -- Anomaly 4.8: Summary Report Health Flagging for Anomalous Tenant
     -- -------------------------------------------------------------------------
     v_summary := public.get_financial_reconciliation_summary(v_synth_org_injected);
 
@@ -987,17 +1012,16 @@ BEGIN
        (v_summary->>'error_count')::INT <= 0 OR
        (v_summary->>'double_entry_balanced')::BOOLEAN IS NOT FALSE OR
        (v_summary->>'commission_policy_compliant')::BOOLEAN IS NOT FALSE THEN
-        RAISE EXCEPTION 'Anomaly 3.11 Failed: get_financial_reconciliation_summary did not correctly flag unhealthy state! Got: %', v_summary;
+        RAISE EXCEPTION 'Anomaly 4.8 Failed: get_financial_reconciliation_summary did not correctly flag unhealthy state! Got: %', v_summary;
     END IF;
     v_test_count := v_test_count + 1;
-    RAISE NOTICE 'Test % PASSED: Anomaly 3.11 - Reconciliation summary accurately flags is_healthy = false, critical_count = %, error_count = %.',
+    RAISE NOTICE 'Test % PASSED: Anomaly 4.8 - Reconciliation summary accurately flags is_healthy = false, critical_count = %, error_count = %.',
         v_test_count, (v_summary->>'critical_count'), (v_summary->>'error_count');
 
 
     -- =========================================================================
-    -- PART 4: Cross-Tenant Isolation Verification (Control Tenant C)
+    -- PART 5: Cross-Tenant Isolation Verification (Control Tenant C)
     -- =========================================================================
-    -- Verify that Tenant B's deliberate corruptions do NOT leak into Tenant C
     INSERT INTO public.organization_balances (
         organization_id, currency, total_gross_settled, total_commission_paid,
         unsettled_clearing_amount, available_withdrawable_balance, pending_payout_amount, total_withdrawn
@@ -1009,74 +1033,122 @@ BEGIN
     FROM public.reconcile_organization_finances(v_synth_org_isolated);
 
     IF v_disc_count != 0 THEN
-        RAISE EXCEPTION 'Part 4 Failed: Isolated tenant reported % discrepancies! Cross-tenant isolation failure.', v_disc_count;
+        RAISE EXCEPTION 'Part 5 Failed: Isolated tenant reported % discrepancies! Cross-tenant isolation failure.', v_disc_count;
     END IF;
 
     v_summary := public.get_financial_reconciliation_summary(v_synth_org_isolated);
     IF (v_summary->>'is_healthy')::BOOLEAN IS NOT TRUE OR
        (v_summary->>'total_discrepancies')::INT != 0 THEN
-        RAISE EXCEPTION 'Part 4 Failed: Isolated tenant summary is unhealthy! Got: %', v_summary;
+        RAISE EXCEPTION 'Part 5 Failed: Isolated tenant summary is unhealthy! Got: %', v_summary;
     END IF;
     v_test_count := v_test_count + 1;
-    RAISE NOTICE 'Test % PASSED: Part 4 - Cross-tenant isolation verified: Tenant C is completely pristine and unaffected by Tenant B anomalies.', v_test_count;
+    RAISE NOTICE 'Test % PASSED: Part 5 - Cross-tenant isolation verified: Tenant C is completely pristine and unaffected by Tenant B anomalies.', v_test_count;
 
 
     -- =========================================================================
-    -- PART 5: Role-Based Access Control & Security Hardening
+    -- PART 6: Role-Based Access Control Using Real PostgreSQL Roles
     -- =========================================================================
-    -- 5.1: Outsider authenticated user denied access
+
+    -- -------------------------------------------------------------------------
+    -- Test 6.1: Real PostgreSQL 'anon' Role Rejected
+    -- -------------------------------------------------------------------------
+    SET ROLE anon;
+    BEGIN
+        PERFORM * FROM public.reconcile_organization_finances(v_synth_org_valid);
+        RAISE EXCEPTION 'Test 6.1 Failed: Actual anon PostgreSQL role was able to run financial reconciliation!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Access denied%' OR SQLERRM LIKE '%permission denied%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test % PASSED: Test 6.1 - Actual anon PostgreSQL role strictly blocked from reconciliation.', v_test_count;
+        ELSE
+            RAISE EXCEPTION 'Test 6.1 Failed with unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    -- -------------------------------------------------------------------------
+    -- Test 6.2: Real PostgreSQL 'authenticated' Role - Outsider User Rejected
+    -- -------------------------------------------------------------------------
+    SET ROLE authenticated;
     PERFORM set_config('request.jwt.claim.sub', v_outsider_user::text, true);
     BEGIN
         PERFORM * FROM public.reconcile_organization_finances(v_synth_org_valid);
-        RAISE EXCEPTION 'Part 5.1 Failed: Outsider user was able to run financial reconciliation!';
+        RAISE EXCEPTION 'Test 6.2 Failed: Outsider authenticated user was able to run financial reconciliation!';
     EXCEPTION WHEN OTHERS THEN
-        IF SQLERRM LIKE '%Only organization owners and admins can run financial reconciliation%' THEN
+        IF SQLERRM LIKE '%Access denied: Only organization owners and admins%' THEN
             v_test_count := v_test_count + 1;
-            RAISE NOTICE 'Test % PASSED: Part 5.1 - Outsider user blocked from running financial reconciliation.', v_test_count;
+            RAISE NOTICE 'Test % PASSED: Test 6.2 - Outsider authenticated user strictly blocked.', v_test_count;
         ELSE
-            RAISE EXCEPTION 'Part 5.1 Failed with unexpected error: %', SQLERRM;
+            RAISE EXCEPTION 'Test 6.2 Failed with unexpected error: %', SQLERRM;
         END IF;
     END;
 
-    -- 5.2: Staff authenticated user denied access
+    -- -------------------------------------------------------------------------
+    -- Test 6.3: Real PostgreSQL 'authenticated' Role - Staff User Rejected
+    -- -------------------------------------------------------------------------
+    SET ROLE authenticated;
     PERFORM set_config('request.jwt.claim.sub', v_staff_valid::text, true);
     BEGIN
         PERFORM * FROM public.reconcile_organization_finances(v_synth_org_valid);
-        RAISE EXCEPTION 'Part 5.2 Failed: Staff user was able to run financial reconciliation!';
+        RAISE EXCEPTION 'Test 6.3 Failed: Staff user was able to run financial reconciliation!';
     EXCEPTION WHEN OTHERS THEN
-        IF SQLERRM LIKE '%Only organization owners and admins can run financial reconciliation%' THEN
+        IF SQLERRM LIKE '%Access denied: Only organization owners and admins%' THEN
             v_test_count := v_test_count + 1;
-            RAISE NOTICE 'Test % PASSED: Part 5.2 - Staff user blocked from sensitive financial reconciliation.', v_test_count;
+            RAISE NOTICE 'Test % PASSED: Test 6.3 - Staff user strictly blocked from sensitive financial reconciliation.', v_test_count;
         ELSE
-            RAISE EXCEPTION 'Part 5.2 Failed with unexpected error: %', SQLERRM;
+            RAISE EXCEPTION 'Test 6.3 Failed with unexpected error: %', SQLERRM;
         END IF;
     END;
 
-    -- 5.3: Authenticated user without explicit organization_id denied access
+    -- -------------------------------------------------------------------------
+    -- Test 6.4: Real PostgreSQL 'authenticated' Role - Cross-Tenant Owner Rejected
+    -- -------------------------------------------------------------------------
+    SET ROLE authenticated;
+    PERFORM set_config('request.jwt.claim.sub', v_owner_injected::text, true);
+    BEGIN
+        PERFORM * FROM public.reconcile_organization_finances(v_synth_org_valid);
+        RAISE EXCEPTION 'Test 6.4 Failed: Cross-tenant owner was able to run financial reconciliation on another organization!';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%Access denied: Only organization owners and admins%' THEN
+            v_test_count := v_test_count + 1;
+            RAISE NOTICE 'Test % PASSED: Test 6.4 - Cross-tenant owner strictly blocked from other organizations.', v_test_count;
+        ELSE
+            RAISE EXCEPTION 'Test 6.4 Failed with unexpected error: %', SQLERRM;
+        END IF;
+    END;
+
+    -- -------------------------------------------------------------------------
+    -- Test 6.5: Authenticated Client Calling Without explicit organization_id Rejected
+    -- -------------------------------------------------------------------------
+    SET ROLE authenticated;
+    PERFORM set_config('request.jwt.claim.sub', v_owner_valid::text, true);
     BEGIN
         PERFORM * FROM public.reconcile_organization_finances(NULL);
-        RAISE EXCEPTION 'Part 5.3 Failed: Authenticated user ran global reconciliation without organization_id!';
+        RAISE EXCEPTION 'Test 6.5 Failed: Authenticated client was able to run global reconciliation without organization_id!';
     EXCEPTION WHEN OTHERS THEN
-        IF SQLERRM LIKE '%Authenticated users must provide an explicit organization_id%' THEN
+        IF SQLERRM LIKE '%Access denied: Authenticated clients must provide an explicit organization_id%' THEN
             v_test_count := v_test_count + 1;
-            RAISE NOTICE 'Test % PASSED: Part 5.3 - Global multi-tenant scan blocked for authenticated callers.', v_test_count;
+            RAISE NOTICE 'Test % PASSED: Test 6.5 - Global scan blocked for authenticated clients.', v_test_count;
         ELSE
-            RAISE EXCEPTION 'Part 5.3 Failed with unexpected error: %', SQLERRM;
+            RAISE EXCEPTION 'Test 6.5 Failed with unexpected error: %', SQLERRM;
         END IF;
     END;
 
-    -- 5.4: Legitimate Organization Owner permitted access
+    -- -------------------------------------------------------------------------
+    -- Test 6.6: Legitimate Owner Permitted Access
+    -- -------------------------------------------------------------------------
+    SET ROLE authenticated;
     PERFORM set_config('request.jwt.claim.sub', v_owner_valid::text, true);
     SELECT count(*) INTO v_disc_count
     FROM public.reconcile_organization_finances(v_synth_org_valid);
 
     IF v_disc_count != 0 THEN
-        RAISE EXCEPTION 'Part 5.4 Failed: Owner execution failed!';
+        RAISE EXCEPTION 'Test 6.6 Failed: Legitimate owner returned % discrepancies!', v_disc_count;
     END IF;
     v_test_count := v_test_count + 1;
-    RAISE NOTICE 'Test % PASSED: Part 5.4 - Legitimate organization owner permitted to execute reconciliation audit.', v_test_count;
+    RAISE NOTICE 'Test % PASSED: Test 6.6 - Legitimate organization owner permitted to execute reconciliation audit.', v_test_count;
 
-    -- Reset caller identity
+    -- Reset role to privileged backend session
+    RESET ROLE;
     PERFORM set_config('request.jwt.claim.sub', '', true);
 
     RAISE NOTICE '========================================================================';

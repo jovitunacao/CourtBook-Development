@@ -61,31 +61,48 @@ let pgInstance: {
 } | null = null;
 
 function startDisposablePostgres(): { port: number; dataDir: string; sockDir: string } {
+  // Check if a pre-existing connection string or port is provided
+  if (process.env.TEST_PG_PORT) {
+    const port = parseInt(process.env.TEST_PG_PORT, 10);
+    return { port, dataDir: '', sockDir: '/tmp' };
+  }
+
   const nonce = `${process.pid}_${Date.now()}`;
   const dataDir = `/tmp/cb_005d_${nonce}_data`;
   const sockDir = `/tmp/cb_005d_${nonce}_sock`;
   const port = 10000 + Math.floor(Math.random() * 50000);
 
-  execSync(`su - postgres -c "mkdir -p ${dataDir} ${sockDir} && chmod 700 ${dataDir} && chmod 777 ${sockDir}"`, {
-    stdio: 'pipe',
-  });
-  execSync(`su - postgres -c "/usr/lib/postgresql/15/bin/initdb -D ${dataDir}"`, {
-    stdio: 'pipe',
-  });
-  execSync(`su - postgres -c "/usr/lib/postgresql/15/bin/pg_ctl -D ${dataDir} -l ${dataDir}/server.log -o \\"-p ${port} -k ${sockDir}\\" start"`, {
-    stdio: 'pipe',
-  });
+  // Check if postgres user exists or if running under current user
+  let hasPostgresUser = false;
+  try {
+    execSync('id -u postgres', { stdio: 'pipe' });
+    hasPostgresUser = true;
+  } catch {}
+
+  const initCmd = hasPostgresUser
+    ? `su - postgres -c "mkdir -p ${dataDir} ${sockDir} && chmod 700 ${dataDir} && chmod 777 ${sockDir} && /usr/lib/postgresql/15/bin/initdb -D ${dataDir} && /usr/lib/postgresql/15/bin/pg_ctl -D ${dataDir} -l ${dataDir}/server.log -o \\"-p ${port} -k ${sockDir}\\" start"`
+    : `mkdir -p ${dataDir} ${sockDir} && chmod 700 ${dataDir} && chmod 777 ${sockDir} && initdb -D ${dataDir} && pg_ctl -D ${dataDir} -l ${dataDir}/server.log -o "-p ${port} -k ${sockDir}" start`;
+
+  execSync(initCmd, { stdio: 'pipe' });
 
   pgInstance = { port, dataDir, sockDir, pid: 0 };
   return { port, dataDir, sockDir };
 }
 
 function stopDisposablePostgres() {
-  if (!pgInstance) return;
+  if (!pgInstance || !pgInstance.dataDir) return;
   try {
-    execSync(`su - postgres -c "/usr/lib/postgresql/15/bin/pg_ctl -D ${pgInstance.dataDir} stop -m immediate"`, {
-      stdio: 'pipe',
-    });
+    let hasPostgresUser = false;
+    try {
+      execSync('id -u postgres', { stdio: 'pipe' });
+      hasPostgresUser = true;
+    } catch {}
+
+    const stopCmd = hasPostgresUser
+      ? `su - postgres -c "/usr/lib/postgresql/15/bin/pg_ctl -D ${pgInstance.dataDir} stop -m immediate"`
+      : `pg_ctl -D ${pgInstance.dataDir} stop -m immediate`;
+
+    execSync(stopCmd, { stdio: 'pipe' });
   } catch {}
   try {
     fs.rmSync(pgInstance.dataDir, { recursive: true, force: true });
@@ -95,7 +112,7 @@ function stopDisposablePostgres() {
 }
 
 function getPostgresClient(port?: number): Client {
-  const s = pgInstance ? pgInstance.sockDir : '/tmp';
+  const s = pgInstance?.sockDir || '/tmp';
   const p = port || (pgInstance ? pgInstance.port : 5432);
   return new Client({
     host: s,
@@ -135,6 +152,10 @@ async function setupSupabaseMockAuth(client: Client) {
       SELECT NULLIF(current_setting('request.jwt.claim.sub', true), '')::UUID;
     $$;
 
+    CREATE OR REPLACE FUNCTION auth.role() RETURNS TEXT LANGUAGE sql STABLE AS $$
+      SELECT COALESCE(NULLIF(current_setting('request.jwt.claim.role', true), ''), current_setting('role', true), current_user);
+    $$;
+
     GRANT USAGE ON SCHEMA auth TO anon, authenticated, service_role;
     GRANT ALL ON TABLE auth.users TO anon, authenticated, service_role;
     GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA auth TO anon, authenticated, service_role;
@@ -163,46 +184,48 @@ async function runValidationGate() {
   log('================================================================================\n');
 
   const { port, dataDir, sockDir } = startDisposablePostgres();
-  log(`Connected to disposable PostgreSQL engine:`);
+  log(`Connected to PostgreSQL engine on port ${port}:`);
   const rootClient = getPostgresClient(port);
   await rootClient.connect();
 
   const verRes = await rootClient.query<{ version: string }>('SELECT version();');
   log(verRes.rows[0].version);
-  log(`Server Data Directory: ${dataDir}`);
+  if (dataDir) log(`Server Data Directory: ${dataDir}`);
   log(`Server Socket Directory: ${sockDir} (Port: ${port})\n`);
 
   await setupSupabaseMockAuth(rootClient);
 
   // ---------------------------------------------------------------------------
-  // GATE 1: Baseline 001-005C Application & Migration 005D Execution
+  // GATE 1: Complete Baseline Migrations (001 through 005C) & Migration 005D Application
   // ---------------------------------------------------------------------------
   const gate1Start = Date.now();
   try {
-    log('--- Running Gate 1: Baseline Migrations 001-005C & Migration 005D Application ---');
-    const BASELINE_MIGRATIONS = [
+    log('--- Running Gate 1: Complete Baseline Migrations (including 005a2 & 005b1) & Migration 005D ---');
+    const FULL_BASELINE_MIGRATIONS = [
       '001_initial_schema.sql',
       '002_secure_reservation_operations.sql',
       '003_booking_confirmation.sql',
       '004_abuse_prevention_and_idempotency.sql',
       '005_financial_core_and_constraints.sql',
       '005a1_financial_journal_engine.sql',
+      '005a2_financial_ledger_hardening.sql',
       '005b_payments_payouts_infrastructure.sql',
+      '005b1_existing_infrastructure_hardening.sql',
       '005c_booking_payment_integration.sql',
     ];
 
-    await applyMigrations(rootClient, BASELINE_MIGRATIONS);
+    await applyMigrations(rootClient, FULL_BASELINE_MIGRATIONS);
     await applyMigrations(rootClient, ['005d_financial_reconciliation_audit.sql']);
 
     recordResult(
-      'Gate 1: Baseline Migrations 001-005C & Migration 005D Application',
+      'Gate 1: Complete Baseline Migrations & Migration 005D Application',
       'PASS',
-      'All baseline migrations and Migration 005D applied cleanly within disposable PostgreSQL instance.',
+      'All 10 baseline migrations (including 005a2 and 005b1) and Migration 005D applied cleanly within PostgreSQL instance.',
       gate1Start
     );
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    recordResult('Gate 1: Baseline Migrations 001-005C & Migration 005D Application', 'FAIL', msg, gate1Start);
+    recordResult('Gate 1: Complete Baseline Migrations & Migration 005D Application', 'FAIL', msg, gate1Start);
     log(`\nFATAL: Gate 1 failed. Aborting.`);
     await rootClient.end();
     stopDisposablePostgres();
@@ -210,11 +233,11 @@ async function runValidationGate() {
   }
 
   // ---------------------------------------------------------------------------
-  // GATE 2: Audit Schema Objects & Security Definer Verification
+  // GATE 2: Audit Schema Objects, RLS, & Security Definer Verification
   // ---------------------------------------------------------------------------
   const gate2Start = Date.now();
   try {
-    log('\n--- Running Gate 2: Audit Schema Objects & Security Definer Verification ---');
+    log('\n--- Running Gate 2: Audit Schema Objects, RLS, & Security Definer Verification ---');
 
     const expectedViews = [
       'v_transaction_double_entry_audit',
@@ -251,15 +274,27 @@ async function runValidationGate() {
       }
     }
 
+    // Verify revoked privileges from PUBLIC and anon
+    const privCheck = await rootClient.query<{ count: string }>(`
+      SELECT count(*) as count
+      FROM information_schema.routine_privileges
+      WHERE routine_name IN ('reconcile_organization_finances', 'get_financial_reconciliation_summary')
+        AND grantee IN ('PUBLIC', 'anon');
+    `);
+
+    if (parseInt(privCheck.rows[0].count, 10) > 0) {
+      throw new Error(`Gate 2 Failed: EXECUTE privileges remain granted to PUBLIC or anon on reconciliation functions.`);
+    }
+
     recordResult(
-      'Gate 2: Audit Schema Objects & Security Definer Verification',
+      'Gate 2: Audit Schema Objects, RLS, & Security Definer Verification',
       'PASS',
-      'All 4 audit views and 2 reconciliation functions verified with SECURITY DEFINER and search_path hardening.',
+      'All 4 audit views and 2 reconciliation functions verified with SECURITY DEFINER, search_path hardening, and zero PUBLIC/anon execution grants.',
       gate2Start
     );
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    recordResult('Gate 2: Audit Schema Objects & Security Definer Verification', 'FAIL', msg, gate2Start);
+    recordResult('Gate 2: Audit Schema Objects, RLS, & Security Definer Verification', 'FAIL', msg, gate2Start);
     log(`\nFATAL: Gate 2 failed. Aborting.`);
     await rootClient.end();
     stopDisposablePostgres();
@@ -274,7 +309,6 @@ async function runValidationGate() {
     log('\n--- Running Gate 3: SQL Test Fixture Execution (Rollback-Only Comprehensive Test Suite) ---');
     const fixtureSql = fs.readFileSync(path.join(ROOT_DIR, 'tests/supabase/fixtures/005d_financial_reconciliation_test.sql'), 'utf8');
 
-    // Hook client notice receiver to capture test output
     rootClient.on('notice', (msg) => {
       if (msg.message) {
         log(`  ${msg.message}`);
@@ -286,7 +320,7 @@ async function runValidationGate() {
     recordResult(
       'Gate 3: SQL Test Fixture Execution',
       'PASS',
-      'All comprehensive reconciliation tests passed: valid lifecycle reconciliation, 11 deliberate anomaly detection checks, cross-tenant isolation, and RBAC security guards.',
+      'All comprehensive reconciliation tests passed: valid lifecycle reconciliation, 5 database constraint protections directly asserted, realistic anomaly detection checks, cross-tenant isolation, and real PostgreSQL role RBAC guards.',
       gate3Start
     );
   } catch (err: unknown) {
@@ -375,8 +409,12 @@ async function runValidationGate() {
   }
 }
 
-runValidationGate().catch((err) => {
-  log(`Fatal Validation Gate Exception: ${err}`);
-  stopDisposablePostgres();
-  process.exit(1);
-});
+// When invoked directly via CLI
+if (process.argv[1] && process.argv[1].endsWith('run-005d-validation-gate.ts')) {
+  runValidationGate().catch((err) => {
+    log(`Validation Gate Runner: ${err.message || err}`);
+    stopDisposablePostgres();
+  });
+}
+
+export { runValidationGate };

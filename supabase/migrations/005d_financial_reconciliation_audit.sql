@@ -9,28 +9,37 @@
 -- ARCHITECTURAL PRINCIPLES & GOALS:
 --   1. Strict Read-Only Audit: Purely analytical; NEVER alters financial records,
 --      balances, ledger lines, or payment states.
---   2. Double-Entry Reconciliation: Verifies sum(debits) = sum(credits) for every
+--   2. Strict Authorization & Zero-Trust Security:
+--      * Anonymous clients and unauthenticated roles are unconditionally blocked.
+--      * Direct EXECUTE revoked from PUBLIC and anon on all reconciliation routines.
+--      * Authenticated clients must provide an explicit organization_id and possess
+--        verified owner or admin role within that organization.
+--      * Privileged service/backend operations (service_role, postgres, supabase_admin)
+--        are explicitly authorized for global or tenant-scoped operational audits.
+--      * All audit views enforce security_invoker = true and tenant RLS isolation.
+--   3. Double-Entry Reconciliation: Verifies sum(debits) = sum(credits) for every
 --      posted transaction and checks account running balances against the general ledger.
---   3. Revenue Split Integrity: Verifies 5% platform commission and 95% owner gross
+--   4. Revenue Split Integrity: Verifies 5% platform commission and 95% owner gross
 --      share with exact centavo precision (ROUND(..., 2)), with zero tolerance for drift.
---   4. Materialized Balance Verification: Reconciles public.organization_balances
---      directly against underlying ledger accounts:
+--   5. Materialized Balance Verification: Reconciles public.organization_balances
+--      directly against underlying ledger accounts (11-account COA):
 --        * Account 2010 (Liability normal) -> unsettled_clearing_amount
 --        * Account 2011 (Liability normal) -> available_withdrawable_balance
 --        * Account 2012 (Liability normal) -> restricted_reserve_amount
 --        * Account 2015 (Liability normal) -> pending_payout_amount
 --        * Account 4010 (Revenue normal)   -> total_commission_paid
+--        * Account 1030 (Asset normal)     -> negative_recovery_balance
 --        * Account 1020/2015 disbursements -> total_withdrawn
---   5. Four-State Balance Decomposition Invariant:
---        Owner Net Revenue (Gross Settled - Commission) =
+--   6. Complete Revenue Decomposition Invariant (Authoritative 005a2 Math):
+--        Owner Revenue Entitlement (total_gross_settled - total_commission_paid) =
 --          unsettled_clearing_amount + available_withdrawable_balance +
---          pending_payout_amount + total_withdrawn
---   6. Operational Payout & Settlement Verification:
---        * Sum of approved_reserved/submitted_to_provider payouts = pending_payout_amount
---        * Sum of paid payouts = total_withdrawn
---        * Journal references strictly match required transaction types and tenant ownership
---   7. Cross-Tenant Isolation: Identifies any cross-tenant journal links or foreign key breaches.
---   8. Anomaly & Replay Detection: Identifies duplicate provider references and orphaned records.
+--          pending_payout_amount + total_withdrawn +
+--          restricted_reserve_amount - negative_recovery_balance
+--   7. Operational Payout & Settlement Verification:
+--        * Sum of active reserved payouts (approved_reserved / submitted_to_provider) = pending_payout_amount
+--        * Sum of completed payouts (paid) = total_withdrawn
+--        * Mandatory journal linkage strictly verified by lifecycle status.
+--   8. Anomaly & Replay Detection: Duplicate provider payment IDs and orphaned journals.
 -- ==============================================================================
 
 BEGIN;
@@ -97,9 +106,21 @@ SELECT
     (p.refunded_amount <= p.captured_amount) AS is_refund_within_bounds,
     p.created_at,
     p.captured_at
-FROM public.payments p;
+FROM public.payments p
+WHERE (
+    -- Privileged service/backend caller
+    current_user IN ('postgres', 'service_role', 'supabase_admin') OR
+    current_setting('role', true) IN ('service_role', 'postgres', 'supabase_admin') OR
+    -- Sensitive financial commission splits restricted strictly to verified owners & admins
+    EXISTS (
+        SELECT 1 FROM public.organization_members om
+        WHERE om.organization_id = p.organization_id
+          AND om.user_id = auth.uid()
+          AND om.role IN ('owner', 'admin')
+    )
+);
 
-COMMENT ON VIEW public.v_payment_commission_audit IS 'Audit view checking 5% commission calculation, owner share conservation, and refund bounds on payment records.';
+COMMENT ON VIEW public.v_payment_commission_audit IS 'Audit view checking 5% commission calculation, owner share conservation, and refund bounds on payment records for authorized owners and admins.';
 
 
 -- ==============================================================================
@@ -194,6 +215,13 @@ WITH ledger_summary AS (
             ELSE 0.00
         END), 2), 0.00) AS gl_commission_revenue,
 
+        -- Account 1030: Platform Merchant Recovery Receivable (Asset normal: Debits - Credits)
+        COALESCE(round(sum(CASE
+            WHEN le.account_code = '1030' AND le.entry_direction = 'DEBIT' THEN le.amount
+            WHEN le.account_code = '1030' AND le.entry_direction = 'CREDIT' THEN -le.amount
+            ELSE 0.00
+        END), 2), 0.00) AS gl_negative_recovery,
+
         -- Account 2030: Customer Refund Liability (Liability normal: Credits - Debits)
         COALESCE(round(sum(CASE
             WHEN le.account_code = '2030' AND le.entry_direction = 'CREDIT' THEN le.amount
@@ -224,12 +252,12 @@ SELECT
     o.name AS organization_name,
     ob.currency,
 
-    -- 1. Unsettled Clearing Reconciliation
+    -- 1. Unsettled Clearing Reconciliation (Account 2010)
     ob.unsettled_clearing_amount AS stored_unsettled_clearing,
     COALESCE(ls.gl_unsettled_clearing, 0.00) AS calculated_unsettled_clearing,
     round(ob.unsettled_clearing_amount - COALESCE(ls.gl_unsettled_clearing, 0.00), 2) AS unsettled_clearing_diff,
 
-    -- 2. Available Balance Reconciliation
+    -- 2. Available Balance Reconciliation (Account 2011)
     ob.available_withdrawable_balance AS stored_available_balance,
     COALESCE(ls.gl_available_balance, 0.00) AS calculated_available_balance,
     round(ob.available_withdrawable_balance - COALESCE(ls.gl_available_balance, 0.00), 2) AS available_balance_diff,
@@ -240,27 +268,33 @@ SELECT
     COALESCE(ps.active_reserved_payouts_sum, 0.00) AS active_payout_records_sum,
     round(ob.pending_payout_amount - COALESCE(ls.gl_pending_payout, 0.00), 2) AS pending_payout_diff,
 
-    -- 4. Total Commission Paid Reconciliation
+    -- 4. Total Commission Paid Reconciliation (Account 4010)
     ob.total_commission_paid AS stored_total_commission,
     COALESCE(ls.gl_commission_revenue, 0.00) AS calculated_total_commission,
     round(ob.total_commission_paid - COALESCE(ls.gl_commission_revenue, 0.00), 2) AS commission_diff,
 
-    -- 5. Total Withdrawn Reconciliation
+    -- 5. Total Withdrawn Reconciliation (Account 1020/2015 Disbursements vs Paid Payouts)
     ob.total_withdrawn AS stored_total_withdrawn,
     COALESCE(ls.gl_total_withdrawn, 0.00) AS calculated_total_withdrawn,
     COALESCE(ps.paid_payouts_sum, 0.00) AS paid_payout_records_sum,
     round(ob.total_withdrawn - COALESCE(ls.gl_total_withdrawn, 0.00), 2) AS withdrawn_diff,
 
-    -- 6. Restricted Reserve
+    -- 6. Restricted Reserve Reconciliation (Account 2012)
     ob.restricted_reserve_amount AS stored_restricted_reserve,
     COALESCE(ls.gl_restricted_reserve, 0.00) AS calculated_restricted_reserve,
     round(ob.restricted_reserve_amount - COALESCE(ls.gl_restricted_reserve, 0.00), 2) AS restricted_reserve_diff,
 
-    -- 7. Four-State Owner Gross Revenue Decomposition Invariant
-    -- Owner Gross Revenue = unsettled + available + pending_payout + total_withdrawn
+    -- 7. Negative Recovery Balance Reconciliation (Account 1030)
+    ob.negative_recovery_balance AS stored_negative_recovery,
+    COALESCE(ls.gl_negative_recovery, 0.00) AS calculated_negative_recovery,
+    round(ob.negative_recovery_balance - COALESCE(ls.gl_negative_recovery, 0.00), 2) AS negative_recovery_diff,
+
+    -- 8. Complete Revenue Decomposition Invariant (Authoritative 005a2 Math):
+    -- Owner Entitlement = total_gross_settled - total_commission_paid
+    -- Decomposed Sum = unsettled + available + pending_payout + total_withdrawn + restricted_reserve - negative_recovery
     round(ob.total_gross_settled - ob.total_commission_paid, 2) AS owner_gross_revenue_entitlement,
-    round(ob.unsettled_clearing_amount + ob.available_withdrawable_balance + ob.pending_payout_amount + ob.total_withdrawn, 2) AS owner_decomposed_revenue_sum,
-    round((ob.total_gross_settled - ob.total_commission_paid) - (ob.unsettled_clearing_amount + ob.available_withdrawable_balance + ob.pending_payout_amount + ob.total_withdrawn), 2) AS decomposition_drift,
+    round(ob.unsettled_clearing_amount + ob.available_withdrawable_balance + ob.pending_payout_amount + ob.total_withdrawn + ob.restricted_reserve_amount - ob.negative_recovery_balance, 2) AS owner_decomposed_revenue_sum,
+    round((ob.total_gross_settled - ob.total_commission_paid) - (ob.unsettled_clearing_amount + ob.available_withdrawable_balance + ob.pending_payout_amount + ob.total_withdrawn + ob.restricted_reserve_amount - ob.negative_recovery_balance), 2) AS decomposition_drift,
 
     -- Overall Integrity Flag
     (
@@ -271,24 +305,34 @@ SELECT
         ob.total_commission_paid = COALESCE(ls.gl_commission_revenue, 0.00) AND
         ob.total_withdrawn = COALESCE(ls.gl_total_withdrawn, 0.00) AND
         ob.total_withdrawn = COALESCE(ps.paid_payouts_sum, 0.00) AND
-        round(ob.total_gross_settled - ob.total_commission_paid, 2) = round(ob.unsettled_clearing_amount + ob.available_withdrawable_balance + ob.pending_payout_amount + ob.total_withdrawn, 2)
+        ob.restricted_reserve_amount = COALESCE(ls.gl_restricted_reserve, 0.00) AND
+        ob.negative_recovery_balance = COALESCE(ls.gl_negative_recovery, 0.00) AND
+        round(ob.total_gross_settled - ob.total_commission_paid, 2) =
+            round(ob.unsettled_clearing_amount + ob.available_withdrawable_balance + ob.pending_payout_amount + ob.total_withdrawn + ob.restricted_reserve_amount - ob.negative_recovery_balance, 2)
     ) AS is_reconciled
 FROM public.organizations o
 JOIN public.organization_balances ob ON ob.organization_id = o.id
 LEFT JOIN ledger_summary ls ON ls.organization_id = o.id
-LEFT JOIN payout_summary ps ON ps.organization_id = o.id;
+LEFT JOIN payout_summary ps ON ps.organization_id = o.id
+WHERE (
+    -- Privileged service/backend caller
+    current_user IN ('postgres', 'service_role', 'supabase_admin') OR
+    current_setting('role', true) IN ('service_role', 'postgres', 'supabase_admin') OR
+    -- Sensitive balance sheet overview restricted strictly to verified owners & admins
+    EXISTS (
+        SELECT 1 FROM public.organization_members om
+        WHERE om.organization_id = o.id
+          AND om.user_id = auth.uid()
+          AND om.role IN ('owner', 'admin')
+    )
+);
 
-COMMENT ON VIEW public.v_financial_reconciliation_overview IS 'Comprehensive view matching materialized balance metrics against general ledger accounts and operational payout sums.';
+COMMENT ON VIEW public.v_financial_reconciliation_overview IS 'Comprehensive view matching materialized balance metrics against general ledger accounts and operational payout sums for authorized owners and admins.';
 
 
 -- ==============================================================================
 -- 5. Read-Only Core Reconciliation Diagnostic Function
 -- ==============================================================================
--- Analyzes transactions, ledger entries, payments, payouts, and organization balances.
--- Identifies and categorizes discrepancies with severity and exact diagnostic payload.
--- Strictly read-only: does not modify any table.
--- ==============================================================================
-
 CREATE OR REPLACE FUNCTION public.reconcile_organization_finances(
     p_organization_id UUID DEFAULT NULL
 )
@@ -311,13 +355,37 @@ SECURITY DEFINER
 SET search_path = public, pg_temp
 AS $$
 DECLARE
+    v_caller_role TEXT;
     v_caller_id UUID;
+    v_is_service_or_superuser BOOLEAN;
 BEGIN
-    -- Authorization Check: If invoked by authenticated user, verify owner/admin role
+    -- Determine execution role context
+    v_caller_role := current_setting('role', true);
+    IF v_caller_role IS NULL OR v_caller_role = '' THEN
+        v_caller_role := current_user;
+    END IF;
+
+    -- 1. Unconditionally reject anonymous callers
+    IF v_caller_role = 'anon' OR current_user = 'anon' THEN
+        RAISE EXCEPTION 'Access denied: Anonymous clients cannot access financial reconciliation.';
+    END IF;
+
+    -- Check if running in privileged backend context (postgres, service_role, supabase_admin)
+    v_is_service_or_superuser := (
+        v_caller_role IN ('service_role', 'postgres', 'supabase_admin') OR
+        current_user IN ('postgres', 'service_role', 'supabase_admin')
+    );
+
     v_caller_id := auth.uid();
-    IF v_caller_id IS NOT NULL THEN
+
+    -- Client callers (authenticated users) MUST authenticate and provide an explicit organization_id
+    IF NOT v_is_service_or_superuser THEN
+        IF v_caller_id IS NULL THEN
+            RAISE EXCEPTION 'Access denied: Unauthenticated clients cannot access financial reconciliation.';
+        END IF;
+
         IF p_organization_id IS NULL THEN
-            RAISE EXCEPTION 'Access denied: Authenticated users must provide an explicit organization_id.';
+            RAISE EXCEPTION 'Access denied: Authenticated clients must provide an explicit organization_id.';
         END IF;
 
         IF NOT EXISTS (
@@ -645,13 +713,57 @@ BEGIN
         v.organization_id,
         'BALANCE_SHEET'::TEXT AS category,
         'CRITICAL'::TEXT AS severity,
+        'BALANCE_RESTRICTED_RESERVE_MISMATCH'::TEXT AS discrepancy_code,
+        'organization_balance'::TEXT AS entity_type,
+        v.organization_id AS entity_id,
+        v.calculated_restricted_reserve AS expected_value,
+        v.stored_restricted_reserve AS actual_value,
+        abs(v.restricted_reserve_diff) AS discrepancy_amount,
+        format('Organization %s restricted_reserve_amount mismatch: Materialized metric (₱%s) != General Ledger Account 2012 (₱%s).',
+            v.organization_name, v.stored_restricted_reserve, v.calculated_restricted_reserve) AS description,
+        jsonb_build_object(
+            'stored', v.stored_restricted_reserve,
+            'calculated_gl_2012', v.calculated_restricted_reserve,
+            'diff', v.restricted_reserve_diff
+        ) AS details
+    FROM public.v_financial_reconciliation_overview v
+    WHERE (p_organization_id IS NULL OR v.organization_id = p_organization_id)
+      AND v.restricted_reserve_diff != 0.00;
+
+    RETURN QUERY
+    SELECT
+        v.organization_id,
+        'BALANCE_SHEET'::TEXT AS category,
+        'CRITICAL'::TEXT AS severity,
+        'BALANCE_NEGATIVE_RECOVERY_MISMATCH'::TEXT AS discrepancy_code,
+        'organization_balance'::TEXT AS entity_type,
+        v.organization_id AS entity_id,
+        v.calculated_negative_recovery AS expected_value,
+        v.stored_negative_recovery AS actual_value,
+        abs(v.negative_recovery_diff) AS discrepancy_amount,
+        format('Organization %s negative_recovery_balance mismatch: Materialized metric (₱%s) != General Ledger Account 1030 (₱%s).',
+            v.organization_name, v.stored_negative_recovery, v.calculated_negative_recovery) AS description,
+        jsonb_build_object(
+            'stored', v.stored_negative_recovery,
+            'calculated_gl_1030', v.calculated_negative_recovery,
+            'diff', v.negative_recovery_diff
+        ) AS details
+    FROM public.v_financial_reconciliation_overview v
+    WHERE (p_organization_id IS NULL OR v.organization_id = p_organization_id)
+      AND v.negative_recovery_diff != 0.00;
+
+    RETURN QUERY
+    SELECT
+        v.organization_id,
+        'BALANCE_SHEET'::TEXT AS category,
+        'CRITICAL'::TEXT AS severity,
         'BALANCE_DECOMPOSITION_INVARIANT_VIOLATION'::TEXT AS discrepancy_code,
         'organization_balance'::TEXT AS entity_type,
         v.organization_id AS entity_id,
         v.owner_gross_revenue_entitlement AS expected_value,
         v.owner_decomposed_revenue_sum AS actual_value,
         abs(v.decomposition_drift) AS discrepancy_amount,
-        format('Organization %s four-state revenue decomposition invariant breached: Entitlement (₱%s) != Decomposed sum (₱%s). Drift: ₱%s.',
+        format('Organization %s revenue decomposition invariant breached: Entitlement (₱%s) != Decomposed sum (₱%s). Drift: ₱%s.',
             v.organization_name, v.owner_gross_revenue_entitlement, v.owner_decomposed_revenue_sum, v.decomposition_drift) AS description,
         jsonb_build_object(
             'owner_entitlement', v.owner_gross_revenue_entitlement,
@@ -660,6 +772,8 @@ BEGIN
             'available', v.stored_available_balance,
             'pending_payout', v.stored_pending_payout,
             'withdrawn', v.stored_total_withdrawn,
+            'restricted_reserve', v.stored_restricted_reserve,
+            'negative_recovery', v.stored_negative_recovery,
             'drift', v.decomposition_drift
         ) AS details
     FROM public.v_financial_reconciliation_overview v
@@ -817,6 +931,9 @@ SECURITY DEFINER
 SET search_path = public, pg_temp
 AS $$
 DECLARE
+    v_caller_role TEXT;
+    v_caller_id UUID;
+    v_is_service_or_superuser BOOLEAN;
     v_total_discrepancies INT := 0;
     v_critical_count INT := 0;
     v_error_count INT := 0;
@@ -829,7 +946,46 @@ DECLARE
     v_discrepancies JSONB := '[]'::jsonb;
     v_disc RECORD;
 BEGIN
-    -- Audit Scope Metrics
+    -- Determine execution role context
+    v_caller_role := current_setting('role', true);
+    IF v_caller_role IS NULL OR v_caller_role = '' THEN
+        v_caller_role := current_user;
+    END IF;
+
+    -- 1. Unconditionally reject anonymous callers
+    IF v_caller_role = 'anon' OR current_user = 'anon' THEN
+        RAISE EXCEPTION 'Access denied: Anonymous clients cannot access financial reconciliation.';
+    END IF;
+
+    -- Check if running in privileged backend context (postgres, service_role, supabase_admin)
+    v_is_service_or_superuser := (
+        v_caller_role IN ('service_role', 'postgres', 'supabase_admin') OR
+        current_user IN ('postgres', 'service_role', 'supabase_admin')
+    );
+
+    v_caller_id := auth.uid();
+
+    -- Client callers (authenticated users) MUST authenticate and provide an explicit organization_id
+    IF NOT v_is_service_or_superuser THEN
+        IF v_caller_id IS NULL THEN
+            RAISE EXCEPTION 'Access denied: Unauthenticated clients cannot access financial reconciliation.';
+        END IF;
+
+        IF p_organization_id IS NULL THEN
+            RAISE EXCEPTION 'Access denied: Authenticated clients must provide an explicit organization_id.';
+        END IF;
+
+        IF NOT EXISTS (
+            SELECT 1 FROM public.organization_members om
+            WHERE om.organization_id = p_organization_id
+              AND om.user_id = v_caller_id
+              AND om.role IN ('owner', 'admin')
+        ) THEN
+            RAISE EXCEPTION 'Access denied: Only organization owners and admins can run financial reconciliation.';
+        END IF;
+    END IF;
+
+    -- Audit Scope Metrics (Scoped to authorized organization)
     SELECT count(DISTINCT id) INTO v_audited_orgs
     FROM public.organizations
     WHERE (p_organization_id IS NULL OR id = p_organization_id);
@@ -909,9 +1065,19 @@ COMMENT ON FUNCTION public.get_financial_reconciliation_summary IS 'High-level s
 
 
 -- ==============================================================================
--- 7. Privileges & Access Hardening
+-- 7. Privileges & Access Hardening (Zero-Trust Model)
 -- ==============================================================================
--- Grant safe read-only access to authenticated owners and service_role
+
+-- Explicitly revoke all privileges from PUBLIC and anon
+REVOKE ALL ON public.v_transaction_double_entry_audit FROM PUBLIC, anon;
+REVOKE ALL ON public.v_payment_commission_audit FROM PUBLIC, anon;
+REVOKE ALL ON public.v_payout_lifecycle_reconciliation FROM PUBLIC, anon;
+REVOKE ALL ON public.v_financial_reconciliation_overview FROM PUBLIC, anon;
+
+REVOKE ALL ON FUNCTION public.reconcile_organization_finances(UUID) FROM PUBLIC, anon;
+REVOKE ALL ON FUNCTION public.get_financial_reconciliation_summary(UUID) FROM PUBLIC, anon;
+
+-- Grant safe, authenticated access
 GRANT SELECT ON public.v_transaction_double_entry_audit TO authenticated, service_role;
 GRANT SELECT ON public.v_payment_commission_audit TO authenticated, service_role;
 GRANT SELECT ON public.v_payout_lifecycle_reconciliation TO authenticated, service_role;
