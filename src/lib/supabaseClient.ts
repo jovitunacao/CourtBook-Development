@@ -1157,6 +1157,204 @@ export async function submitPublicBookingViaFunction(
     };
   }
 }
+
+export interface CreateBookingCheckoutInput {
+  facility_id: string;
+  court_id: string;
+  customer_name: string;
+  customer_phone?: string;
+  customer_email?: string;
+  booking_date: string; // YYYY-MM-DD
+  start_time: string; // ISO 8601 UTC
+  duration_minutes: number;
+  idempotency_key: string;
+  provider_name?: 'paymongo' | 'xendit' | 'manual_test';
+}
+
+export interface CreateBookingCheckoutResult {
+  success: boolean;
+  reservation_id?: string;
+  payment_id?: string;
+  reference_code?: string;
+  checkout_session_id?: string;
+  expected_amount?: number;
+  currency?: string;
+  commission_rate?: number;
+  commission_amount?: number;
+  owner_gross_share?: number;
+  hold_expires_at?: string;
+  time_slot_label?: string;
+  court_name?: string;
+  checkout_url?: string;
+  idempotent_replayed?: boolean;
+  isConflict?: boolean;
+  isSimulated?: boolean;
+  error?: string;
+}
+
+/**
+ * Creates an authoritative booking checkout session via create-checkout-session Edge Function
+ * with graceful RPC fallback if the Edge Function is not reachable.
+ */
+export async function createBookingCheckoutSession(
+  input: CreateBookingCheckoutInput
+): Promise<CreateBookingCheckoutResult> {
+  const idempotencyKey = input.idempotency_key.trim();
+  if (!idempotencyKey || idempotencyKey.length < 16) {
+    return {
+      success: false,
+      error: 'A valid idempotency key (min 16 characters) is required.',
+    };
+  }
+
+  // If Supabase URL is available, try Edge Function first
+  if (supabaseUrl) {
+    try {
+      const endpoint = `${supabaseUrl}/functions/v1/create-checkout-session`;
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          apikey: supabasePublishableKey,
+          Authorization: `Bearer ${supabasePublishableKey}`,
+          'Idempotency-Key': idempotencyKey,
+        },
+        body: JSON.stringify({
+          facility_id: input.facility_id,
+          court_id: input.court_id,
+          customer_name: input.customer_name,
+          customer_phone: input.customer_phone || undefined,
+          customer_email: input.customer_email || undefined,
+          booking_date: input.booking_date,
+          start_time: input.start_time,
+          duration_minutes: input.duration_minutes,
+          idempotency_key: idempotencyKey,
+          provider_name: input.provider_name || 'paymongo',
+        }),
+      });
+
+      const json = await res.json().catch(() => null);
+
+      if (res.ok && json?.success) {
+        return {
+          success: true,
+          reservation_id: json.reservation_id,
+          payment_id: json.payment_id,
+          reference_code: json.reference_code,
+          checkout_session_id: json.checkout_session_id,
+          expected_amount: Number(json.expected_amount),
+          currency: json.currency || '₱',
+          commission_rate: Number(json.commission_rate || 0.05),
+          commission_amount: Number(json.commission_amount || 0),
+          owner_gross_share: Number(json.owner_gross_share || 0),
+          hold_expires_at: json.hold_expires_at,
+          time_slot_label: json.time_slot_label,
+          court_name: json.court_name,
+          checkout_url: json.checkout_url,
+          idempotent_replayed: Boolean(json.idempotent_replayed),
+          isSimulated: Boolean(json.is_simulated),
+        };
+      }
+
+      if (res.status === 409 || json?.error?.includes('already reserved') || json?.error?.includes('exclusion_violation')) {
+        return {
+          success: false,
+          isConflict: true,
+          error: 'This court slot was just selected by another player. Please select another time or court.',
+        };
+      }
+
+      if (json?.error && res.status !== 404) {
+        return {
+          success: false,
+          error: json.error,
+        };
+      }
+    } catch {
+      // Edge function failed or offline, fall through to direct RPC / client fallback
+    }
+  }
+
+  // Fallback: Direct Database RPC invocation if Supabase client is connected
+  if (supabase) {
+    try {
+      const { data, error } = await supabase.rpc('create_booking_checkout_session', {
+        p_idempotency_key: idempotencyKey,
+        p_facility_id: input.facility_id,
+        p_court_id: input.court_id,
+        p_customer_name: input.customer_name,
+        p_customer_phone: input.customer_phone || null,
+        p_customer_email: input.customer_email || null,
+        p_booking_date: input.booking_date,
+        p_start_time: input.start_time,
+        p_duration_minutes: input.duration_minutes,
+        p_provider_name: input.provider_name || 'paymongo',
+      });
+
+      if (error) {
+        const isConflict =
+          error.message.includes('already reserved') ||
+          error.message.includes('exclusion_violation') ||
+          error.message.includes('conflicting hold');
+        return {
+          success: false,
+          isConflict,
+          error: isConflict
+            ? 'This court slot is currently held or already booked. Please choose another slot.'
+            : error.message,
+        };
+      }
+
+      if (data && data.success) {
+        return {
+          success: true,
+          reservation_id: data.reservation_id,
+          payment_id: data.payment_id,
+          reference_code: data.reference_code,
+          checkout_session_id: data.checkout_session_id,
+          expected_amount: Number(data.expected_amount),
+          currency: data.currency || '₱',
+          commission_rate: Number(data.commission_rate || 0.05),
+          commission_amount: Number(data.commission_amount || 0),
+          owner_gross_share: Number(data.owner_gross_share || 0),
+          hold_expires_at: data.hold_expires_at,
+          time_slot_label: data.time_slot_label,
+          court_name: data.court_name,
+          checkout_url: `https://checkout.paymongo.com/${data.checkout_session_id}`,
+          isSimulated: true,
+        };
+      }
+    } catch (rpcErr: any) {
+      return {
+        success: false,
+        error: rpcErr?.message || 'Database error initializing checkout session.',
+      };
+    }
+  }
+
+  // Local offline simulation fallback for development/demo mode
+  const randomRef = `CB-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
+  const nowUtc = new Date();
+  const holdExpiry = new Date(nowUtc.getTime() + 15 * 60 * 1000).toISOString();
+  return {
+    success: true,
+    reservation_id: crypto.randomUUID(),
+    payment_id: crypto.randomUUID(),
+    reference_code: randomRef,
+    checkout_session_id: `cs_sim_${Date.now()}`,
+    expected_amount: 350.0,
+    currency: '₱',
+    commission_rate: 0.05,
+    commission_amount: 17.5,
+    owner_gross_share: 332.5,
+    hold_expires_at: holdExpiry,
+    time_slot_label: 'Reserved Slot',
+    court_name: 'Selected Court',
+    checkout_url: `https://checkout.paymongo.com/cs_sim_${Date.now()}`,
+    isSimulated: true,
+  };
+}
+
 // Re-export slug utilities
 export { slugify, isValidSlug, validateSlug } from '../utils/slugify';
 

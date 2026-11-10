@@ -87,7 +87,7 @@ function startDisposablePostgres(): { port: number; dataDir: string; sockDir: st
 
   const initCmd = hasPostgresUser
     ? `su - postgres -c "mkdir -p ${dataDir} ${sockDir} && chmod 700 ${dataDir} && chmod 777 ${sockDir} && /usr/lib/postgresql/15/bin/initdb -D ${dataDir} && /usr/lib/postgresql/15/bin/pg_ctl -D ${dataDir} -l ${dataDir}/server.log -o \\"-p ${port} -k ${sockDir}\\" start"`
-    : `mkdir -p ${dataDir} ${sockDir} && chmod 700 ${dataDir} && chmod 777 ${sockDir} && initdb -D ${dataDir} && pg_ctl -D ${dataDir} -l ${dataDir}/server.log -o "-p ${port} -k ${sockDir}" start`;
+    : `mkdir -p ${dataDir} ${sockDir} && chmod 700 ${dataDir} && chmod 777 ${sockDir} && /usr/lib/postgresql/15/bin/initdb -D ${dataDir} && /usr/lib/postgresql/15/bin/pg_ctl -D ${dataDir} -l ${dataDir}/server.log -o "-p ${port} -k ${sockDir}" start`;
 
   execSync(initCmd, { stdio: 'pipe' });
 
@@ -106,7 +106,7 @@ function stopDisposablePostgres() {
 
     const stopCmd = hasPostgresUser
       ? `su - postgres -c "/usr/lib/postgresql/15/bin/pg_ctl -D ${pgInstance.dataDir} stop -m immediate"`
-      : `pg_ctl -D ${pgInstance.dataDir} stop -m immediate`;
+      : `/usr/lib/postgresql/15/bin/pg_ctl -D ${pgInstance.dataDir} stop -m immediate`;
 
     execSync(stopCmd, { stdio: 'pipe' });
   } catch {}

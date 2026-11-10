@@ -13,6 +13,7 @@ import { Footer } from './components/Footer';
 import { HomePage } from './components/HomePage';
 import { BookingPage } from './components/BookingPage';
 import { VenueDirectory } from './components/VenueDirectory';
+import { CustomerBookingFlow } from './components/booking/CustomerBookingFlow';
 import { AdminPage } from './components/AdminPage';
 import { FacilitySettingsPage } from './components/FacilitySettingsPage';
 import { AuthModal } from './components/AuthModal';
@@ -395,39 +396,31 @@ function CourtBookApp() {
         )}
 
         {currentTab === 'booking' && (
-          isConfigured && !activePublicFacility ? (
-            <VenueDirectory
-              facilities={publicFacilities}
-              directoryCourts={directoryCourts}
-              isLoading={publicFacilitiesLoading}
-              error={publicFacilitiesError}
-              onSelectFacility={async (facilityId) => {
-                await setActivePublicFacilityId(facilityId);
-                setCurrentTab('booking');
-                window.scrollTo({ top: 0, behavior: 'smooth' });
-              }}
-              onRetry={refreshPublicFacilities}
-            />
-          ) : (
-            <BookingPage
-              initialCourtId={selectedCourtForBooking}
-              settings={publicActiveSettings || facilitySettings}
-              reservations={reservations}
-              onAddReservation={handleAddReservation}
-              onNavigateToAdmin={handleOpenAdmin}
-              onNavigateToSettings={handleOpenSettings}
-              onChangeVenue={() => {
-                setActivePublicFacilityId('');
-                setCurrentTab('home');
-                window.scrollTo({ top: 0, behavior: 'smooth' });
-              }}
-              onResetToNewBooking={() => {
-                const targetSettings = publicActiveSettings || facilitySettings;
-                const firstCourt = targetSettings.courts.find((c) => c.isEnabled) || targetSettings.courts[0];
-                setSelectedCourtForBooking(firstCourt ? firstCourt.id : '');
-              }}
-            />
-          )
+          <CustomerBookingFlow
+            initialFacilityId={activePublicFacility?.id}
+            onNavigateHome={() => {
+              setCurrentTab('home');
+              window.scrollTo({ top: 0, behavior: 'smooth' });
+            }}
+            onBookingConfirmed={(details) => {
+              handleAddReservation({
+                id: details.reservationId,
+                referenceCode: details.referenceCode,
+                courtId: details.courtName,
+                courtName: details.courtName,
+                date: details.bookingDate,
+                timeSlotId: details.timeSlotLabel,
+                timeSlotLabel: details.timeSlotLabel,
+                customerName: details.customerName,
+                customerPhone: details.customerPhone,
+                customerEmail: details.customerEmail,
+                price: details.totalPrice,
+                status: 'confirmed',
+                createdAt: details.confirmedAt,
+              });
+              showToast(`Court reservation ${details.referenceCode} confirmed!`);
+            }}
+          />
         )}
 
         {/* Administrative Views: Gated by user authentication and onboardingState */}

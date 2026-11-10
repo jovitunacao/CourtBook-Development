@@ -14,6 +14,8 @@
     "test:005b": "tsx tests/supabase/run-005b-validation-gate.ts",
     "test:005c": "tsx tests/supabase/run-005c-validation-gate.ts",
     "test:005d": "tsx tests/supabase/run-005d-validation-gate.ts",
+    "test:frontend": "tsx tests/frontend/venue-directory.test.ts",
+    "test:booking": "tsx tests/frontend/customer-booking-flow.test.ts",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit"
   },
