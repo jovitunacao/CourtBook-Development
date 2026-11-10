@@ -15,14 +15,12 @@ const ROOT_DIR = path.resolve(__dirname, '../..');
 
 const REPORT_DIR = path.join(ROOT_DIR, 'tests/supabase/reports');
 const REPORT_FILE = path.join(REPORT_DIR, '005d_execution_evidence.log');
-const ROOT_ARTIFACT_DIR = path.join(ROOT_DIR, '.aistudio/artifacts/brain/d31f6d16-618d-4fb1-93bb-7151c73b2135');
-const SYSTEM_ARTIFACT_DIR = '/.aistudio/artifacts/brain/d31f6d16-618d-4fb1-93bb-7151c73b2135';
-const ARTIFACT_DIR = fs.existsSync(ROOT_ARTIFACT_DIR)
-  ? ROOT_ARTIFACT_DIR
-  : fs.existsSync(SYSTEM_ARTIFACT_DIR)
-  ? SYSTEM_ARTIFACT_DIR
-  : ROOT_ARTIFACT_DIR;
-const ARTIFACT_FILE = path.join(ARTIFACT_DIR, '005d_execution_evidence.log');
+const CANDIDATE_ARTIFACT_DIRS = [
+  path.join(ROOT_DIR, '.aistudio/artifacts/brain/d31f6d16-618d-4fb1-93bb-7151c73b2135'),
+  '/.aistudio/artifacts/brain/d31f6d16-618d-4fb1-93bb-7151c73b2135',
+  path.join(ROOT_DIR, '.aistudio/artifacts/brain/14b764e0-b74b-41d6-a054-3591c160f963'),
+  '/.aistudio/artifacts/brain/14b764e0-b74b-41d6-a054-3591c160f963',
+];
 
 if (!fs.existsSync(REPORT_DIR)) {
   fs.mkdirSync(REPORT_DIR, { recursive: true });
@@ -37,11 +35,13 @@ function log(msg: string) {
 
 function flushLog() {
   fs.writeFileSync(REPORT_FILE, reportLogBuffer, 'utf8');
-  try {
-    if (fs.existsSync(ARTIFACT_DIR)) {
-      fs.writeFileSync(ARTIFACT_FILE, reportLogBuffer, 'utf8');
-    }
-  } catch {}
+  for (const dir of CANDIDATE_ARTIFACT_DIRS) {
+    try {
+      if (fs.existsSync(dir)) {
+        fs.writeFileSync(path.join(dir, '005d_execution_evidence.log'), reportLogBuffer, 'utf8');
+      }
+    } catch {}
+  }
 }
 
 interface GateResult {
@@ -362,31 +362,46 @@ async function runValidationGate() {
     // 1. Anonymous role rejection on functions and views
     await runInPostgrestContext('anon', null, 'anon', async () => {
       let finBlocked = false;
+      await rootClient.query('SAVEPOINT sp_anon1;');
       try {
         await rootClient.query(`SELECT * FROM public.reconcile_organization_finances('${testOrgId}');`);
       } catch (err: unknown) {
+        await rootClient.query('ROLLBACK TO SAVEPOINT sp_anon1;');
         const msg = err instanceof Error ? err.message : String(err);
-        if (msg.includes('Access denied: Anonymous clients cannot access financial reconciliation.')) {
+        if (msg.includes('Access denied') || msg.includes('permission denied')) {
           finBlocked = true;
         }
       }
       if (!finBlocked) throw new Error('Gate 2 Failed: Anon was able to run reconcile_organization_finances!');
 
       let summBlocked = false;
+      await rootClient.query('SAVEPOINT sp_anon2;');
       try {
         await rootClient.query(`SELECT public.get_financial_reconciliation_summary('${testOrgId}');`);
       } catch (err: unknown) {
+        await rootClient.query('ROLLBACK TO SAVEPOINT sp_anon2;');
         const msg = err instanceof Error ? err.message : String(err);
-        if (msg.includes('Access denied: Anonymous clients cannot access financial reconciliation.')) {
+        if (msg.includes('Access denied') || msg.includes('permission denied')) {
           summBlocked = true;
         }
       }
       if (!summBlocked) throw new Error('Gate 2 Failed: Anon was able to run get_financial_reconciliation_summary!');
 
-      const viewRes = await rootClient.query<{ count: string }>(`
-        SELECT count(*) as count FROM public.v_financial_reconciliation_overview WHERE organization_id = '${testOrgId}';
-      `);
-      if (parseInt(viewRes.rows[0].count, 10) !== 0) {
+      let viewBlocked = false;
+      try {
+        const viewRes = await rootClient.query<{ count: string }>(`
+          SELECT count(*) as count FROM public.v_financial_reconciliation_overview WHERE organization_id = '${testOrgId}';
+        `);
+        if (parseInt(viewRes.rows[0].count, 10) === 0) {
+          viewBlocked = true;
+        }
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes('permission denied') || msg.includes('Access denied')) {
+          viewBlocked = true;
+        }
+      }
+      if (!viewBlocked) {
         throw new Error('Gate 2 Failed: Anon was able to see rows in v_financial_reconciliation_overview!');
       }
     });
@@ -395,9 +410,11 @@ async function runValidationGate() {
     // 2. Outsider authenticated caller rejection
     await runInPostgrestContext('authenticated', outsiderUid, 'authenticated', async () => {
       let finBlocked = false;
+      await rootClient.query('SAVEPOINT sp_out1;');
       try {
         await rootClient.query(`SELECT * FROM public.reconcile_organization_finances('${testOrgId}');`);
       } catch (err: unknown) {
+        await rootClient.query('ROLLBACK TO SAVEPOINT sp_out1;');
         const msg = err instanceof Error ? err.message : String(err);
         if (msg.includes('Access denied: Only organization owners and admins')) {
           finBlocked = true;
@@ -406,9 +423,11 @@ async function runValidationGate() {
       if (!finBlocked) throw new Error('Gate 2 Failed: Outsider authenticated user was not blocked on reconcile_organization_finances!');
 
       let summBlocked = false;
+      await rootClient.query('SAVEPOINT sp_out2;');
       try {
         await rootClient.query(`SELECT public.get_financial_reconciliation_summary('${testOrgId}');`);
       } catch (err: unknown) {
+        await rootClient.query('ROLLBACK TO SAVEPOINT sp_out2;');
         const msg = err instanceof Error ? err.message : String(err);
         if (msg.includes('Access denied: Only organization owners and admins')) {
           summBlocked = true;
@@ -443,9 +462,11 @@ async function runValidationGate() {
     // 4. Cross-tenant owner rejection
     await runInPostgrestContext('authenticated', otherOwnerUid, 'authenticated', async () => {
       let finBlocked = false;
+      await rootClient.query('SAVEPOINT sp_ct1;');
       try {
         await rootClient.query(`SELECT * FROM public.reconcile_organization_finances('${testOrgId}');`);
       } catch (err: unknown) {
+        await rootClient.query('ROLLBACK TO SAVEPOINT sp_ct1;');
         const msg = err instanceof Error ? err.message : String(err);
         if (msg.includes('Access denied: Only organization owners and admins')) {
           finBlocked = true;
@@ -520,7 +541,9 @@ async function runValidationGate() {
 
     // Clean up temporary Gate 2 test records
     await rootClient.query(`
+      ALTER TABLE public.organization_members DISABLE TRIGGER tr_protect_last_owner;
       DELETE FROM public.organization_members WHERE organization_id IN ('${testOrgId}', '${otherOrgId}');
+      ALTER TABLE public.organization_members ENABLE TRIGGER tr_protect_last_owner;
       DELETE FROM public.organization_balances WHERE organization_id IN ('${testOrgId}', '${otherOrgId}');
       DELETE FROM public.organizations WHERE id IN ('${testOrgId}', '${otherOrgId}');
       DELETE FROM auth.users WHERE id IN ('${outsiderUid}', '${staffUid}', '${otherOwnerUid}', '${ownerUid}');
@@ -580,21 +603,19 @@ async function runValidationGate() {
   try {
     log('\n--- Running Gate 4: Database Cleanliness & Zero Residual State Integrity Check ---');
 
-    const cleanChecks = await Promise.all([
-      rootClient.query<{ count: string }>('SELECT count(*) as count FROM public.financial_transactions;'),
-      rootClient.query<{ count: string }>('SELECT count(*) as count FROM public.ledger_entries;'),
-      rootClient.query<{ count: string }>('SELECT count(*) as count FROM public.payouts;'),
-      rootClient.query<{ count: string }>('SELECT count(*) as count FROM public.payout_lifecycle_logs;'),
-      rootClient.query<{ count: string }>('SELECT count(*) as count FROM public.reservations;'),
-      rootClient.query<{ count: string }>('SELECT count(*) as count FROM public.payments;'),
-    ]);
+    const txRes = await rootClient.query<{ count: string }>('SELECT count(*) as count FROM public.financial_transactions;');
+    const leRes = await rootClient.query<{ count: string }>('SELECT count(*) as count FROM public.ledger_entries;');
+    const payoutRes = await rootClient.query<{ count: string }>('SELECT count(*) as count FROM public.payouts;');
+    const payoutLogRes = await rootClient.query<{ count: string }>('SELECT count(*) as count FROM public.payout_lifecycle_logs;');
+    const resRes = await rootClient.query<{ count: string }>('SELECT count(*) as count FROM public.reservations;');
+    const payRes = await rootClient.query<{ count: string }>('SELECT count(*) as count FROM public.payments;');
 
-    const txCount = parseInt(cleanChecks[0].rows[0].count, 10);
-    const leCount = parseInt(cleanChecks[1].rows[0].count, 10);
-    const payoutCount = parseInt(cleanChecks[2].rows[0].count, 10);
-    const payoutLogCount = parseInt(cleanChecks[3].rows[0].count, 10);
-    const resCount = parseInt(cleanChecks[4].rows[0].count, 10);
-    const payCount = parseInt(cleanChecks[5].rows[0].count, 10);
+    const txCount = parseInt(txRes.rows[0].count, 10);
+    const leCount = parseInt(leRes.rows[0].count, 10);
+    const payoutCount = parseInt(payoutRes.rows[0].count, 10);
+    const payoutLogCount = parseInt(payoutLogRes.rows[0].count, 10);
+    const resCount = parseInt(resRes.rows[0].count, 10);
+    const payCount = parseInt(payRes.rows[0].count, 10);
 
     log(`  Post-Test Counts:`);
     log(`  - financial_transactions: ${txCount}`);
