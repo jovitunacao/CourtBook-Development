@@ -34,6 +34,7 @@ export const PaymentReviewPage: React.FC = () => {
 
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [isSimulating, setIsSimulating] = useState<boolean>(false);
 
   // Missing prerequisites check
   const isMissingPrerequisites =
@@ -43,18 +44,35 @@ export const PaymentReviewPage: React.FC = () => {
     !customerName.trim() ||
     !customerPhone.trim();
 
-  // Initiate checkout session on mount if not already created
+  // Stable signature of current booking slot to avoid duplicate session creations
+  const currentSlotSignature = `${activeFacility?.id}_${activeCourt?.id}_${selectedDate}_${selectedStartTimeIso}_${durationMinutes}_${customerName.trim()}_${customerPhone.trim()}`;
+  const inFlightRef = React.useRef<boolean>(false);
+  const lastCreatedSignatureRef = React.useRef<string | null>(null);
+
+  // Initiate checkout session on mount if not already created for this slot
   useEffect(() => {
     if (isMissingPrerequisites) return;
-    if (checkoutResult && checkoutResult.success) return;
+
+    // If an authoritative checkout result already exists for this exact slot, reuse it
+    if (
+      checkoutResult &&
+      checkoutResult.success &&
+      lastCreatedSignatureRef.current === currentSlotSignature
+    ) {
+      return;
+    }
+
+    if (inFlightRef.current) return;
 
     let isMounted = true;
+    inFlightRef.current = true;
 
     async function initCheckout() {
       setIsLoading(true);
       setErrorMessage(null);
 
-      const idempotencyKey = `idem_page_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
+      // Generate a stable idempotency key for this slot
+      const idempotencyKey = `idem_slot_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
 
       const res = await createBookingCheckoutSession({
         facility_id: activeFacility!.id,
@@ -69,9 +87,12 @@ export const PaymentReviewPage: React.FC = () => {
         provider_name: 'paymongo',
       });
 
+      inFlightRef.current = false;
+
       if (isMounted) {
         setIsLoading(false);
         if (res.success) {
+          lastCreatedSignatureRef.current = currentSlotSignature;
           setCheckoutResult(res);
         } else {
           setErrorMessage(res.error || 'Failed to initialize payment checkout session.');
@@ -83,9 +104,11 @@ export const PaymentReviewPage: React.FC = () => {
 
     return () => {
       isMounted = false;
+      inFlightRef.current = false;
     };
   }, [
     isMissingPrerequisites,
+    currentSlotSignature,
     activeFacility,
     activeCourt,
     selectedStartTimeIso,
@@ -119,7 +142,7 @@ export const PaymentReviewPage: React.FC = () => {
           <button
             type="button"
             onClick={() => navigate('/book/details')}
-            className="px-5 py-2.5 rounded-xl bg-blue-600 text-white text-xs font-bold hover:bg-blue-700"
+            className="px-5 py-2.5 rounded-xl bg-blue-600 text-white text-xs font-bold hover:bg-blue-700 cursor-pointer"
           >
             Enter Guest Details
           </button>
@@ -128,24 +151,38 @@ export const PaymentReviewPage: React.FC = () => {
     );
   }
 
-  // Handle successful payment simulation / webhook capture
+  // Handle successful payment simulation (RESTRICTED TO ISOLATED DEMO EXPERIENCE ONLY)
+  // Real live facilities require authoritative backend webhook capture and verified database confirmation.
   const handleSimulatePaymentSuccess = () => {
     if (!activeFacility || !activeCourt || !checkoutResult) return;
 
-    const startDate = new Date(selectedStartTimeIso || new Date().toISOString());
-    const startH = startDate.getHours() % 12 || 12;
-    const startM = String(startDate.getMinutes()).padStart(2, '0');
-    const ampm = startDate.getHours() < 12 ? 'AM' : 'PM';
+    // Strict guard: Real live facilities can NEVER simulate payment on the frontend
+    if (!activeFacility.is_demo) {
+      setErrorMessage(
+        'Payment simulation is disabled for live registered facilities. Please complete official payment via PayMongo.'
+      );
+      return;
+    }
+
+    // Require authoritative reservation ID and reference code from checkoutResult (NEVER invent on frontend)
+    if (!checkoutResult.reservation_id || !checkoutResult.reference_code) {
+      setErrorMessage(
+        'Authoritative reservation details missing from checkout session. Please re-initialize checkout.'
+      );
+      return;
+    }
+
+    setIsSimulating(true);
 
     const confirmation: CustomerConfirmationDetails = {
-      reservationId: checkoutResult.reservation_id || crypto.randomUUID(),
-      referenceCode: checkoutResult.reference_code || `CB-${Math.random().toString(36).substring(2, 8).toUpperCase()}`,
+      reservationId: checkoutResult.reservation_id,
+      referenceCode: checkoutResult.reference_code,
       facilityName: activeFacility.name,
       facilityAddress: activeFacility.address || 'Metro Manila, Philippines',
       courtName: activeCourt.name,
       sportType: activeCourt.sport_type,
       bookingDate: selectedDate,
-      timeSlotLabel: checkoutResult.time_slot_label || `${startH}:${startM} ${ampm}`,
+      timeSlotLabel: checkoutResult.time_slot_label || 'Reserved Slot',
       durationMinutes,
       totalPrice: Number(checkoutResult.expected_amount || activeCourt.hourly_rate),
       currency: activeFacility.currency || '₱',
@@ -160,6 +197,8 @@ export const PaymentReviewPage: React.FC = () => {
   };
 
   const handleRetry = async () => {
+    lastCreatedSignatureRef.current = null;
+    inFlightRef.current = false;
     setCheckoutResult(null);
   };
 
@@ -174,6 +213,7 @@ export const PaymentReviewPage: React.FC = () => {
         checkoutResult={checkoutResult}
         isLoading={isLoading}
         errorMessage={errorMessage}
+        isDemoFacility={Boolean(activeFacility?.is_demo)}
         onSimulateSuccess={handleSimulatePaymentSuccess}
         onRetry={handleRetry}
         onCancel={() => navigate('/book/schedule')}

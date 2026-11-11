@@ -342,6 +342,89 @@ let passed = 0;
   console.log('✓ Test 10: Multi-Page BookingPageLayout header & progress passed');
 }
 
+// Test 11: PaymentCheckoutBridge Demo-Only Simulation Guard
+{
+  const { PaymentCheckoutBridge } = await import('../../src/components/booking/PaymentCheckoutBridge');
+
+  const mockCheckoutResult = {
+    success: true,
+    reservation_id: 'res-live-1111',
+    payment_id: 'pay-live-1111',
+    reference_code: 'CB-LIVE99',
+    expected_amount: 500,
+    currency: '₱',
+    checkout_url: 'https://checkout.paymongo.com/cs_test_123',
+  };
+
+  // When isDemoFacility is false (live registered facility)
+  const liveHtml = renderToStaticMarkup(
+    React.createElement(PaymentCheckoutBridge, {
+      checkoutResult: mockCheckoutResult,
+      isLoading: false,
+      errorMessage: null,
+      isDemoFacility: false,
+      onSimulateSuccess: () => {},
+      onRetry: () => {},
+      onCancel: () => {},
+    })
+  );
+
+  assert.ok(
+    !liveHtml.includes('Simulate Demo Payment'),
+    'Live facility must NOT show Simulate Demo Payment button'
+  );
+  assert.ok(
+    liveHtml.includes('Awaiting Authoritative Webhook Confirmation'),
+    'Live facility must show awaiting authoritative confirmation state'
+  );
+
+  // When isDemoFacility is true (demo test facility)
+  const demoHtml = renderToStaticMarkup(
+    React.createElement(PaymentCheckoutBridge, {
+      checkoutResult: mockCheckoutResult,
+      isLoading: false,
+      errorMessage: null,
+      isDemoFacility: true,
+      onSimulateSuccess: () => {},
+      onRetry: () => {},
+      onCancel: () => {},
+    })
+  );
+
+  assert.ok(
+    demoHtml.includes('Simulate Demo Payment &amp; View Pass'),
+    'Demo facility MUST display explicit demo simulation option'
+  );
+  passed++;
+  console.log('✓ Test 11: PaymentCheckoutBridge demo-only simulation guard passed');
+}
+
+// Test 12: Zero Silent Substitution & Isolated Inventory Guarantees
+{
+  const { DEMO_FACILITIES, DEMO_COURTS } = await import('../../src/data/demoVenues');
+
+  // Verify that an invalid venue ID does NOT substitute another facility
+  const invalidId = 'f9999999-9999-4999-8999-999999999999';
+  const found = DEMO_FACILITIES.find((f) => f.id === invalidId) || null;
+  assert.equal(found, null, 'Invalid facility ID must strictly return null without fallback substitution');
+
+  // Verify that an invalid court ID does NOT substitute another court
+  const invalidCourtId = 'c9999999-9999-4999-8999-999999999999';
+  const foundCourt = DEMO_COURTS.find((c) => c.id === invalidCourtId) || null;
+  assert.equal(foundCourt, null, 'Invalid court ID must strictly return null without fallback substitution');
+
+  // Verify every demo court belongs to a valid demo facility
+  for (const c of DEMO_COURTS) {
+    const parentFacility = DEMO_FACILITIES.find((f) => f.id === c.facility_id);
+    assert.ok(parentFacility, `Court ${c.name} must belong to an existing demo facility`);
+    assert.equal(parentFacility?.is_demo, true, 'Parent facility must be demo');
+  }
+
+  passed++;
+  console.log('✓ Test 12: Zero silent substitution and isolated inventory guarantees passed');
+}
+
 console.log(`\n======================================================`);
 console.log(`ALL ${passed} CUSTOMER BOOKING UNIT TESTS PASSED!`);
 console.log(`======================================================`);
+

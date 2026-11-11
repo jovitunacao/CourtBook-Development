@@ -16,8 +16,7 @@ export const ScheduleSelectionPage: React.FC = () => {
   const {
     activeFacility,
     activeCourt,
-    allFacilities,
-    allCourts,
+    courts,
     selectedCourtId,
     selectedDate,
     selectedStartTimeIso,
@@ -102,7 +101,7 @@ export const ScheduleSelectionPage: React.FC = () => {
         <div className="bg-white rounded-3xl border border-slate-200/90 p-5 sm:p-8 shadow-xs">
           <CourtSlotPicker
             facility={activeFacility}
-            courts={allCourts}
+            courts={courts}
             selectedCourtId={selectedCourtId}
             onSelectCourt={setSelectedCourtId}
             selectedDate={selectedDate}

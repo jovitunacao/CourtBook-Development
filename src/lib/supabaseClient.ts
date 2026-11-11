@@ -324,17 +324,16 @@ export function isSlotBusyInTimezone(
   return { isBusy: false };
 }
 
-import { DEMO_FACILITIES, DEMO_COURTS } from '../data/demoVenues';
-
 /**
  * Public facilities query for anonymous visitors.
  * RLS policy "public_can_view_active_facilities" grants SELECT on active facilities.
+ * Returns genuine database results without silent fallback substitution.
  */
 export async function fetchPublicFacilitiesWithStatus(): Promise<{
   data: SupabaseFacility[];
   error: string | null;
 }> {
-  if (!supabase) return { data: DEMO_FACILITIES, error: null };
+  if (!supabase) return { data: [], error: null };
 
   try {
     const { data, error } = await supabase
@@ -344,15 +343,14 @@ export async function fetchPublicFacilitiesWithStatus(): Promise<{
       .order('created_at', { ascending: true });
 
     if (error) {
-      console.warn('Error fetching public facilities from Supabase, falling back to demo venues:', error.message);
-      return { data: DEMO_FACILITIES, error: null };
+      console.warn('Error fetching public facilities from Supabase:', error.message);
+      return { data: [], error: error.message };
     }
 
-    const list = (data as SupabaseFacility[]) || [];
-    return { data: list.length > 0 ? list : DEMO_FACILITIES, error: null };
+    return { data: (data as SupabaseFacility[]) || [], error: null };
   } catch (err: any) {
-    console.error('Failed to fetch public facilities, falling back to demo venues:', err);
-    return { data: DEMO_FACILITIES, error: null };
+    console.error('Failed to fetch public facilities:', err);
+    return { data: [], error: err?.message || 'Failed to load public facilities.' };
   }
 }
 
@@ -364,13 +362,10 @@ export async function fetchPublicFacilities(): Promise<SupabaseFacility[]> {
 /**
  * Public courts query for anonymous visitors.
  * RLS policy "public_can_view_enabled_courts" grants SELECT on enabled courts of active facilities.
+ * Returns genuine database results without silent fallback substitution.
  */
 export async function fetchPublicCourts(facilityId?: string): Promise<SupabaseCourt[]> {
-  if (!supabase) {
-    return facilityId
-      ? DEMO_COURTS.filter((c) => c.facility_id === facilityId)
-      : DEMO_COURTS;
-  }
+  if (!supabase) return [];
 
   try {
     let query = supabase
@@ -385,25 +380,14 @@ export async function fetchPublicCourts(facilityId?: string): Promise<SupabaseCo
 
     const { data, error } = await query;
     if (error) {
-      console.warn('Error fetching public courts, falling back to demo courts:', error.message);
-      return facilityId
-        ? DEMO_COURTS.filter((c) => c.facility_id === facilityId)
-        : DEMO_COURTS;
+      console.warn('Error fetching public courts from Supabase:', error.message);
+      return [];
     }
 
-    const list = (data as SupabaseCourt[]) || [];
-    if (list.length === 0) {
-      return facilityId
-        ? DEMO_COURTS.filter((c) => c.facility_id === facilityId)
-        : DEMO_COURTS;
-    }
-
-    return list;
+    return (data as SupabaseCourt[]) || [];
   } catch (err) {
-    console.error('Failed to fetch public courts, falling back to demo courts:', err);
-    return facilityId
-      ? DEMO_COURTS.filter((c) => c.facility_id === facilityId)
-      : DEMO_COURTS;
+    console.error('Failed to fetch public courts:', err);
+    return [];
   }
 }
 

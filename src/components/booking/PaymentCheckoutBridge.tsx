@@ -17,6 +17,7 @@ interface PaymentCheckoutBridgeProps {
   checkoutResult: CreateBookingCheckoutResult | null;
   isLoading: boolean;
   errorMessage: string | null;
+  isDemoFacility?: boolean;
   onSimulateSuccess: () => void;
   onRetry: () => void;
   onCancel: () => void;
@@ -26,6 +27,7 @@ export const PaymentCheckoutBridge: React.FC<PaymentCheckoutBridgeProps> = ({
   checkoutResult,
   isLoading,
   errorMessage,
+  isDemoFacility = false,
   onSimulateSuccess,
   onRetry,
   onCancel,
@@ -195,16 +197,33 @@ export const PaymentCheckoutBridge: React.FC<PaymentCheckoutBridgeProps> = ({
             </a>
           )}
 
-          {/* Test / Simulated Payment Confirmation Button */}
-          <button
-            type="button"
-            onClick={onSimulateSuccess}
-            className="w-full py-3.5 px-6 rounded-2xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs sm:text-sm font-extrabold flex items-center justify-center gap-2 transition-all cursor-pointer shadow-xs"
-          >
-            <Sparkles className="w-4 h-4" />
-            <span>Confirm Payment & Generate Booking Pass</span>
-            <ArrowRight className="w-4 h-4" />
-          </button>
+          {/* Test / Simulated Payment Confirmation Button: STRICTLY RESTRICTED TO DEMO TEST VENUES */}
+          {isDemoFacility ? (
+            <div className="space-y-1.5 pt-1">
+              <button
+                type="button"
+                onClick={onSimulateSuccess}
+                className="w-full py-3.5 px-6 rounded-2xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs sm:text-sm font-extrabold flex items-center justify-center gap-2 transition-all cursor-pointer shadow-xs"
+              >
+                <Sparkles className="w-4 h-4" />
+                <span>Simulate Demo Payment & View Pass</span>
+                <ArrowRight className="w-4 h-4" />
+              </button>
+              <p className="text-[11px] text-center text-slate-400">
+                Demo Facility sandbox test: creates an isolated demo reservation pass.
+              </p>
+            </div>
+          ) : (
+            <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-2xl text-center space-y-1">
+              <div className="text-xs font-bold text-slate-700 flex items-center justify-center gap-1.5">
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-600" />
+                <span>Awaiting Authoritative Webhook Confirmation</span>
+              </div>
+              <p className="text-[11px] text-slate-500">
+                Complete payment on the PayMongo hosted window above. Once the webhook arrives, your reservation is verified in real-time.
+              </p>
+            </div>
+          )}
         </div>
       </div>
     </div>

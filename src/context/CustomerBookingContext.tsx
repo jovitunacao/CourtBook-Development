@@ -3,7 +3,11 @@
 // File: src/context/CustomerBookingContext.tsx
 // Description:
 //   Persists customer booking draft across dedicated URLs and page refreshes.
-//   Strictly avoids persisting any sensitive payment information.
+//   Strictly enforces:
+//     - Explicit separation of live vs demo inventory (never mixed, no silent substitution).
+//     - Cascading invalidation on sport, location, venue, court, and schedule changes.
+//     - Zero silent substitution of invalid IDs.
+//     - Zero persistence of sensitive payment information.
 // ==============================================================================
 
 import React, { createContext, useContext, useState, useEffect, useMemo, useCallback } from 'react';
@@ -20,9 +24,24 @@ import {
 import { useSupabaseAuth } from './SupabaseAuthContext';
 import { DEMO_FACILITIES, DEMO_COURTS } from '../data/demoVenues';
 
-const STORAGE_KEY = 'courtbook_booking_draft_v2';
+const STORAGE_KEY = 'courtbook_booking_draft_v3';
+
+export type InventorySource = 'live' | 'demo';
 
 export interface CustomerBookingContextType {
+  // Inventory Source & Status
+  inventorySource: InventorySource;
+  setInventorySource: (source: InventorySource) => void;
+  isConfigured: boolean;
+  isLoadingFacilities: boolean;
+  facilitiesError: string | null;
+
+  // Active Datasets (Strictly isolated by inventorySource)
+  facilities: SupabaseFacility[];
+  courts: SupabaseCourt[];
+  filteredFacilities: SupabaseFacility[];
+  sportCounts: Record<string, number>;
+
   // Selections
   selectedSport: string | null;
   selectedLocation: PhilippineLocation | null;
@@ -41,16 +60,11 @@ export interface CustomerBookingContextType {
   checkoutResult: CreateBookingCheckoutResult | null;
   confirmedPassDetails: CustomerConfirmationDetails | null;
 
-  // Derived Objects
+  // Derived Objects (Strictly null if unselected or invalid — zero silent substitution)
   activeFacility: SupabaseFacility | null;
   activeCourt: SupabaseCourt | null;
-  allFacilities: SupabaseFacility[];
-  allCourts: SupabaseCourt[];
-  filteredFacilities: SupabaseFacility[];
-  sportCounts: Record<string, number>;
-  isLoadingFacilities: boolean;
 
-  // Updaters
+  // Updaters with Cascading Invalidation
   setSelectedSport: (sport: string | null) => void;
   setSelectedLocation: (loc: PhilippineLocation | null) => void;
   setSelectedFacilityId: (facilityId: string | null) => void;
@@ -66,25 +80,42 @@ const CustomerBookingContext = createContext<CustomerBookingContextType | undefi
 
 export const CustomerBookingProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const {
+    isConfigured,
     publicFacilities,
     publicCourts,
     publicFacilitiesLoading,
+    publicFacilitiesError,
   } = useSupabaseAuth();
 
-  // Combine public facilities from database or fallback to demo facilities
-  const allFacilities = useMemo(() => {
-    if (publicFacilities && publicFacilities.length > 0) {
-      return publicFacilities;
-    }
-    return DEMO_FACILITIES;
-  }, [publicFacilities]);
+  // Inventory source: defaults to 'live' if Supabase is configured; otherwise 'demo'.
+  // User can explicitly toggle, but live and demo records are NEVER mixed.
+  const [inventorySource, setInventorySourceState] = useState<InventorySource>(() => {
+    return isConfigured ? 'live' : 'demo';
+  });
 
-  const allCourts = useMemo(() => {
-    if (publicCourts && publicCourts.length > 0) {
-      return publicCourts;
+  // Automatically update source if configuration changes
+  useEffect(() => {
+    if (!isConfigured) {
+      setInventorySourceState('demo');
     }
-    return DEMO_COURTS;
-  }, [publicCourts]);
+  }, [isConfigured]);
+
+  // Determine active facilities & courts strictly by source (Zero silent mixing)
+  const facilities = useMemo<SupabaseFacility[]>(() => {
+    if (inventorySource === 'demo') {
+      return DEMO_FACILITIES;
+    }
+    // Live mode: return genuine Supabase results without substituting demo records
+    return publicFacilities || [];
+  }, [inventorySource, publicFacilities]);
+
+  const courts = useMemo<SupabaseCourt[]>(() => {
+    if (inventorySource === 'demo') {
+      return DEMO_COURTS;
+    }
+    // Live mode: return genuine Supabase courts
+    return publicCourts || [];
+  }, [inventorySource, publicCourts]);
 
   // Read initial draft from sessionStorage
   const [selectedSport, setSelectedSportState] = useState<string | null>(() => {
@@ -243,41 +274,36 @@ export const CustomerBookingProvider: React.FC<{ children: React.ReactNode }> = 
     confirmedPassDetails,
   ]);
 
-  // Derive active facility
-  const activeFacility = useMemo(() => {
-    if (!selectedFacilityId) return allFacilities[0] || null;
-    return allFacilities.find((f) => f.id === selectedFacilityId) || allFacilities[0] || null;
-  }, [allFacilities, selectedFacilityId]);
+  // Derived active facility: Strictly null if no selection or not found (NO SILENT SUBSTITUTION)
+  const activeFacility = useMemo<SupabaseFacility | null>(() => {
+    if (!selectedFacilityId) return null;
+    return facilities.find((f) => f.id === selectedFacilityId) || null;
+  }, [facilities, selectedFacilityId]);
 
-  // Derive active court
-  const activeCourt = useMemo(() => {
-    if (selectedCourtId) {
-      const found = allCourts.find((c) => c.id === selectedCourtId);
-      if (found) return found;
-    }
-    if (activeFacility) {
-      const facilityCourts = allCourts.filter((c) => c.facility_id === activeFacility.id && c.is_enabled);
-      return facilityCourts[0] || null;
-    }
-    return allCourts[0] || null;
-  }, [allCourts, selectedCourtId, activeFacility]);
+  // Derived active court: Strictly null if no selection, or if court does not belong to activeFacility (NO SILENT SUBSTITUTION)
+  const activeCourt = useMemo<SupabaseCourt | null>(() => {
+    if (!selectedCourtId || !activeFacility) return null;
+    return courts.find(
+      (c) => c.id === selectedCourtId && c.facility_id === activeFacility.id && c.is_enabled
+    ) || null;
+  }, [courts, selectedCourtId, activeFacility]);
 
-  // Calculate sport court inventory counts
+  // Calculate sport court inventory counts strictly for active dataset
   const sportCounts = useMemo(() => {
     const counts: Record<string, number> = {};
-    for (const c of allCourts) {
+    for (const c of courts) {
       if (c.is_enabled && c.sport_type) {
         const key = c.sport_type.toLowerCase();
         counts[key] = (counts[key] || 0) + 1;
       }
     }
     return counts;
-  }, [allCourts]);
+  }, [courts]);
 
   // Filter facilities based on sport and location
   const filteredFacilities = useMemo(() => {
-    return allFacilities.filter((facility) => {
-      const facilityCourts = allCourts.filter((c) => c.facility_id === facility.id && c.is_enabled);
+    return facilities.filter((facility) => {
+      const facilityCourts = courts.filter((c) => c.facility_id === facility.id && c.is_enabled);
       if (facilityCourts.length === 0) return false;
 
       // Filter by sport
@@ -304,35 +330,104 @@ export const CustomerBookingProvider: React.FC<{ children: React.ReactNode }> = 
 
       return true;
     });
-  }, [allFacilities, allCourts, selectedSport, selectedLocation]);
+  }, [facilities, courts, selectedSport, selectedLocation]);
 
-  // State setters
-  const setSelectedSport = useCallback((sport: string | null) => {
-    setSelectedSportState(sport);
+  // Explicit Inventory Source Setter: Resets any active draft to prevent mixing
+  const setInventorySource = useCallback((source: InventorySource) => {
+    setInventorySourceState(source);
+    setSelectedFacilityIdState(null);
+    setSelectedCourtIdState(null);
+    setSelectedStartTimeIsoState(null);
+    setCheckoutResult(null);
+    setConfirmedPassDetails(null);
   }, []);
 
-  const setSelectedLocation = useCallback((loc: PhilippineLocation | null) => {
-    setSelectedLocationState(loc);
-  }, []);
+  // Cascading Invalidation on Sport Change:
+  // If the active facility does NOT support the new sport, clear facility, court, slot, and payment state.
+  const setSelectedSport = useCallback((newSport: string | null) => {
+    setSelectedSportState(newSport);
 
-  const setSelectedFacilityId = useCallback((facilityId: string | null) => {
-    setSelectedFacilityIdState(facilityId);
-    if (facilityId) {
-      const courtsForFacility = allCourts.filter((c) => c.facility_id === facilityId && c.is_enabled);
-      if (courtsForFacility.length > 0) {
-        setSelectedCourtIdState(courtsForFacility[0].id);
+    if (newSport && selectedFacilityId) {
+      const facilityCourts = courts.filter(
+        (c) => c.facility_id === selectedFacilityId && c.is_enabled
+      );
+      const supportsSport = facilityCourts.some(
+        (c) => c.sport_type.toLowerCase() === newSport.toLowerCase()
+      );
+
+      if (!supportsSport) {
+        setSelectedFacilityIdState(null);
+        setSelectedCourtIdState(null);
+        setSelectedStartTimeIsoState(null);
+        setCheckoutResult(null);
+        setConfirmedPassDetails(null);
+        return;
+      }
+
+      // If facility supports the sport but the currently selected court doesn't, clear court and schedule
+      if (selectedCourtId) {
+        const currentCourt = facilityCourts.find((c) => c.id === selectedCourtId);
+        if (!currentCourt || currentCourt.sport_type.toLowerCase() !== newSport.toLowerCase()) {
+          setSelectedCourtIdState(null);
+          setSelectedStartTimeIsoState(null);
+          setCheckoutResult(null);
+          setConfirmedPassDetails(null);
+        }
       }
     }
-  }, [allCourts]);
+  }, [selectedFacilityId, selectedCourtId, courts]);
 
-  const setSelectedCourtId = useCallback((courtId: string | null) => {
-    setSelectedCourtIdState(courtId);
+  // Cascading Invalidation on Location Change:
+  // If the active facility does NOT match the new location, clear facility, court, slot, and payment state.
+  const setSelectedLocation = useCallback((newLoc: PhilippineLocation | null) => {
+    setSelectedLocationState(newLoc);
+
+    if (newLoc && selectedFacilityId) {
+      const currentFac = facilities.find((f) => f.id === selectedFacilityId);
+      if (currentFac) {
+        const addr = (currentFac.address || '').toLowerCase();
+        const cityMatch = addr.includes(newLoc.city.toLowerCase());
+        const provMatch = addr.includes(newLoc.province.toLowerCase());
+
+        if (!cityMatch && !provMatch) {
+          setSelectedFacilityIdState(null);
+          setSelectedCourtIdState(null);
+          setSelectedStartTimeIsoState(null);
+          setCheckoutResult(null);
+          setConfirmedPassDetails(null);
+        }
+      }
+    }
+  }, [selectedFacilityId, facilities]);
+
+  // Cascading Invalidation on Venue Change:
+  // Changing venue MUST reset selected court, schedule, and payment state.
+  const setSelectedFacilityId = useCallback((facilityId: string | null) => {
+    setSelectedFacilityIdState(facilityId);
+    // Explicitly reset dependent selections (NO SILENT COURT SELECTION)
+    setSelectedCourtIdState(null);
+    setSelectedStartTimeIsoState(null);
+    setCheckoutResult(null);
+    setConfirmedPassDetails(null);
   }, []);
 
-  const setSchedule = useCallback((date: string, startTimeIso: string | null, durationMinutes: number) => {
+  // Cascading Invalidation on Court Change:
+  // Changing court resets slot time, checkout, and confirmation state.
+  const setSelectedCourtId = useCallback((courtId: string | null) => {
+    setSelectedCourtIdState(courtId);
+    setSelectedStartTimeIsoState(null);
+    setCheckoutResult(null);
+    setConfirmedPassDetails(null);
+  }, []);
+
+  // Cascading Invalidation on Schedule Change:
+  // Changing date, slot time, or duration invalidates any active checkout session or previous confirmation.
+  const setSchedule = useCallback((date: string, startTimeIso: string | null, newDurationMinutes: number) => {
     setSelectedDateState(date);
     setSelectedStartTimeIsoState(startTimeIso);
-    setDurationMinutesState(durationMinutes);
+    setDurationMinutesState(newDurationMinutes);
+    setCheckoutResult(null);
+    setConfirmedPassDetails(null);
   }, []);
 
   const setGuestDetails = useCallback((name: string, phone: string, email: string) => {
@@ -362,6 +457,15 @@ export const CustomerBookingProvider: React.FC<{ children: React.ReactNode }> = 
   return (
     <CustomerBookingContext.Provider
       value={{
+        inventorySource,
+        setInventorySource,
+        isConfigured,
+        isLoadingFacilities: inventorySource === 'live' ? publicFacilitiesLoading : false,
+        facilitiesError: inventorySource === 'live' ? publicFacilitiesError : null,
+        facilities,
+        courts,
+        filteredFacilities,
+        sportCounts,
         selectedSport,
         selectedLocation,
         selectedFacilityId,
@@ -376,11 +480,6 @@ export const CustomerBookingProvider: React.FC<{ children: React.ReactNode }> = 
         confirmedPassDetails,
         activeFacility,
         activeCourt,
-        allFacilities,
-        allCourts,
-        filteredFacilities,
-        sportCounts,
-        isLoadingFacilities: publicFacilitiesLoading,
         setSelectedSport,
         setSelectedLocation,
         setSelectedFacilityId,
