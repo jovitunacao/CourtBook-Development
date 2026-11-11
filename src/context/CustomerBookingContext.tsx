@@ -23,6 +23,7 @@ import {
 } from '../lib/supabaseClient';
 import { useSupabaseAuth } from './SupabaseAuthContext';
 import { DEMO_FACILITIES, DEMO_COURTS } from '../data/demoVenues';
+import { PHILIPPINE_REGIONS } from '../data/philippineLocations';
 
 const STORAGE_KEY = 'courtbook_booking_draft_v3';
 
@@ -330,18 +331,48 @@ export const CustomerBookingProvider: React.FC<{ children: React.ReactNode }> = 
         // (Prevents unrelated venues in the same province from falsely matching)
         if (selectedLocation.city && selectedLocation.city.trim()) {
           const city = selectedLocation.city.toLowerCase().trim();
-          // Normalize suffixes like " city" for robust matching (e.g. "Makati City" vs "Makati")
           const cleanCity = city.replace(/\s+city$/i, '');
           if (!addr.includes(city) && !addr.includes(cleanCity)) {
             return false;
           }
         }
 
-        // 3. If a province was selected, facility address MUST contain the province name
+        // 3. If a province was selected, facility address MUST contain the province name or its known cities
         if (selectedLocation.province && selectedLocation.province.trim()) {
           const prov = selectedLocation.province.toLowerCase().trim();
           if (!addr.includes(prov)) {
-            return false;
+            // Also check if address contains any city within the selected province
+            const regionObj = PHILIPPINE_REGIONS.find((r) => r.code === selectedLocation.regionCode);
+            const provObj = regionObj?.provinces.find((p) => p.name.toLowerCase() === prov);
+            const hasCityInProvince = provObj?.cities.some((c) => {
+              const cName = c.name.toLowerCase().trim().replace(/\s+city$/i, '');
+              return addr.includes(cName);
+            });
+            if (!hasCityInProvince) {
+              return false;
+            }
+          }
+        }
+
+        // 4. Region-only selection (when province and city are omitted or general)
+        if (
+          selectedLocation.regionCode &&
+          (!selectedLocation.province || !selectedLocation.province.trim()) &&
+          (!selectedLocation.city || !selectedLocation.city.trim())
+        ) {
+          const regionObj = PHILIPPINE_REGIONS.find((r) => r.code === selectedLocation.regionCode);
+          if (regionObj) {
+            const matchesAnyInRegion = regionObj.provinces.some((p) => {
+              const pName = p.name.toLowerCase().trim();
+              if (addr.includes(pName)) return true;
+              return p.cities.some((c) => {
+                const cName = c.name.toLowerCase().trim().replace(/\s+city$/i, '');
+                return addr.includes(cName);
+              });
+            });
+            if (!matchesAnyInRegion) {
+              return false;
+            }
           }
         }
       }

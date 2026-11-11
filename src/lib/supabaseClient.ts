@@ -1172,6 +1172,10 @@ export interface CreateBookingCheckoutInput {
   idempotency_key: string;
   provider_name?: 'paymongo' | 'xendit' | 'manual_test';
   is_demo?: boolean;
+  is_frontend_demo?: boolean; // Explicit flag for frontend-only fictional inventory
+  hourly_rate?: number; // Used to calculate accurate amounts for demo checkout
+  currency?: string;
+  court_name?: string;
 }
 
 export interface CreateBookingCheckoutResult {
@@ -1198,6 +1202,10 @@ export interface CreateBookingCheckoutResult {
 /**
  * Creates an authoritative booking checkout session via create-checkout-session Edge Function
  * with graceful RPC fallback if the Edge Function is not reachable.
+ * 
+ * CRITICAL ISOLATION RULE:
+ * If input.is_frontend_demo is true, returns immediately with an in-memory simulated checkout
+ * without making ANY network calls to Supabase or PayMongo.
  */
 export async function createBookingCheckoutSession(
   input: CreateBookingCheckoutInput
@@ -1210,6 +1218,55 @@ export async function createBookingCheckoutSession(
     };
   }
 
+  // ============================================================================
+  // EARLY ISOLATION BRANCH: FRONTEND-ONLY DEMO MODE
+  // MUST execute BEFORE any Supabase or PayMongo network calls.
+  // ============================================================================
+  if (input.is_frontend_demo) {
+    const rate = Number(input.hourly_rate) > 0 ? Number(input.hourly_rate) : 350.0;
+    const duration = input.duration_minutes > 0 ? input.duration_minutes : 60;
+    const totalAmount = Math.round((rate * (duration / 60)) * 100) / 100;
+    const commissionRate = 0.05;
+    const commissionAmount = Math.round((totalAmount * commissionRate) * 100) / 100;
+    const ownerGrossShare = Math.round((totalAmount - commissionAmount) * 100) / 100;
+
+    const startDate = new Date(input.start_time || new Date().toISOString());
+    const startH = startDate.getHours() % 12 || 12;
+    const startM = String(startDate.getMinutes()).padStart(2, '0');
+    const ampm = startDate.getHours() < 12 ? 'AM' : 'PM';
+    const endDate = new Date(startDate.getTime() + duration * 60000);
+    const endH = endDate.getHours() % 12 || 12;
+    const endM = String(endDate.getMinutes()).padStart(2, '0');
+    const endAmpm = endDate.getHours() < 12 ? 'AM' : 'PM';
+    const timeSlotLabel = `${startH}:${startM} ${ampm} – ${endH}:${endM} ${endAmpm}`;
+
+    const nowUtc = new Date();
+    const holdExpiry = new Date(nowUtc.getTime() + 15 * 60 * 1000).toISOString();
+    const deterministicSuffix = idempotencyKey.substring(Math.max(0, idempotencyKey.length - 6)).toUpperCase();
+    const demoRef = `DEMO-${deterministicSuffix}`;
+
+    return {
+      success: true,
+      reservation_id: `demo-res-${idempotencyKey.substring(0, 12)}`,
+      payment_id: `demo-pay-${idempotencyKey.substring(0, 12)}`,
+      reference_code: demoRef,
+      checkout_session_id: `cs_demo_${idempotencyKey.substring(0, 16)}`,
+      expected_amount: totalAmount,
+      currency: input.currency || '₱',
+      commission_rate: commissionRate,
+      commission_amount: commissionAmount,
+      owner_gross_share: ownerGrossShare,
+      hold_expires_at: holdExpiry,
+      time_slot_label: timeSlotLabel,
+      court_name: input.court_name || 'Demo Court',
+      checkout_url: undefined, // Zero fake PayMongo URL
+      isSimulated: true,
+    };
+  }
+
+  // ============================================================================
+  // LIVE SUPABASE-BACKED FACILITY CHECKOUT PATH
+  // ============================================================================
   // If Supabase URL is available, try Edge Function first
   if (supabaseUrl) {
     try {
@@ -1335,35 +1392,11 @@ export async function createBookingCheckoutSession(
     }
   }
 
-  // Strict Fail-Closed Rule for Live Bookings:
-  // If the facility is not a demo venue, NEVER fabricate simulated reservation or payment IDs on the client.
-  if (!input.is_demo) {
-    return {
-      success: false,
-      error: 'Unable to establish authoritative backend checkout session with payment provider. Please verify connection and retry.',
-    };
-  }
-
-  // Local offline sandbox fallback: STRICTLY FOR FRONTEND-ONLY DEMO EXPERIENCE
-  const randomRef = `DEMO-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
-  const nowUtc = new Date();
-  const holdExpiry = new Date(nowUtc.getTime() + 15 * 60 * 1000).toISOString();
+  // Strict Fail-Closed Rule for Live / Supabase-backed Facilities:
+  // If Edge Function and Database RPC could not be completed, NEVER fabricate simulated reservation or payment IDs.
   return {
-    success: true,
-    reservation_id: `demo-res-${Date.now()}`,
-    payment_id: `demo-pay-${Date.now()}`,
-    reference_code: randomRef,
-    checkout_session_id: `cs_demo_${Date.now()}`,
-    expected_amount: 350.0,
-    currency: '₱',
-    commission_rate: 0.05,
-    commission_amount: 17.5,
-    owner_gross_share: 332.5,
-    hold_expires_at: holdExpiry,
-    time_slot_label: 'Demo Reserved Slot',
-    court_name: 'Demo Court',
-    checkout_url: `https://checkout.paymongo.com/cs_demo_${Date.now()}`,
-    isSimulated: true,
+    success: false,
+    error: 'Unable to establish authoritative backend checkout session with payment provider. Please verify connection and retry.',
   };
 }
 

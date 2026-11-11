@@ -19,6 +19,7 @@ import { CustomerConfirmationDetails } from '../../types/customerBooking';
 export const PaymentReviewPage: React.FC = () => {
   const navigate = useNavigate();
   const {
+    inventorySource,
     activeFacility,
     activeCourt,
     selectedDate,
@@ -53,13 +54,29 @@ export const PaymentReviewPage: React.FC = () => {
   useEffect(() => {
     if (isMissingPrerequisites) return;
 
-    // If an authoritative checkout result already exists for this exact slot, reuse it
+    // Check if previous checkout result has expired
+    const isHoldExpired = Boolean(
+      checkoutResult?.hold_expires_at &&
+      new Date(checkoutResult.hold_expires_at).getTime() <= Date.now()
+    );
+
+    // If an authoritative unexpired checkout result already exists for this exact slot, reuse it
     if (
       checkoutResult &&
       checkoutResult.success &&
+      !isHoldExpired &&
       lastCreatedSignatureRef.current === currentSlotSignature
     ) {
       return;
+    }
+
+    // If hold expired, clear stale attempt storage to generate a fresh booking attempt
+    if (isHoldExpired) {
+      const attemptStorageKey = `courtbook_attempt_${currentSlotSignature}`;
+      try {
+        sessionStorage.removeItem(attemptStorageKey);
+      } catch {}
+      lastCreatedSignatureRef.current = null;
     }
 
     if (inFlightRef.current) return;
@@ -83,6 +100,8 @@ export const PaymentReviewPage: React.FC = () => {
       const courtPrefix = (activeCourt!.id || '').replace(/-/g, '').substring(0, 8);
       const idempotencyKey = `idem_${facPrefix}_${courtPrefix}_${attemptToken}`.substring(0, 64);
 
+      const isFrontendDemo = inventorySource === 'demo' || Boolean(activeFacility?.is_demo);
+
       const res = await createBookingCheckoutSession({
         facility_id: activeFacility!.id,
         court_id: activeCourt!.id,
@@ -95,6 +114,10 @@ export const PaymentReviewPage: React.FC = () => {
         idempotency_key: idempotencyKey,
         provider_name: 'paymongo',
         is_demo: Boolean(activeFacility?.is_demo),
+        is_frontend_demo: isFrontendDemo,
+        hourly_rate: Number(activeCourt!.hourly_rate),
+        currency: activeFacility!.currency || '₱',
+        court_name: activeCourt!.name,
       });
 
       inFlightRef.current = false;
