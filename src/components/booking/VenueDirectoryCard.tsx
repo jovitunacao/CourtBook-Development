@@ -84,11 +84,18 @@ export const VenueDirectoryCard: React.FC<VenueDirectoryCardProps> = ({
             </div>
           </div>
 
-          {/* Verified Business Badge */}
-          <div className="absolute top-3 left-3 flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-500/90 backdrop-blur-md text-white text-[11px] font-bold shadow-xs">
-            <ShieldCheck className="w-3.5 h-3.5" />
-            <span>Verified Venue</span>
-          </div>
+          {/* Business Verification or Demo Badge */}
+          {facility.is_demo ? (
+            <div className="absolute top-3 left-3 flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-amber-500/95 backdrop-blur-md text-white text-[10px] font-extrabold tracking-wider uppercase shadow-xs">
+              <span className="w-2 h-2 rounded-full bg-white animate-pulse" />
+              <span>DEMO VENUE</span>
+            </div>
+          ) : (
+            <div className="absolute top-3 left-3 flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-500/90 backdrop-blur-md text-white text-[11px] font-bold shadow-xs">
+              <ShieldCheck className="w-3.5 h-3.5" />
+              <span>Verified Venue</span>
+            </div>
+          )}
 
           {/* Bottom Photo Overlay Info */}
           <div className="absolute bottom-3 left-3 right-3 flex items-center justify-between text-white">

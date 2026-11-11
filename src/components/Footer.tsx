@@ -1,11 +1,25 @@
 import React from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Dumbbell, ShieldAlert, Layers } from 'lucide-react';
 
 interface FooterProps {
-  onNavigate: (tab: 'home' | 'booking' | 'admin' | 'settings') => void;
+  onNavigate?: (tab: 'home' | 'booking' | 'admin' | 'settings') => void;
 }
 
 export const Footer: React.FC<FooterProps> = ({ onNavigate }) => {
+  const navigate = useNavigate();
+
+  const handleNav = (tab: 'home' | 'booking' | 'admin' | 'settings') => {
+    if (onNavigate) {
+      onNavigate(tab);
+    }
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+
+    if (tab === 'home') navigate('/');
+    else if (tab === 'booking') navigate('/book/sport');
+    else if (tab === 'admin') navigate('/admin');
+    else if (tab === 'settings') navigate('/settings');
+  };
   return (
     <footer className="bg-slate-900 text-slate-400 border-t border-slate-800 text-sm">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-12">
@@ -39,7 +53,7 @@ export const Footer: React.FC<FooterProps> = ({ onNavigate }) => {
             <ul className="space-y-2">
               <li>
                 <button
-                  onClick={() => onNavigate('home')}
+                  onClick={() => handleNav('home')}
                   className="hover:text-white transition-colors cursor-pointer"
                 >
                   Homepage
@@ -47,7 +61,7 @@ export const Footer: React.FC<FooterProps> = ({ onNavigate }) => {
               </li>
               <li>
                 <button
-                  onClick={() => onNavigate('booking')}
+                  onClick={() => handleNav('booking')}
                   className="hover:text-white transition-colors text-blue-400 font-medium cursor-pointer"
                 >
                   Customer Booking
@@ -55,7 +69,7 @@ export const Footer: React.FC<FooterProps> = ({ onNavigate }) => {
               </li>
               <li>
                 <button
-                  onClick={() => onNavigate('admin')}
+                  onClick={() => handleNav('admin')}
                   className="hover:text-white transition-colors cursor-pointer"
                 >
                   Admin Reservations Table
@@ -63,7 +77,7 @@ export const Footer: React.FC<FooterProps> = ({ onNavigate }) => {
               </li>
               <li>
                 <button
-                  onClick={() => onNavigate('settings')}
+                  onClick={() => handleNav('settings')}
                   className="hover:text-white transition-colors text-slate-300 cursor-pointer"
                 >
                   Facility Settings &amp; Courts

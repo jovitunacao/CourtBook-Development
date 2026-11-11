@@ -1,5 +1,13 @@
 import React, { useState, useEffect } from 'react';
 import {
+  BrowserRouter,
+  Routes,
+  Route,
+  Navigate,
+  useNavigate,
+  useLocation,
+} from 'react-router-dom';
+import {
   Building,
   Shield,
   AlertCircle,
@@ -11,9 +19,7 @@ import {
 import { Navbar } from './components/Navbar';
 import { Footer } from './components/Footer';
 import { HomePage } from './components/HomePage';
-import { BookingPage } from './components/BookingPage';
 import { VenueDirectory } from './components/VenueDirectory';
-import { CustomerBookingFlow } from './components/booking/CustomerBookingFlow';
 import { AdminPage } from './components/AdminPage';
 import { FacilitySettingsPage } from './components/FacilitySettingsPage';
 import { AuthModal } from './components/AuthModal';
@@ -29,10 +35,21 @@ import {
   resetStoredFacilitySettings,
 } from './utils/storage';
 import { SupabaseAuthProvider, useSupabaseAuth } from './context/SupabaseAuthContext';
+import { CustomerBookingProvider, useCustomerBooking } from './context/CustomerBookingContext';
 
-function CourtBookApp() {
-  const [currentTab, setCurrentTab] = useState<'home' | 'booking' | 'admin' | 'settings'>('home');
-  const [selectedCourtForBooking, setSelectedCourtForBooking] = useState<string>('');
+// Dedicated Customer Booking Pages
+import { SportSelectionPage } from './pages/book/SportSelectionPage';
+import { LocationSelectionPage } from './pages/book/LocationSelectionPage';
+import { VenueDirectoryPage } from './pages/book/VenueDirectoryPage';
+import { ScheduleSelectionPage } from './pages/book/ScheduleSelectionPage';
+import { GuestDetailsPage } from './pages/book/GuestDetailsPage';
+import { PaymentReviewPage } from './pages/book/PaymentReviewPage';
+import { ConfirmationPage } from './pages/book/ConfirmationPage';
+
+function CourtBookMainContent() {
+  const navigate = useNavigate();
+  const location = useLocation();
+
   const [reservations, setReservations] = useState<Reservation[]>([]);
   const [facilitySettings, setFacilitySettings] = useState<FacilitySettings>(DEFAULT_FACILITY_SETTINGS);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
@@ -56,31 +73,20 @@ function CourtBookApp() {
     setActivePublicFacilityId,
   } = useSupabaseAuth();
 
+  const { setSelectedFacilityId, setSelectedCourtId } = useCustomerBooking();
+
   // Active facility settings for administrative/demo views
   const activeSettings = mappedFacilitySettings || facilitySettings;
-  // Active facility settings for public customer views (strictly isolated to selected public venue)
+  // Active facility settings for public customer views
   const publicActiveSettings = isConfigured ? publicFacilitySettings : facilitySettings;
 
   // Header display name
   const displayFacilityName =
     user && onboardingState === 'needs_onboarding'
       ? 'CourtBook Owner Portal'
-      : currentTab === 'admin' || currentTab === 'settings'
+      : location.pathname.startsWith('/admin') || location.pathname.startsWith('/settings')
       ? activeSettings.name
       : publicActiveSettings?.name || 'CourtBook Directory';
-
-  // Keep selectedCourtForBooking synchronized with available courts in activeSettings
-  useEffect(() => {
-    if (activeSettings.courts.length > 0) {
-      const exists = activeSettings.courts.some((c) => c.id === selectedCourtForBooking && c.isEnabled);
-      if (!exists) {
-        const firstEnabled = activeSettings.courts.find((c) => c.isEnabled) || activeSettings.courts[0];
-        if (firstEnabled) {
-          setSelectedCourtForBooking(firstEnabled.id);
-        }
-      }
-    }
-  }, [activeSettings.courts, selectedCourtForBooking]);
 
   // Initialize from localStorage
   useEffect(() => {
@@ -95,13 +101,6 @@ function CourtBookApp() {
     setTimeout(() => {
       setToastMessage((prev) => (prev === message ? null : prev));
     }, 3500);
-  };
-
-  const handleAddReservation = (newReservation: Reservation) => {
-    const updated = [newReservation, ...reservations];
-    setReservations(updated);
-    saveStoredReservations(updated);
-    showToast(`Reservation ${newReservation.referenceCode} confirmed!`);
   };
 
   const handleCancelReservation = (id: string) => {
@@ -155,19 +154,21 @@ function CourtBookApp() {
 
   const handleStartBooking = (courtId?: string) => {
     if (courtId) {
-      setSelectedCourtForBooking(courtId);
+      setSelectedCourtId(courtId);
+      navigate('/book/schedule');
+    } else {
+      navigate('/book/sport');
     }
-    setCurrentTab('booking');
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
   const handleOpenAdmin = () => {
-    setCurrentTab('admin');
+    navigate('/admin');
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
   const handleOpenSettings = () => {
-    setCurrentTab('settings');
+    navigate('/settings');
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
@@ -177,7 +178,6 @@ function CourtBookApp() {
 
   // Render helper for administrative views when user is authenticated
   const renderAdministrativeScreen = (tab: 'admin' | 'settings') => {
-    // 1. Separate Loading State
     if (onboardingState === 'loading') {
       return (
         <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-20 flex items-center justify-center">
@@ -194,7 +194,6 @@ function CourtBookApp() {
       );
     }
 
-    // 2. Separate Error State (strictly distinct from 0 organizations)
     if (onboardingState === 'error') {
       return (
         <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-10">
@@ -221,7 +220,7 @@ function CourtBookApp() {
               <button
                 type="button"
                 onClick={() => {
-                  setCurrentTab('booking');
+                  navigate('/book/venues');
                   window.scrollTo({ top: 0, behavior: 'smooth' });
                 }}
                 className="px-4 py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold transition-colors cursor-pointer"
@@ -252,25 +251,22 @@ function CourtBookApp() {
       );
     }
 
-    // 3. Guided Owner Onboarding Wizard (needs_onboarding)
-    // Renders the 3-step setup wizard for authenticated owners with an incomplete workspace
     if (onboardingState === 'needs_onboarding') {
       return (
         <OwnerOnboardingWizard
           onComplete={async () => {
             await refreshStaffData();
-            setCurrentTab('admin');
+            navigate('/admin');
             window.scrollTo({ top: 0, behavior: 'smooth' });
           }}
           onNavigateToBooking={() => {
-            setCurrentTab('booking');
+            navigate('/book/sport');
             window.scrollTo({ top: 0, behavior: 'smooth' });
           }}
         />
       );
     }
 
-    // 4. Ready State: mappedFacilitySettings must be valid (no fallback to localStorage)
     if (!mappedFacilitySettings) {
       return (
         <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-10">
@@ -307,7 +303,6 @@ function CourtBookApp() {
       );
     }
 
-    // Authenticated user with ready organization and facility: render page with mapped settings
     if (tab === 'admin') {
       return (
         <AdminPage
@@ -319,7 +314,7 @@ function CourtBookApp() {
           onResetDemoData={handleResetDemoData}
           onClearAllData={handleClearAllData}
           onNavigateToBooking={() => {
-            setCurrentTab('booking');
+            navigate('/book/sport');
             window.scrollTo({ top: 0, behavior: 'smooth' });
           }}
           onNavigateToSettings={handleOpenSettings}
@@ -334,7 +329,7 @@ function CourtBookApp() {
         onSaveSettings={handleSaveFacilitySettings}
         onResetSettings={handleResetFacilitySettings}
         onNavigateToBooking={() => {
-          setCurrentTab('booking');
+          navigate('/book/sport');
           window.scrollTo({ top: 0, behavior: 'smooth' });
         }}
         onNavigateToReservations={handleOpenAdmin}
@@ -362,123 +357,121 @@ function CourtBookApp() {
 
       {/* Primary Navigation */}
       <Navbar
-        currentTab={currentTab}
-        setCurrentTab={setCurrentTab}
         activeReservationsCount={activeReservationsCount}
         facilityName={displayFacilityName}
         onOpenAuthModal={() => setIsAuthModalOpen(true)}
       />
 
-      {/* Screen Render */}
+      {/* Main Routed Content */}
       <main className="flex-1">
-        {currentTab === 'home' && (
-          isConfigured && !activePublicFacility ? (
-            <VenueDirectory
-              facilities={publicFacilities}
-              directoryCourts={directoryCourts}
-              isLoading={publicFacilitiesLoading}
-              error={publicFacilitiesError}
-              onSelectFacility={async (facilityId) => {
-                await setActivePublicFacilityId(facilityId);
-                setCurrentTab('booking');
-                window.scrollTo({ top: 0, behavior: 'smooth' });
-              }}
-              onRetry={refreshPublicFacilities}
-            />
-          ) : (
-            <HomePage
-              settings={publicActiveSettings || facilitySettings}
-              onStartBooking={handleStartBooking}
-              onOpenAdmin={handleOpenAdmin}
-              activeReservationsCount={activeReservationsCount}
-            />
-          )
-        )}
-
-        {currentTab === 'booking' && (
-          <CustomerBookingFlow
-            initialFacilityId={activePublicFacility?.id}
-            onNavigateHome={() => {
-              setCurrentTab('home');
-              window.scrollTo({ top: 0, behavior: 'smooth' });
-            }}
-            onBookingConfirmed={(details) => {
-              handleAddReservation({
-                id: details.reservationId,
-                referenceCode: details.referenceCode,
-                courtId: details.courtName,
-                courtName: details.courtName,
-                date: details.bookingDate,
-                timeSlotId: details.timeSlotLabel,
-                timeSlotLabel: details.timeSlotLabel,
-                customerName: details.customerName,
-                customerPhone: details.customerPhone,
-                customerEmail: details.customerEmail,
-                price: details.totalPrice,
-                status: 'confirmed',
-                createdAt: details.confirmedAt,
-              });
-              showToast(`Court reservation ${details.referenceCode} confirmed!`);
-            }}
+        <Routes>
+          {/* Home Route */}
+          <Route
+            path="/"
+            element={
+              isConfigured && !activePublicFacility ? (
+                <VenueDirectory
+                  facilities={publicFacilities}
+                  directoryCourts={directoryCourts}
+                  isLoading={publicFacilitiesLoading}
+                  error={publicFacilitiesError}
+                  onSelectFacility={async (facilityId) => {
+                    await setActivePublicFacilityId(facilityId);
+                    setSelectedFacilityId(facilityId);
+                    navigate('/book/schedule');
+                    window.scrollTo({ top: 0, behavior: 'smooth' });
+                  }}
+                  onRetry={refreshPublicFacilities}
+                />
+              ) : (
+                <HomePage
+                  settings={publicActiveSettings || facilitySettings}
+                  onStartBooking={handleStartBooking}
+                  onOpenAdmin={handleOpenAdmin}
+                  activeReservationsCount={activeReservationsCount}
+                />
+              )
+            }
           />
-        )}
 
-        {/* Administrative Views: Gated by user authentication and onboardingState */}
-        {currentTab === 'admin' && (
-          user ? (
-            renderAdministrativeScreen('admin')
-          ) : (
-            <AdminPage
-              settings={activeSettings}
-              reservations={reservations}
-              onCancelReservation={handleCancelReservation}
-              onRestoreReservation={handleRestoreReservation}
-              onDeleteReservation={handleDeleteReservation}
-              onResetDemoData={handleResetDemoData}
-              onClearAllData={handleClearAllData}
-              onNavigateToBooking={() => {
-                setCurrentTab('booking');
-                window.scrollTo({ top: 0, behavior: 'smooth' });
-              }}
-              onNavigateToSettings={handleOpenSettings}
-              onOpenAuthModal={() => setIsAuthModalOpen(true)}
-            />
-          )
-        )}
+          {/* Customer Booking Dedicated Multi-Page Journey */}
+          <Route path="/book/sport" element={<SportSelectionPage />} />
+          <Route path="/book/location" element={<LocationSelectionPage />} />
+          <Route path="/book/venues" element={<VenueDirectoryPage />} />
+          <Route path="/book/schedule" element={<ScheduleSelectionPage />} />
+          <Route path="/book/details" element={<GuestDetailsPage />} />
+          <Route path="/book/payment" element={<PaymentReviewPage />} />
+          <Route path="/book/confirmation" element={<ConfirmationPage />} />
 
-        {currentTab === 'settings' && (
-          user ? (
-            renderAdministrativeScreen('settings')
-          ) : (
-            <FacilitySettingsPage
-              settings={activeSettings}
-              onSaveSettings={handleSaveFacilitySettings}
-              onResetSettings={handleResetFacilitySettings}
-              onNavigateToBooking={() => {
-                setCurrentTab('booking');
-                window.scrollTo({ top: 0, behavior: 'smooth' });
-              }}
-              onNavigateToReservations={handleOpenAdmin}
-            />
-          )
-        )}
+          {/* Aliases & Redirects */}
+          <Route path="/book" element={<Navigate to="/book/sport" replace />} />
+          <Route path="/venues" element={<Navigate to="/book/venues" replace />} />
+
+          {/* Administrative Views */}
+          <Route
+            path="/admin"
+            element={
+              user ? (
+                renderAdministrativeScreen('admin')
+              ) : (
+                <AdminPage
+                  settings={activeSettings}
+                  reservations={reservations}
+                  onCancelReservation={handleCancelReservation}
+                  onRestoreReservation={handleRestoreReservation}
+                  onDeleteReservation={handleDeleteReservation}
+                  onResetDemoData={handleResetDemoData}
+                  onClearAllData={handleClearAllData}
+                  onNavigateToBooking={() => {
+                    navigate('/book/sport');
+                    window.scrollTo({ top: 0, behavior: 'smooth' });
+                  }}
+                  onNavigateToSettings={handleOpenSettings}
+                  onOpenAuthModal={() => setIsAuthModalOpen(true)}
+                />
+              )
+            }
+          />
+
+          <Route
+            path="/settings"
+            element={
+              user ? (
+                renderAdministrativeScreen('settings')
+              ) : (
+                <FacilitySettingsPage
+                  settings={activeSettings}
+                  onSaveSettings={handleSaveFacilitySettings}
+                  onResetSettings={handleResetFacilitySettings}
+                  onNavigateToBooking={() => {
+                    navigate('/book/sport');
+                    window.scrollTo({ top: 0, behavior: 'smooth' });
+                  }}
+                  onNavigateToReservations={handleOpenAdmin}
+                />
+              )
+            }
+          />
+
+          {/* Catch-all redirect to Home */}
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
       </main>
 
       {/* Footer */}
-      <Footer
-        onNavigate={(tab) => {
-          setCurrentTab(tab);
-          window.scrollTo({ top: 0, behavior: 'smooth' });
-        }}
-      />
+      <Footer />
     </div>
   );
 }
 
 export default function App() {
   return (
-    <SupabaseAuthProvider>
-      <CourtBookApp />
-    </SupabaseAuthProvider>
+    <BrowserRouter>
+      <SupabaseAuthProvider>
+        <CustomerBookingProvider>
+          <CourtBookMainContent />
+        </CustomerBookingProvider>
+      </SupabaseAuthProvider>
+    </BrowserRouter>
   );
 }

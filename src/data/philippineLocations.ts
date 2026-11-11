@@ -318,6 +318,48 @@ export const PHILIPPINE_REGIONS: RegionData[] = [
       },
     ],
   },
+  {
+    code: 'REGION-IX',
+    name: 'Region IX (Zamboanga Peninsula)',
+    provinces: [
+      {
+        name: 'Zamboanga del Sur',
+        cities: [
+          {
+            name: 'Zamboanga City',
+            isCity: true,
+            barangays: ['Tetuan', 'Pasonanca', 'Santa Maria', 'Canelar', 'Tumaga', 'Guiwan', 'San Jose Gusu'],
+          },
+        ],
+      },
+    ],
+  },
+  {
+    code: 'REGION-X',
+    name: 'Region X (Northern Mindanao)',
+    provinces: [
+      {
+        name: 'Misamis Oriental',
+        cities: [
+          {
+            name: 'Cagayan de Oro City',
+            isCity: true,
+            barangays: ['Carmen', 'Macasandig', 'Nazareth', 'Kauswagan', 'Lapasan', 'Bulua', 'Patag'],
+          },
+        ],
+      },
+      {
+        name: 'Lanao del Norte',
+        cities: [
+          {
+            name: 'Iligan City',
+            isCity: true,
+            barangays: ['Tubod', 'Pala-o', 'San Miguel', 'Suarez', 'Hinaplanon', 'Buru-un'],
+          },
+        ],
+      },
+    ],
+  },
 ];
 
 export interface FlattenedLocationOption {

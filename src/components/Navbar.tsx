@@ -1,24 +1,38 @@
 import React from 'react';
+import { useNavigate, useLocation } from 'react-router-dom';
 import { Calendar, Shield, Dumbbell, Menu, X, CheckCircle2, SlidersHorizontal, LogIn, LogOut, User } from 'lucide-react';
 import { useSupabaseAuth } from '../context/SupabaseAuthContext';
 
 interface NavbarProps {
-  currentTab: 'home' | 'booking' | 'admin' | 'settings';
-  setCurrentTab: (tab: 'home' | 'booking' | 'admin' | 'settings') => void;
+  currentTab?: 'home' | 'booking' | 'admin' | 'settings';
+  setCurrentTab?: (tab: 'home' | 'booking' | 'admin' | 'settings') => void;
   activeReservationsCount: number;
   facilityName?: string;
   onOpenAuthModal?: () => void;
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
-  currentTab,
+  currentTab: propCurrentTab,
   setCurrentTab,
   activeReservationsCount,
   facilityName = 'CourtBook',
   onOpenAuthModal,
 }) => {
+  const navigate = useNavigate();
+  const location = useLocation();
   const [mobileMenuOpen, setMobileMenuOpen] = React.useState(false);
   const { isConfigured, user, isDemoSession, demoProfile, staffData, onboardingState, signOut } = useSupabaseAuth();
+
+  // Derive active tab from URL path
+  const currentTab = propCurrentTab || (
+    location.pathname.startsWith('/book')
+      ? 'booking'
+      : location.pathname.startsWith('/admin')
+      ? 'admin'
+      : location.pathname.startsWith('/settings')
+      ? 'settings'
+      : 'home'
+  );
 
   const isAuthenticated = Boolean(user || isDemoSession);
   const isNeedsOnboarding = Boolean(user && onboardingState === 'needs_onboarding');
@@ -31,9 +45,16 @@ export const Navbar: React.FC<NavbarProps> = ({
   const staffEmail = user?.email || demoProfile?.email;
 
   const handleNav = (tab: 'home' | 'booking' | 'admin' | 'settings') => {
-    setCurrentTab(tab);
+    if (setCurrentTab) {
+      setCurrentTab(tab);
+    }
     setMobileMenuOpen(false);
     window.scrollTo({ top: 0, behavior: 'smooth' });
+
+    if (tab === 'home') navigate('/');
+    else if (tab === 'booking') navigate('/book/sport');
+    else if (tab === 'admin') navigate('/admin');
+    else if (tab === 'settings') navigate('/settings');
   };
 
   return (

@@ -235,6 +235,113 @@ let passed = 0;
   console.log('✓ Test 7: BookingConfirmationCard rendering & pass features passed');
 }
 
+// Test 8: 12 Fictional Demo Court Businesses & 36 Courts Seed Dataset
+{
+  const { DEMO_FACILITIES, DEMO_COURTS } = await import('../../src/data/demoVenues');
+
+  assert.equal(DEMO_FACILITIES.length, 12, 'Must contain exactly 12 demo facilities');
+  assert.equal(DEMO_COURTS.length, 36, 'Must contain exactly 36 demo courts (3 per venue)');
+
+  // Verify all 12 are marked is_demo = true
+  for (const fac of DEMO_FACILITIES) {
+    assert.equal(fac.is_demo, true, `Facility ${fac.name} must be marked is_demo = true`);
+    assert.ok(fac.slug.startsWith('demo-'), `Facility slug ${fac.slug} must start with demo-`);
+    assert.equal(fac.timezone, 'Asia/Manila', 'Must use Asia/Manila timezone');
+    assert.equal(fac.currency, '₱', 'Must use ₱ Philippine peso');
+  }
+
+  // Verify all 12 requested cities are covered
+  const requiredCities = [
+    // Luzon
+    'Quezon City',
+    'Makati City',
+    'Baguio City',
+    'Santa Rosa City',
+    // Visayas
+    'Cebu City',
+    'Mandaue City',
+    'Iloilo City',
+    'Bacolod City',
+    // Mindanao
+    'Zamboanga City',
+    'Davao City',
+    'Cagayan de Oro City',
+    'Iligan City',
+  ];
+
+  for (const city of requiredCities) {
+    const found = DEMO_FACILITIES.some((f) => f.address?.includes(city));
+    assert.ok(found, `Demo venues must include facility in ${city}`);
+  }
+
+  // Verify all 36 courts link to valid facilities and have 3 courts per facility
+  for (const fac of DEMO_FACILITIES) {
+    const facCourts = DEMO_COURTS.filter((c) => c.facility_id === fac.id);
+    assert.equal(facCourts.length, 3, `Facility ${fac.name} must have exactly 3 courts`);
+  }
+
+  passed++;
+  console.log('✓ Test 8: 12 Demo Businesses & 36 Courts Dataset Verification passed');
+}
+
+// Test 9: DEMO VENUE Badge Rendering on VenueDirectoryCard
+{
+  const { DEMO_FACILITIES, DEMO_COURTS } = await import('../../src/data/demoVenues');
+  const demoFac = DEMO_FACILITIES[0];
+
+  const html = renderToStaticMarkup(
+    React.createElement(VenueDirectoryCard, {
+      facility: demoFac,
+      courts: DEMO_COURTS,
+      onSelectVenue: () => {},
+      selectedSport: 'Pickleball',
+    })
+  );
+
+  assert.ok(html.includes('DEMO VENUE'), 'Should prominently label sample business as DEMO VENUE');
+  passed++;
+  console.log('✓ Test 9: DEMO VENUE badge rendering on sample businesses passed');
+}
+
+// Test 10: Multi-Page BookingPageLayout Header & Progress
+{
+  const { BookingPageLayout } = await import('../../src/components/booking/BookingPageLayout');
+  const { MemoryRouter } = await import('react-router-dom');
+  const { SupabaseAuthProvider } = await import('../../src/context/SupabaseAuthContext');
+  const { CustomerBookingProvider } = await import('../../src/context/CustomerBookingContext');
+
+  const html = renderToStaticMarkup(
+    React.createElement(
+      MemoryRouter,
+      { initialEntries: ['/book/sport'] },
+      React.createElement(
+        SupabaseAuthProvider,
+        null,
+        React.createElement(
+          CustomerBookingProvider,
+          null,
+          React.createElement(
+            BookingPageLayout,
+            {
+              currentStep: 1,
+              title: 'Choose Your Sport',
+              subtitle: 'Select the sport or court game you want to book today',
+            },
+            React.createElement('div', null, 'Step 1 Child Content')
+          )
+        )
+      )
+    )
+  );
+
+  assert.ok(html.includes('Step 1 of 7'), 'Should render Step 1 of 7 indicator');
+  assert.ok(html.includes('14% Complete'), 'Should calculate correct progress percent');
+  assert.ok(html.includes('Choose Your Sport'), 'Should render page title');
+  assert.ok(html.includes('Step 1 Child Content'), 'Should render child page content');
+  passed++;
+  console.log('✓ Test 10: Multi-Page BookingPageLayout header & progress passed');
+}
+
 console.log(`\n======================================================`);
 console.log(`ALL ${passed} CUSTOMER BOOKING UNIT TESTS PASSED!`);
 console.log(`======================================================`);
