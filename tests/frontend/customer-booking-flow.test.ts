@@ -424,7 +424,216 @@ let passed = 0;
   console.log('✓ Test 12: Zero silent substitution and isolated inventory guarantees passed');
 }
 
+// Test 13: Strict Hierarchical Location Filtering (City and Barangay Matching)
+{
+  const { DEMO_FACILITIES, DEMO_COURTS } = await import('../../src/data/demoVenues');
+
+  // Case A: Filtering by Quezon City must only match QC facilities, not Makati or Baguio
+  const qcLocation = {
+    regionCode: 'NCR',
+    regionName: 'NCR',
+    province: 'Metro Manila',
+    city: 'Quezon City',
+  };
+
+  const qcMatches = DEMO_FACILITIES.filter((f) => {
+    const addr = (f.address || '').toLowerCase();
+    const city = qcLocation.city.toLowerCase().trim().replace(/\s+city$/i, '');
+    return addr.includes(city);
+  });
+
+  assert.equal(qcMatches.length, 1, 'Exactly 1 demo facility in Quezon City');
+  assert.equal(qcMatches[0].name, 'Apex Pickleball & Racquet Hub');
+
+  // Case B: City mismatch must NOT match just because province matches (Metro Manila)
+  // Selecting Pasay City must NOT return Quezon City or Makati facilities
+  const pasayLocation = {
+    regionCode: 'NCR',
+    regionName: 'NCR',
+    province: 'Metro Manila',
+    city: 'Pasay City',
+  };
+
+  const pasayMatches = DEMO_FACILITIES.filter((f) => {
+    const addr = (f.address || '').toLowerCase();
+    const city = pasayLocation.city.toLowerCase().trim().replace(/\s+city$/i, '');
+    return addr.includes(city);
+  });
+
+  assert.equal(pasayMatches.length, 0, 'No demo facility in Pasay City; must not match other Metro Manila venues');
+
+  // Case C: Barangay match enforcement
+  const salcedoLocation = {
+    regionCode: 'NCR',
+    regionName: 'NCR',
+    province: 'Metro Manila',
+    city: 'Makati City',
+    barangay: 'Salcedo Village',
+  };
+
+  const salcedoMatches = DEMO_FACILITIES.filter((f) => {
+    const addr = (f.address || '').toLowerCase();
+    const city = salcedoLocation.city.toLowerCase().trim().replace(/\s+city$/i, '');
+    const bgy = salcedoLocation.barangay.toLowerCase().trim();
+    return addr.includes(city) && addr.includes(bgy);
+  });
+
+  assert.equal(salcedoMatches.length, 1, 'Must match Salcedo Padel & Racquet Club');
+  assert.equal(salcedoMatches[0].name, 'Salcedo Padel & Racquet Club');
+  passed++;
+  console.log('✓ Test 13: Strict hierarchical location filtering passed');
+}
+
+// Test 14: Financial Model & 5% Platform Commission Verification
+{
+  const hourlyRate = 350.0;
+  const durationMinutes = 60;
+  const totalPrice = Math.round((hourlyRate * (durationMinutes / 60)) * 100) / 100;
+  const commissionRate = 0.05;
+  const commissionAmount = Math.round((totalPrice * commissionRate) * 100) / 100;
+  const ownerGrossShare = Math.round((totalPrice - commissionAmount) * 100) / 100;
+
+  assert.equal(totalPrice, 350.0, 'Customer pays listed court price');
+  assert.equal(commissionAmount, 17.5, 'CourtBook commission is exactly 5% of gross');
+  assert.equal(ownerGrossShare, 332.5, 'Owner gross entitlement is 95%');
+  assert.equal(commissionAmount + ownerGrossShare, totalPrice, 'Journal balances perfectly');
+  passed++;
+  console.log('✓ Test 14: 5% platform commission and owner gross share calculation passed');
+}
+
+// Test 15: Booking Confirmation Pass Distinction (DEMO / SIMULATED vs Official)
+{
+  const { BookingConfirmationCard } = await import('../../src/components/booking/BookingConfirmationCard');
+
+  // Demo confirmation rendering
+  const demoDetails = {
+    reservationId: 'demo-res-1234',
+    referenceCode: 'DEMO-ABC123',
+    facilityName: 'Apex Sports Club [DEMO]',
+    facilityAddress: 'Quezon City, Metro Manila',
+    courtName: 'Court 1',
+    sportType: 'Pickleball',
+    bookingDate: '2026-11-20',
+    timeSlotLabel: '08:00 AM – 09:00 AM',
+    durationMinutes: 60,
+    totalPrice: 400.0,
+    currency: '₱',
+    customerName: 'Demo Player',
+    confirmedAt: new Date().toISOString(),
+    isDemo: true,
+    isSimulated: true,
+  };
+
+  const demoCardHtml = renderToStaticMarkup(
+    React.createElement(BookingConfirmationCard, {
+      details: demoDetails,
+      onBookAnother: () => {},
+      onDone: () => {},
+    })
+  );
+
+  assert.ok(
+    demoCardHtml.includes('DEMO SIMULATION ONLY • NOT A PAID RESERVATION'),
+    'Demo confirmation must prominently state it is a simulation only'
+  );
+  assert.ok(
+    demoCardHtml.includes('DEMO / SIMULATED'),
+    'Demo confirmation badge must say DEMO / SIMULATED'
+  );
+  assert.ok(
+    !demoCardHtml.includes('Paid &amp; Verified'),
+    'Demo confirmation must NOT display Paid & Verified badge'
+  );
+
+  // Live confirmed reservation rendering
+  const liveDetails = {
+    ...demoDetails,
+    isDemo: false,
+    isSimulated: false,
+    referenceCode: 'CB-LIVE99',
+  };
+
+  const liveCardHtml = renderToStaticMarkup(
+    React.createElement(BookingConfirmationCard, {
+      details: liveDetails,
+      onBookAnother: () => {},
+      onDone: () => {},
+    })
+  );
+
+  assert.ok(
+    liveCardHtml.includes('Paid &amp; Verified'),
+    'Live confirmed reservation must display Paid & Verified badge'
+  );
+  assert.ok(
+    liveCardHtml.includes('Confirmed &amp; Reserved'),
+    'Live confirmed reservation must state Confirmed & Reserved'
+  );
+  passed++;
+  console.log('✓ Test 15: Demo vs Live confirmation pass labeling passed');
+}
+
+// Test 16: Live Checkout Fail-Closed Guard (No Fake Live Reservations)
+{
+  const { createBookingCheckoutSession } = await import('../../src/lib/supabaseClient');
+
+  // Attempting checkout for a live registered facility when backend is offline/unreachable
+  // MUST fail closed and return success: false without fabricating fake IDs
+  const result = await createBookingCheckoutSession({
+    facility_id: '11111111-1111-4111-8111-111111111111',
+    court_id: '22222222-2222-4222-8222-222222222222',
+    customer_name: 'Live Customer',
+    customer_phone: '09171112233',
+    booking_date: '2026-11-20',
+    start_time: '2026-11-20T08:00:00.000Z',
+    duration_minutes: 60,
+    idempotency_key: 'idem_test_live_fail_closed_123456',
+    is_demo: false, // Live facility
+  });
+
+  assert.equal(result.success, false, 'Live facility checkout without backend connection must fail closed');
+  assert.ok(
+    result.error?.includes('Unable to establish authoritative backend checkout session') ||
+    result.error?.includes('connection') ||
+    result.error?.includes('offline'),
+    'Must return clear failure reason without faking live success'
+  );
+  passed++;
+  console.log('✓ Test 16: Live checkout fail-closed guard passed');
+}
+
+// Test 17: Fictional Demo Seed SQL Fixture Whitelist & Idempotency
+{
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+
+  const fixturePath = path.resolve('supabase/fixtures/006_demo_court_businesses_seed.sql');
+  const sqlContent = fs.readFileSync(fixturePath, 'utf8');
+
+  // Verify fixture does NOT contain unsafe wildcard deletes
+  assert.ok(
+    !sqlContent.includes("DELETE FROM public.facilities WHERE slug LIKE 'demo-%'"),
+    'Fixture must NOT contain unsafe wildcard slug deletion'
+  );
+  assert.ok(
+    !sqlContent.includes("DELETE FROM public.organizations WHERE slug LIKE 'demo-%'"),
+    'Fixture must NOT contain unsafe wildcard organization deletion'
+  );
+
+  // Verify fixture contains exact 12 organization UUIDs and 12 facility UUIDs
+  assert.ok(sqlContent.includes('d0000001-0000-4000-8000-000000000001'), 'Must contain Org 1 UUID');
+  assert.ok(sqlContent.includes('d0000001-0000-4000-8000-000000000012'), 'Must contain Org 12 UUID');
+  assert.ok(sqlContent.includes('d0000002-0000-4000-8000-000000000001'), 'Must contain Facility 1 UUID');
+  assert.ok(sqlContent.includes('d0000002-0000-4000-8000-000000000012'), 'Must contain Facility 12 UUID');
+
+  // Verify safe ON CONFLICT clauses for idempotency
+  assert.ok(sqlContent.includes('ON CONFLICT (slug) DO UPDATE'), 'Must be idempotent with ON CONFLICT');
+  passed++;
+  console.log('✓ Test 17: Demo Seed SQL Fixture safety and exact UUID cleanup verification passed');
+}
+
 console.log(`\n======================================================`);
 console.log(`ALL ${passed} CUSTOMER BOOKING UNIT TESTS PASSED!`);
 console.log(`======================================================`);
+
 

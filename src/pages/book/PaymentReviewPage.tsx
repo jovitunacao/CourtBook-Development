@@ -69,10 +69,19 @@ export const PaymentReviewPage: React.FC = () => {
 
     async function initCheckout() {
       setIsLoading(true);
-      setErrorMessage(null);
+      // Generate or retrieve a persistent booking-attempt token for this exact slot
+      // Guarantees stable idempotency across page refreshes, remounts, and network retries
+      const attemptStorageKey = `courtbook_attempt_${currentSlotSignature}`;
+      let attemptToken = sessionStorage.getItem(attemptStorageKey);
+      if (!attemptToken) {
+        attemptToken = `${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
+        sessionStorage.setItem(attemptStorageKey, attemptToken);
+      }
 
-      // Generate a stable idempotency key for this slot
-      const idempotencyKey = `idem_slot_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
+      // Compact, compliant 32-64 char deterministic key: idem_<facPrefix>_<courtPrefix>_<token>
+      const facPrefix = (activeFacility!.id || '').replace(/-/g, '').substring(0, 8);
+      const courtPrefix = (activeCourt!.id || '').replace(/-/g, '').substring(0, 8);
+      const idempotencyKey = `idem_${facPrefix}_${courtPrefix}_${attemptToken}`.substring(0, 64);
 
       const res = await createBookingCheckoutSession({
         facility_id: activeFacility!.id,
@@ -85,6 +94,7 @@ export const PaymentReviewPage: React.FC = () => {
         duration_minutes: durationMinutes,
         idempotency_key: idempotencyKey,
         provider_name: 'paymongo',
+        is_demo: Boolean(activeFacility?.is_demo),
       });
 
       inFlightRef.current = false;
@@ -190,6 +200,8 @@ export const PaymentReviewPage: React.FC = () => {
       customerPhone,
       customerEmail,
       confirmedAt: new Date().toISOString(),
+      isDemo: true,
+      isSimulated: true,
     };
 
     setConfirmedPassDetails(confirmation);
@@ -197,6 +209,10 @@ export const PaymentReviewPage: React.FC = () => {
   };
 
   const handleRetry = async () => {
+    const attemptStorageKey = `courtbook_attempt_${currentSlotSignature}`;
+    try {
+      sessionStorage.removeItem(attemptStorageKey);
+    } catch {}
     lastCreatedSignatureRef.current = null;
     inFlightRef.current = false;
     setCheckoutResult(null);

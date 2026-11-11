@@ -67,19 +67,21 @@ export const BookingConfirmationCard: React.FC<BookingConfirmationCardProps> = (
   return (
     <div className="space-y-6 max-w-xl mx-auto">
       {/* Top Success Banner */}
-      <div className="bg-emerald-500 text-white rounded-3xl p-6 sm:p-8 text-center space-y-3 shadow-lg shadow-emerald-500/20">
+      <div className={`${details.isDemo ? 'bg-amber-600 shadow-amber-600/20' : 'bg-emerald-500 shadow-emerald-500/20'} text-white rounded-3xl p-6 sm:p-8 text-center space-y-3 shadow-lg`}>
         <div className="w-16 h-16 rounded-2xl bg-white/20 backdrop-blur-md flex items-center justify-center mx-auto shadow-inner">
           <CheckCircle2 className="w-10 h-10 text-white" />
         </div>
         <div>
-          <span className="inline-block px-3 py-1 rounded-full bg-emerald-600/80 text-[11px] font-extrabold uppercase tracking-wider mb-1">
-            Confirmed & Reserved
+          <span className={`inline-block px-3 py-1 rounded-full ${details.isDemo ? 'bg-amber-700/80 text-amber-100' : 'bg-emerald-600/80 text-emerald-100'} text-[11px] font-extrabold uppercase tracking-wider mb-1`}>
+            {details.isDemo ? 'DEMO SIMULATION ONLY • NOT A PAID RESERVATION' : 'Confirmed & Reserved'}
           </span>
           <h2 className="text-2xl sm:text-3xl font-extrabold tracking-tight">
-            Booking Confirmed!
+            {details.isDemo ? 'Demo Booking Simulated' : 'Booking Confirmed!'}
           </h2>
-          <p className="text-xs sm:text-sm text-emerald-100 mt-1 max-w-sm mx-auto">
-            Your court is officially booked. Present this digital pass or your reference code upon arrival.
+          <p className="text-xs sm:text-sm text-white/90 mt-1 max-w-sm mx-auto">
+            {details.isDemo
+              ? 'This is a fictional demonstration booking pass. No real transaction occurred and no court was reserved.'
+              : 'Your court is officially booked. Present this digital pass or your reference code upon arrival.'}
           </p>
         </div>
       </div>
@@ -90,15 +92,15 @@ export const BookingConfirmationCard: React.FC<BookingConfirmationCardProps> = (
         <div className="p-6 bg-slate-900 text-white flex items-center justify-between">
           <div>
             <div className="text-[10px] font-extrabold uppercase tracking-widest text-slate-400">
-              Booking Reference
+              {details.isDemo ? 'Demo Reference Code' : 'Booking Reference'}
             </div>
-            <div className="text-xl sm:text-2xl font-black font-mono tracking-wider text-emerald-400 mt-0.5">
+            <div className={`text-xl sm:text-2xl font-black font-mono tracking-wider ${details.isDemo ? 'text-amber-400' : 'text-emerald-400'} mt-0.5`}>
               {details.referenceCode}
             </div>
           </div>
           <div className="px-3 py-1.5 rounded-xl bg-white/10 backdrop-blur-md text-xs font-bold flex items-center gap-1.5">
-            <ShieldCheck className="w-4 h-4 text-emerald-400" />
-            <span>Paid & Verified</span>
+            <ShieldCheck className={`w-4 h-4 ${details.isDemo ? 'text-amber-400' : 'text-emerald-400'}`} />
+            <span>{details.isDemo ? 'DEMO / SIMULATED' : 'Paid & Verified'}</span>
           </div>
         </div>
 

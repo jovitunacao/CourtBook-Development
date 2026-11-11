@@ -1171,6 +1171,7 @@ export interface CreateBookingCheckoutInput {
   duration_minutes: number;
   idempotency_key: string;
   provider_name?: 'paymongo' | 'xendit' | 'manual_test';
+  is_demo?: boolean;
 }
 
 export interface CreateBookingCheckoutResult {
@@ -1323,7 +1324,7 @@ export async function createBookingCheckoutSession(
           time_slot_label: data.time_slot_label,
           court_name: data.court_name,
           checkout_url: `https://checkout.paymongo.com/${data.checkout_session_id}`,
-          isSimulated: true,
+          isSimulated: Boolean(input.is_demo),
         };
       }
     } catch (rpcErr: any) {
@@ -1334,25 +1335,34 @@ export async function createBookingCheckoutSession(
     }
   }
 
-  // Local offline simulation fallback for development/demo mode
-  const randomRef = `CB-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
+  // Strict Fail-Closed Rule for Live Bookings:
+  // If the facility is not a demo venue, NEVER fabricate simulated reservation or payment IDs on the client.
+  if (!input.is_demo) {
+    return {
+      success: false,
+      error: 'Unable to establish authoritative backend checkout session with payment provider. Please verify connection and retry.',
+    };
+  }
+
+  // Local offline sandbox fallback: STRICTLY FOR FRONTEND-ONLY DEMO EXPERIENCE
+  const randomRef = `DEMO-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
   const nowUtc = new Date();
   const holdExpiry = new Date(nowUtc.getTime() + 15 * 60 * 1000).toISOString();
   return {
     success: true,
-    reservation_id: crypto.randomUUID(),
-    payment_id: crypto.randomUUID(),
+    reservation_id: `demo-res-${Date.now()}`,
+    payment_id: `demo-pay-${Date.now()}`,
     reference_code: randomRef,
-    checkout_session_id: `cs_sim_${Date.now()}`,
+    checkout_session_id: `cs_demo_${Date.now()}`,
     expected_amount: 350.0,
     currency: '₱',
     commission_rate: 0.05,
     commission_amount: 17.5,
     owner_gross_share: 332.5,
     hold_expires_at: holdExpiry,
-    time_slot_label: 'Reserved Slot',
-    court_name: 'Selected Court',
-    checkout_url: `https://checkout.paymongo.com/cs_sim_${Date.now()}`,
+    time_slot_label: 'Demo Reserved Slot',
+    court_name: 'Demo Court',
+    checkout_url: `https://checkout.paymongo.com/cs_demo_${Date.now()}`,
     isSimulated: true,
   };
 }

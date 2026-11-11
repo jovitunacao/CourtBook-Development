@@ -64,4 +64,6 @@ export interface CustomerConfirmationDetails {
   customerPhone?: string;
   customerEmail?: string;
   confirmedAt: string;
+  isDemo?: boolean;
+  isSimulated?: boolean;
 }

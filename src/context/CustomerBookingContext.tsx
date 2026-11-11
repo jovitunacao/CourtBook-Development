@@ -314,17 +314,35 @@ export const CustomerBookingProvider: React.FC<{ children: React.ReactNode }> = 
         if (!matchesSport) return false;
       }
 
-      // Filter by location
+      // Filter by location (Strict hierarchical matching: barangay -> city -> province -> region)
       if (selectedLocation) {
         const addr = (facility.address || '').toLowerCase();
-        const cityMatch = addr.includes(selectedLocation.city.toLowerCase());
-        const provMatch = addr.includes(selectedLocation.province.toLowerCase());
-        const bgyMatch = selectedLocation.barangay
-          ? addr.includes(selectedLocation.barangay.toLowerCase())
-          : true;
+        
+        // 1. If a specific barangay was selected, facility address MUST contain the barangay name
+        if (selectedLocation.barangay && selectedLocation.barangay.trim()) {
+          const bgy = selectedLocation.barangay.toLowerCase().trim();
+          if (!addr.includes(bgy)) {
+            return false;
+          }
+        }
 
-        if (!cityMatch && !provMatch && facility.address) {
-          return false;
+        // 2. If a specific city/municipality was selected, facility address MUST contain the city name
+        // (Prevents unrelated venues in the same province from falsely matching)
+        if (selectedLocation.city && selectedLocation.city.trim()) {
+          const city = selectedLocation.city.toLowerCase().trim();
+          // Normalize suffixes like " city" for robust matching (e.g. "Makati City" vs "Makati")
+          const cleanCity = city.replace(/\s+city$/i, '');
+          if (!addr.includes(city) && !addr.includes(cleanCity)) {
+            return false;
+          }
+        }
+
+        // 3. If a province was selected, facility address MUST contain the province name
+        if (selectedLocation.province && selectedLocation.province.trim()) {
+          const prov = selectedLocation.province.toLowerCase().trim();
+          if (!addr.includes(prov)) {
+            return false;
+          }
         }
       }
 
@@ -386,10 +404,13 @@ export const CustomerBookingProvider: React.FC<{ children: React.ReactNode }> = 
       const currentFac = facilities.find((f) => f.id === selectedFacilityId);
       if (currentFac) {
         const addr = (currentFac.address || '').toLowerCase();
-        const cityMatch = addr.includes(newLoc.city.toLowerCase());
-        const provMatch = addr.includes(newLoc.province.toLowerCase());
+        const city = newLoc.city.toLowerCase().trim();
+        const cleanCity = city.replace(/\s+city$/i, '');
+        const cityMatch = addr.includes(city) || addr.includes(cleanCity);
+        const provMatch = newLoc.province ? addr.includes(newLoc.province.toLowerCase().trim()) : true;
+        const bgyMatch = newLoc.barangay ? addr.includes(newLoc.barangay.toLowerCase().trim()) : true;
 
-        if (!cityMatch && !provMatch) {
+        if (!cityMatch || !provMatch || !bgyMatch) {
           setSelectedFacilityIdState(null);
           setSelectedCourtIdState(null);
           setSelectedStartTimeIsoState(null);
