@@ -801,9 +801,206 @@ let passed = 0;
   console.log('✓ Test 23: Idempotent attempt key stability across re-renders passed');
 }
 
+// Test 24: Authoritative Status Verification Contract - Confirmed Capture
+{
+  const { verifyPublicBookingPaymentStatus } = await import('../../src/lib/supabaseClient');
+
+  const originalFetch = globalThis.fetch;
+  const mockReservationId = 'd1111111-1111-4111-8111-111111111111';
+  const mockReferenceCode = 'CB-PAID123';
+  const mockPaymentId = 'p1111111-1111-4111-8111-111111111111';
+
+  // Mock Edge Function responding with authentic captured payment evidence
+  globalThis.fetch = async (url: any, opts: any) => {
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        success: true,
+        verified: true,
+        status: 'confirmed',
+        reservation_status: 'confirmed',
+        payment_status: 'captured',
+        reservation_id: mockReservationId,
+        reference_code: mockReferenceCode,
+        payment_id: mockPaymentId,
+        total_price: 450.0,
+        currency: '₱',
+        facility_name: 'Metro Arena',
+        court_name: 'Center Court',
+        booking_date: '2026-11-20',
+        time_slot_label: '08:00 AM – 09:00 AM',
+        confirmed_at: '2026-11-20T08:05:00.000Z',
+      }),
+    } as any;
+  };
+
+  try {
+    const verifiedResult = await verifyPublicBookingPaymentStatus({
+      reference_code: mockReferenceCode,
+      reservation_id: mockReservationId,
+      payment_id: mockPaymentId,
+    });
+
+    assert.equal(verifiedResult.verified, true, 'Server-confirmed capture must report verified: true');
+    assert.equal(verifiedResult.status, 'confirmed');
+    assert.equal(verifiedResult.reference_code, mockReferenceCode);
+    assert.equal(verifiedResult.reservation_id, mockReservationId);
+    assert.equal(verifiedResult.payment_id, mockPaymentId);
+    assert.equal(verifiedResult.total_price, 450.0);
+    assert.equal(verifiedResult.facility_name, 'Metro Arena');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  passed++;
+  console.log('✓ Test 24: Authoritative status verification contract on confirmed capture passed');
+}
+
+// Test 25: Forged or Mismatched Reservation Reference Rejection
+{
+  const { verifyPublicBookingPaymentStatus } = await import('../../src/lib/supabaseClient');
+
+  const originalFetch = globalThis.fetch;
+
+  // Mock server returning reference code mismatch / 404
+  globalThis.fetch = async () => {
+    return {
+      ok: false,
+      status: 404,
+      json: async () => ({
+        error: 'Reservation not found or reference code mismatch',
+      }),
+    } as any;
+  };
+
+  try {
+    const result = await verifyPublicBookingPaymentStatus({
+      reference_code: 'CB-FORGED99',
+      reservation_id: 'd1111111-1111-4111-8111-111111111111',
+    });
+
+    assert.equal(result.verified, false, 'Forged lookup must not verify');
+    assert.equal(result.status, 'failed');
+    assert.ok(result.error?.includes('not found') || result.error?.includes('mismatch'));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  passed++;
+  console.log('✓ Test 25: Forged or mismatched reservation reference rejection passed');
+}
+
+// Test 26: Mismatched Response Contract Protection
+{
+  const { verifyPublicBookingPaymentStatus } = await import('../../src/lib/supabaseClient');
+
+  const originalFetch = globalThis.fetch;
+
+  // Mock server response returning mismatched reservation_id
+  globalThis.fetch = async () => {
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        success: true,
+        verified: true,
+        status: 'confirmed',
+        reservation_id: 'different-uuid-returned',
+        reference_code: 'CB-TEST123',
+      }),
+    } as any;
+  };
+
+  try {
+    const result = await verifyPublicBookingPaymentStatus({
+      reference_code: 'CB-TEST123',
+      reservation_id: 'target-uuid-sent',
+    });
+
+    // Must fail closed because returned reservation_id does not match target-uuid-sent
+    assert.equal(result.verified, false, 'Mismatched response contract must fail closed');
+    assert.equal(result.status, 'pending');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  passed++;
+  console.log('✓ Test 26: Mismatched response contract protection passed');
+}
+
+// Test 27: Failed / Expired Status Handling in Verification
+{
+  const { verifyPublicBookingPaymentStatus } = await import('../../src/lib/supabaseClient');
+
+  const originalFetch = globalThis.fetch;
+
+  // Case A: Expired hold
+  globalThis.fetch = async () => {
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        success: true,
+        verified: false,
+        status: 'expired',
+        reservation_status: 'expired',
+        payment_status: 'expired',
+        reservation_id: 'res-expired-111',
+        reference_code: 'CB-EXPIRED',
+      }),
+    } as any;
+  };
+
+  try {
+    const expiredRes = await verifyPublicBookingPaymentStatus({
+      reference_code: 'CB-EXPIRED',
+      reservation_id: 'res-expired-111',
+    });
+
+    assert.equal(expiredRes.verified, false);
+    assert.equal(expiredRes.status, 'expired');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  // Case B: Payment failed
+  globalThis.fetch = async () => {
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        success: true,
+        verified: false,
+        status: 'failed',
+        reservation_status: 'pending',
+        payment_status: 'failed',
+        reservation_id: 'res-failed-111',
+        reference_code: 'CB-FAILED',
+      }),
+    } as any;
+  };
+
+  try {
+    const failedRes = await verifyPublicBookingPaymentStatus({
+      reference_code: 'CB-FAILED',
+      reservation_id: 'res-failed-111',
+    });
+
+    assert.equal(failedRes.verified, false);
+    assert.equal(failedRes.status, 'failed');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  passed++;
+  console.log('✓ Test 27: Failed and expired status handling passed');
+}
+
 console.log(`\n======================================================`);
 console.log(`ALL ${passed} CUSTOMER BOOKING UNIT TESTS PASSED!`);
 console.log(`======================================================`);
+
 
 
 

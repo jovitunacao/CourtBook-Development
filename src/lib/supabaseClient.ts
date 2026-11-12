@@ -1451,17 +1451,23 @@ export async function verifyPublicBookingPaymentStatus(input: {
     };
   }
 
-  // If Supabase URL is available, invoke the secure backend status endpoint / function
-  if (supabaseUrl) {
-    try {
-      const endpoint = `${supabaseUrl}/functions/v1/get-booking-status`;
-      const res = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          apikey: supabasePublishableKey,
-          Authorization: `Bearer ${supabasePublishableKey}`,
-        },
+  // Invoke the authoritative backend get-booking-status Edge Function
+  const endpoint = supabaseUrl
+    ? `${supabaseUrl}/functions/v1/get-booking-status`
+    : 'https://backend.courtbook.ph/functions/v1/get-booking-status';
+
+  try {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (supabasePublishableKey) {
+      headers.apikey = supabasePublishableKey;
+      headers.Authorization = `Bearer ${supabasePublishableKey}`;
+    }
+
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers,
         body: JSON.stringify({
           reference_code: refCode,
           reservation_id: resId,
@@ -1472,7 +1478,14 @@ export async function verifyPublicBookingPaymentStatus(input: {
 
       if (res.ok) {
         const json = await res.json().catch(() => null);
-        if (json && json.success) {
+        // Authoritative verification contract:
+        // Must contain success: true, matching reference_code and reservation_id
+        if (
+          json &&
+          json.success === true &&
+          json.reference_code === refCode &&
+          json.reservation_id === resId
+        ) {
           const rawStatus = String(json.status || json.reservation_status || '').toLowerCase().trim();
           let status: AuthoritativeBookingStatus = 'pending';
           if (rawStatus === 'confirmed' || rawStatus === 'captured') status = 'confirmed';
@@ -1481,11 +1494,14 @@ export async function verifyPublicBookingPaymentStatus(input: {
           else if (rawStatus === 'cancelled') status = 'cancelled';
           else if (rawStatus === 'failed') status = 'failed';
 
+          // Strictly require verified flag from backend
+          const verified = Boolean(json.verified) && status === 'confirmed';
+
           return {
-            verified: status === 'confirmed',
+            verified,
             status,
-            reservation_id: json.reservation_id || resId,
-            reference_code: json.reference_code || refCode,
+            reservation_id: json.reservation_id,
+            reference_code: json.reference_code,
             payment_id: json.payment_id,
             payment_status: json.payment_status,
             hold_expires_at: json.hold_expires_at,
@@ -1497,51 +1513,29 @@ export async function verifyPublicBookingPaymentStatus(input: {
             time_slot_label: json.time_slot_label,
             confirmed_at: json.confirmed_at || json.updated_at,
           };
+        } else if (json && json.error) {
+          return {
+            verified: false,
+            status: 'failed',
+            error: json.error,
+          };
         }
-      }
-    } catch {
-      // Fall through to database RPC or fail-closed handling
-    }
-  }
-
-  // Direct database RPC fallback: get_public_booking_status
-  if (supabase) {
-    try {
-      const { data, error } = await supabase.rpc('get_public_booking_status', {
-        p_reference_code: refCode,
-        p_reservation_id: resId,
-      });
-
-      if (!error && data && data.success) {
-        const rawStatus = String(data.status || data.reservation_status || '').toLowerCase().trim();
-        let status: AuthoritativeBookingStatus = 'pending';
-        if (rawStatus === 'confirmed' || rawStatus === 'captured') status = 'confirmed';
-        else if (rawStatus === 'processing') status = 'processing';
-        else if (rawStatus === 'expired') status = 'expired';
-        else if (rawStatus === 'cancelled') status = 'cancelled';
-        else if (rawStatus === 'failed') status = 'failed';
-
+      } else if (res.status === 404) {
         return {
-          verified: status === 'confirmed',
-          status,
-          reservation_id: data.reservation_id || resId,
-          reference_code: data.reference_code || refCode,
-          payment_id: data.payment_id,
-          payment_status: data.payment_status,
-          hold_expires_at: data.hold_expires_at,
-          total_price: data.total_price ? Number(data.total_price) : undefined,
-          currency: data.currency || '₱',
-          facility_name: data.facility_name,
-          court_name: data.court_name,
-          booking_date: data.booking_date,
-          time_slot_label: data.time_slot_label,
-          confirmed_at: data.confirmed_at || data.updated_at,
+          verified: false,
+          status: 'failed',
+          error: 'Reservation record not found. Please verify your reference code.',
+        };
+      } else if (res.status === 429) {
+        return {
+          verified: false,
+          status: 'pending',
+          error: 'Rate limit exceeded. Please wait a moment before checking status again.',
         };
       }
     } catch {
-      // Fail closed
+      // Network failure or offline
     }
-  }
 
   // Fails closed: Server verification is unavailable or unconfirmed
   return {
