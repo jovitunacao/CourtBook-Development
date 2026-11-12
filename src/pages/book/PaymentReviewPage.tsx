@@ -12,6 +12,7 @@ import { useCustomerBooking } from '../../context/CustomerBookingContext';
 import { PaymentCheckoutBridge } from '../../components/booking/PaymentCheckoutBridge';
 import {
   createBookingCheckoutSession,
+  verifyPublicBookingPaymentStatus,
   CreateBookingCheckoutResult,
 } from '../../lib/supabaseClient';
 import { CustomerConfirmationDetails } from '../../types/customerBooking';
@@ -100,7 +101,12 @@ export const PaymentReviewPage: React.FC = () => {
       const courtPrefix = (activeCourt!.id || '').replace(/-/g, '').substring(0, 8);
       const idempotencyKey = `idem_${facPrefix}_${courtPrefix}_${attemptToken}`.substring(0, 64);
 
-      const isFrontendDemo = inventorySource === 'demo' || Boolean(activeFacility?.is_demo);
+      // CRITICAL DEMO ISOLATION:
+      // Only explicitly selected frontend fictional inventory (inventorySource === 'demo')
+      // may use the zero-network simulation path.
+      // A Supabase-backed facility with is_demo = true is NOT a frontend-only demo and MUST
+      // use the secured backend sandbox booking flow.
+      const isFrontendDemo = inventorySource === 'demo';
 
       const res = await createBookingCheckoutSession({
         facility_id: activeFacility!.id,
@@ -184,15 +190,16 @@ export const PaymentReviewPage: React.FC = () => {
     );
   }
 
-  // Handle successful payment simulation (RESTRICTED TO ISOLATED DEMO EXPERIENCE ONLY)
-  // Real live facilities require authoritative backend webhook capture and verified database confirmation.
+  // Handle successful payment simulation (RESTRICTED TO EXPLICIT FRONTEND-ONLY DEMO INVENTORY)
+  // Supabase facilities (even with is_demo = true) require authoritative backend verification.
   const handleSimulatePaymentSuccess = () => {
     if (!activeFacility || !activeCourt || !checkoutResult) return;
 
-    // Strict guard: Real live facilities can NEVER simulate payment on the frontend
-    if (!activeFacility.is_demo) {
+    // Strict guard: Only explicitly selected frontend fictional inventory (inventorySource === 'demo')
+    // may use the frontend simulation path. Supabase-backed facilities must NOT bypass real payment.
+    if (inventorySource !== 'demo') {
       setErrorMessage(
-        'Payment simulation is disabled for live registered facilities. Please complete official payment via PayMongo.'
+        'Payment simulation is disabled for Supabase-backed facilities. Please complete official payment verification via the backend.'
       );
       return;
     }
@@ -231,6 +238,67 @@ export const PaymentReviewPage: React.FC = () => {
     navigate('/book/confirmation');
   };
 
+  const [isCheckingStatus, setIsCheckingStatus] = useState<boolean>(false);
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
+
+  // Authoritative status-check path for live/Supabase bookings
+  const handleCheckPaymentStatus = async () => {
+    if (!checkoutResult?.reference_code || !checkoutResult?.reservation_id || !activeFacility || !activeCourt) {
+      return;
+    }
+
+    setIsCheckingStatus(true);
+    setStatusMessage(null);
+
+    const res = await verifyPublicBookingPaymentStatus({
+      reference_code: checkoutResult.reference_code,
+      reservation_id: checkoutResult.reservation_id,
+      payment_id: checkoutResult.payment_id,
+      customer_phone_or_email: customerPhone || customerEmail,
+    });
+
+    setIsCheckingStatus(false);
+
+    if (res.verified && res.status === 'confirmed') {
+      // Authoritative backend confirmed state established!
+      const confirmation: CustomerConfirmationDetails = {
+        reservationId: res.reservation_id || checkoutResult.reservation_id,
+        referenceCode: res.reference_code || checkoutResult.reference_code,
+        facilityName: res.facility_name || activeFacility.name,
+        facilityAddress: activeFacility.address || 'Metro Manila, Philippines',
+        courtName: res.court_name || activeCourt.name,
+        sportType: activeCourt.sport_type,
+        bookingDate: res.booking_date || selectedDate,
+        timeSlotLabel: res.time_slot_label || checkoutResult.time_slot_label || 'Reserved Slot',
+        durationMinutes,
+        totalPrice: Number(res.total_price || checkoutResult.expected_amount || activeCourt.hourly_rate),
+        currency: res.currency || activeFacility.currency || '₱',
+        customerName,
+        customerPhone,
+        customerEmail,
+        confirmedAt: res.confirmed_at || new Date().toISOString(),
+        isDemo: false,
+        isSimulated: false,
+      };
+
+      setConfirmedPassDetails(confirmation);
+      navigate('/book/confirmation');
+    } else if (res.status === 'expired') {
+      setStatusMessage('This booking hold has expired. Please select a new time slot.');
+      const attemptStorageKey = `courtbook_attempt_${currentSlotSignature}`;
+      try {
+        sessionStorage.removeItem(attemptStorageKey);
+      } catch {}
+      lastCreatedSignatureRef.current = null;
+    } else if (res.status === 'failed' || res.status === 'cancelled') {
+      setStatusMessage('Payment capture could not be completed or was cancelled.');
+    } else {
+      setStatusMessage(
+        res.error || 'Payment confirmation is still pending from the provider webhook. If you have completed checkout, please wait a moment and try again.'
+      );
+    }
+  };
+
   const handleRetry = async () => {
     const attemptStorageKey = `courtbook_attempt_${currentSlotSignature}`;
     try {
@@ -252,8 +320,11 @@ export const PaymentReviewPage: React.FC = () => {
         checkoutResult={checkoutResult}
         isLoading={isLoading}
         errorMessage={errorMessage}
-        isDemoFacility={Boolean(activeFacility?.is_demo)}
+        isDemoFacility={inventorySource === 'demo'}
+        isCheckingStatus={isCheckingStatus}
+        statusMessage={statusMessage}
         onSimulateSuccess={handleSimulatePaymentSuccess}
+        onCheckPaymentStatus={handleCheckPaymentStatus}
         onRetry={handleRetry}
         onCancel={() => navigate('/book/schedule')}
       />

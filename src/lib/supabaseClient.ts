@@ -1400,6 +1400,157 @@ export async function createBookingCheckoutSession(
   };
 }
 
+export type AuthoritativeBookingStatus =
+  | 'pending'
+  | 'processing'
+  | 'confirmed'
+  | 'failed'
+  | 'cancelled'
+  | 'expired';
+
+export interface VerifyBookingPaymentStatusResult {
+  verified: boolean;
+  status: AuthoritativeBookingStatus;
+  reservation_id?: string;
+  reference_code?: string;
+  payment_id?: string;
+  payment_status?: string;
+  hold_expires_at?: string;
+  total_price?: number;
+  currency?: string;
+  facility_name?: string;
+  court_name?: string;
+  booking_date?: string;
+  time_slot_label?: string;
+  confirmed_at?: string;
+  error?: string;
+}
+
+/**
+ * Authoritative payment status retrieval:
+ * Queries the backend for server-verified reservation and payment state using
+ * reference_code and reservation_id.
+ * 
+ * Never marks a reservation paid from frontend state.
+ * Fails closed if the backend returns incomplete or unverifiable state.
+ */
+export async function verifyPublicBookingPaymentStatus(input: {
+  reference_code: string;
+  reservation_id: string;
+  payment_id?: string;
+  customer_phone_or_email?: string;
+}): Promise<VerifyBookingPaymentStatusResult> {
+  const refCode = input.reference_code.trim();
+  const resId = input.reservation_id.trim();
+
+  if (!refCode || !resId) {
+    return {
+      verified: false,
+      status: 'failed',
+      error: 'Missing required reservation reference or ID for status verification.',
+    };
+  }
+
+  // If Supabase URL is available, invoke the secure backend status endpoint / function
+  if (supabaseUrl) {
+    try {
+      const endpoint = `${supabaseUrl}/functions/v1/get-booking-status`;
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          apikey: supabasePublishableKey,
+          Authorization: `Bearer ${supabasePublishableKey}`,
+        },
+        body: JSON.stringify({
+          reference_code: refCode,
+          reservation_id: resId,
+          payment_id: input.payment_id,
+          contact: input.customer_phone_or_email,
+        }),
+      });
+
+      if (res.ok) {
+        const json = await res.json().catch(() => null);
+        if (json && json.success) {
+          const rawStatus = String(json.status || json.reservation_status || '').toLowerCase().trim();
+          let status: AuthoritativeBookingStatus = 'pending';
+          if (rawStatus === 'confirmed' || rawStatus === 'captured') status = 'confirmed';
+          else if (rawStatus === 'processing') status = 'processing';
+          else if (rawStatus === 'expired') status = 'expired';
+          else if (rawStatus === 'cancelled') status = 'cancelled';
+          else if (rawStatus === 'failed') status = 'failed';
+
+          return {
+            verified: status === 'confirmed',
+            status,
+            reservation_id: json.reservation_id || resId,
+            reference_code: json.reference_code || refCode,
+            payment_id: json.payment_id,
+            payment_status: json.payment_status,
+            hold_expires_at: json.hold_expires_at,
+            total_price: json.total_price ? Number(json.total_price) : undefined,
+            currency: json.currency || '₱',
+            facility_name: json.facility_name,
+            court_name: json.court_name,
+            booking_date: json.booking_date,
+            time_slot_label: json.time_slot_label,
+            confirmed_at: json.confirmed_at || json.updated_at,
+          };
+        }
+      }
+    } catch {
+      // Fall through to database RPC or fail-closed handling
+    }
+  }
+
+  // Direct database RPC fallback: get_public_booking_status
+  if (supabase) {
+    try {
+      const { data, error } = await supabase.rpc('get_public_booking_status', {
+        p_reference_code: refCode,
+        p_reservation_id: resId,
+      });
+
+      if (!error && data && data.success) {
+        const rawStatus = String(data.status || data.reservation_status || '').toLowerCase().trim();
+        let status: AuthoritativeBookingStatus = 'pending';
+        if (rawStatus === 'confirmed' || rawStatus === 'captured') status = 'confirmed';
+        else if (rawStatus === 'processing') status = 'processing';
+        else if (rawStatus === 'expired') status = 'expired';
+        else if (rawStatus === 'cancelled') status = 'cancelled';
+        else if (rawStatus === 'failed') status = 'failed';
+
+        return {
+          verified: status === 'confirmed',
+          status,
+          reservation_id: data.reservation_id || resId,
+          reference_code: data.reference_code || refCode,
+          payment_id: data.payment_id,
+          payment_status: data.payment_status,
+          hold_expires_at: data.hold_expires_at,
+          total_price: data.total_price ? Number(data.total_price) : undefined,
+          currency: data.currency || '₱',
+          facility_name: data.facility_name,
+          court_name: data.court_name,
+          booking_date: data.booking_date,
+          time_slot_label: data.time_slot_label,
+          confirmed_at: data.confirmed_at || data.updated_at,
+        };
+      }
+    } catch {
+      // Fail closed
+    }
+  }
+
+  // Fails closed: Server verification is unavailable or unconfirmed
+  return {
+    verified: false,
+    status: 'pending',
+    error: 'Backend payment status verification is in progress or currently unreachable. Please refresh to check confirmation.',
+  };
+}
+
 // Re-export slug utilities
 export { slugify, isValidSlug, validateSlug } from '../utils/slugify';
 

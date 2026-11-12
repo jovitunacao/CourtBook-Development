@@ -1,5 +1,0 @@
-{
-  "summary":  "Phase 4.2.3 Migration 005B PostgreSQL 15.19 Validation Evidence Log. Reports 4/4 passed gates: baseline migrations 001-005a1 and 005B execution, schema/table constraints verification, complete 21-test fixture suite with explicit notices, and 2-session independent concurrency tests (Test 22).",
-  "updatedAt":  "2026-11-01T00:29:43.826294254Z",
-  "userFacing":  true
-}

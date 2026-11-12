@@ -18,7 +18,10 @@ interface PaymentCheckoutBridgeProps {
   isLoading: boolean;
   errorMessage: string | null;
   isDemoFacility?: boolean;
+  isCheckingStatus?: boolean;
+  statusMessage?: string | null;
   onSimulateSuccess: () => void;
+  onCheckPaymentStatus?: () => void;
   onRetry: () => void;
   onCancel: () => void;
 }
@@ -28,7 +31,10 @@ export const PaymentCheckoutBridge: React.FC<PaymentCheckoutBridgeProps> = ({
   isLoading,
   errorMessage,
   isDemoFacility = false,
+  isCheckingStatus = false,
+  statusMessage = null,
   onSimulateSuccess,
+  onCheckPaymentStatus,
   onRetry,
   onCancel,
 }) => {
@@ -214,14 +220,33 @@ export const PaymentCheckoutBridge: React.FC<PaymentCheckoutBridgeProps> = ({
               </p>
             </div>
           ) : (
-            <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-2xl text-center space-y-1">
-              <div className="text-xs font-bold text-slate-700 flex items-center justify-center gap-1.5">
-                <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-600" />
-                <span>Awaiting Authoritative Webhook Confirmation</span>
+            <div className="p-4 bg-slate-50 border border-slate-200 rounded-2xl text-center space-y-3">
+              <div className="space-y-1">
+                <div className="text-xs font-bold text-slate-800 flex items-center justify-center gap-1.5">
+                  <Loader2 className={`w-3.5 h-3.5 ${isCheckingStatus ? 'animate-spin text-blue-600' : 'text-slate-400'}`} />
+                  <span>{isCheckingStatus ? 'Verifying Authoritative Backend Status...' : 'Awaiting Authoritative Payment Capture'}</span>
+                </div>
+                <p className="text-[11px] text-slate-500 max-w-sm mx-auto">
+                  Complete your payment on the PayMongo checkout window. Once confirmed by the webhook, click below to verify and receive your digital pass.
+                </p>
+                {statusMessage && (
+                  <p className="text-[11px] text-amber-700 font-medium pt-1">
+                    {statusMessage}
+                  </p>
+                )}
               </div>
-              <p className="text-[11px] text-slate-500">
-                Complete payment on the PayMongo hosted window above. Once the webhook arrives, your reservation is verified in real-time.
-              </p>
+
+              {onCheckPaymentStatus && (
+                <button
+                  type="button"
+                  onClick={onCheckPaymentStatus}
+                  disabled={isCheckingStatus}
+                  className="w-full py-3 px-4 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-xs font-bold flex items-center justify-center gap-1.5 transition-colors cursor-pointer shadow-xs"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isCheckingStatus ? 'animate-spin' : ''}`} />
+                  <span>{isCheckingStatus ? 'Checking Status...' : 'I Have Paid — Check My Booking Status'}</span>
+                </button>
+              )}
             </div>
           )}
         </div>

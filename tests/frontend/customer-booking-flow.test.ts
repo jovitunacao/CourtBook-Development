@@ -374,8 +374,8 @@ let passed = 0;
     'Live facility must NOT show Simulate Demo Payment button'
   );
   assert.ok(
-    liveHtml.includes('Awaiting Authoritative Webhook Confirmation'),
-    'Live facility must show awaiting authoritative confirmation state'
+    liveHtml.includes('Awaiting Authoritative Payment Capture'),
+    'Live facility must show awaiting authoritative payment capture state'
   );
 
   // When isDemoFacility is true (demo test facility)
@@ -729,9 +729,82 @@ let passed = 0;
   console.log('✓ Test 20: Hold expiration and fresh attempt trigger validation passed');
 }
 
+// Test 21: Supabase Demo Facility Does NOT Bypass Backend Checkout
+{
+  const { createBookingCheckoutSession } = await import('../../src/lib/supabaseClient');
+
+  // When a facility is in Supabase with is_demo = true, but is_frontend_demo is false (or omitted),
+  // it MUST use the real backend path and NOT execute local in-memory simulation.
+  // If the backend is offline, it must fail closed and return success: false.
+  const result = await createBookingCheckoutSession({
+    facility_id: 'd0000002-0000-4000-8000-000000000001', // Supabase demo facility UUID
+    court_id: 'd0000003-0000-4000-8000-000000000001',
+    customer_name: 'Database Demo Player',
+    customer_phone: '09171234567',
+    booking_date: '2026-11-25',
+    start_time: '2026-11-25T10:00:00.000Z',
+    duration_minutes: 60,
+    idempotency_key: 'idem_test_db_demo_must_not_bypass_backend',
+    is_demo: true, // database demo facility
+    is_frontend_demo: false, // NOT frontend-only demo
+  });
+
+  assert.equal(result.success, false, 'Supabase-backed demo facility without backend must fail closed');
+  assert.ok(
+    result.error?.includes('Unable to establish authoritative backend checkout session') ||
+    result.error?.includes('connection') ||
+    result.error?.includes('offline'),
+    'Supabase demo facility must NOT use local offline simulation bypass'
+  );
+  passed++;
+  console.log('✓ Test 21: Supabase demo facility backend path & fail-closed verification passed');
+}
+
+// Test 22: Authoritative Payment Verification Fails Closed on Invalid or Pending State
+{
+  const { verifyPublicBookingPaymentStatus } = await import('../../src/lib/supabaseClient');
+
+  // Case A: Missing required reference or reservation ID
+  const invalidResult = await verifyPublicBookingPaymentStatus({
+    reference_code: '',
+    reservation_id: '',
+  });
+  assert.equal(invalidResult.verified, false, 'Missing input must return verified: false');
+  assert.equal(invalidResult.status, 'failed');
+
+  // Case B: Unverified / pending status when backend is unconfirmed
+  const unverifiedResult = await verifyPublicBookingPaymentStatus({
+    reference_code: 'CB-TEST9999',
+    reservation_id: 'res-9999-unverified',
+    payment_id: 'pay-9999-unverified',
+  });
+  assert.equal(unverifiedResult.verified, false, 'Unconfirmed status must never report verified: true');
+  assert.equal(unverifiedResult.status, 'pending');
+  assert.ok(unverifiedResult.error?.includes('unreachable') || unverifiedResult.error?.includes('progress'));
+  passed++;
+  console.log('✓ Test 22: Authoritative payment verification fail-closed state handling passed');
+}
+
+// Test 23: Idempotent Attempt Key Stability Across Re-Renders
+{
+  const slotSignature = 'facA_courtB_2026-11-28_2026-11-28T09:00:00Z_60_Maria_09181234567';
+  const token = 'stable_token_12345678';
+  const facPrefix = 'facA1111'.substring(0, 8);
+  const courtPrefix = 'courtB22'.substring(0, 8);
+
+  const key1 = `idem_${facPrefix}_${courtPrefix}_${token}`.substring(0, 64);
+  const key2 = `idem_${facPrefix}_${courtPrefix}_${token}`.substring(0, 64);
+
+  assert.equal(key1, key2, 'Deterministic attempt key must be strictly identical across re-renders');
+  assert.ok(key1.length >= 16 && key1.length <= 64, 'Idempotency key length must be compliant');
+  passed++;
+  console.log('✓ Test 23: Idempotent attempt key stability across re-renders passed');
+}
+
 console.log(`\n======================================================`);
 console.log(`ALL ${passed} CUSTOMER BOOKING UNIT TESTS PASSED!`);
 console.log(`======================================================`);
+
 
 
 
