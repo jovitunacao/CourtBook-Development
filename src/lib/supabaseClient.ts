@@ -1201,9 +1201,9 @@ export interface CreateBookingCheckoutResult {
 }
 
 /**
- * Creates an authoritative booking checkout session via create-checkout-session Edge Function
- * with graceful RPC fallback if the Edge Function is not reachable.
- * 
+ * Creates an authoritative booking checkout session via the create-checkout-session Edge Function.
+ * Strictly fails closed if the Edge Function is unavailable (never falls back to direct database RPC).
+ *
  * CRITICAL ISOLATION RULE:
  * If input.is_frontend_demo is true, returns immediately with an in-memory simulated checkout
  * without making ANY network calls to Supabase or PayMongo.
@@ -1266,9 +1266,8 @@ export async function createBookingCheckoutSession(
   }
 
   // ============================================================================
-  // LIVE SUPABASE-BACKED FACILITY CHECKOUT PATH
+  // LIVE & SUPABASE-BACKED DEMO CHECKOUT PATH (EDGE FUNCTION ONLY)
   // ============================================================================
-  // If Supabase URL is available, try Edge Function first
   if (supabaseUrl) {
     try {
       const endpoint = `${supabaseUrl}/functions/v1/create-checkout-session`;
@@ -1326,76 +1325,19 @@ export async function createBookingCheckoutSession(
         };
       }
 
-      if (json?.error && res.status !== 404) {
+      if (json?.error) {
         return {
           success: false,
           error: json.error,
         };
       }
     } catch {
-      // Edge function failed or offline, fall through to direct RPC / client fallback
+      // Edge Function failed or offline — fail closed below (no direct database RPC fallback)
     }
   }
 
-  // Fallback: Direct Database RPC invocation if Supabase client is connected
-  if (supabase) {
-    try {
-      const { data, error } = await supabase.rpc('create_booking_checkout_session', {
-        p_idempotency_key: idempotencyKey,
-        p_facility_id: input.facility_id,
-        p_court_id: input.court_id,
-        p_customer_name: input.customer_name,
-        p_customer_phone: input.customer_phone || null,
-        p_customer_email: input.customer_email || null,
-        p_booking_date: input.booking_date,
-        p_start_time: input.start_time,
-        p_duration_minutes: input.duration_minutes,
-        p_provider_name: input.provider_name || 'paymongo',
-      });
-
-      if (error) {
-        const isConflict =
-          error.message.includes('already reserved') ||
-          error.message.includes('exclusion_violation') ||
-          error.message.includes('conflicting hold');
-        return {
-          success: false,
-          isConflict,
-          error: isConflict
-            ? 'This court slot is currently held or already booked. Please choose another slot.'
-            : error.message,
-        };
-      }
-
-      if (data && data.success) {
-        return {
-          success: true,
-          reservation_id: data.reservation_id,
-          payment_id: data.payment_id,
-          reference_code: data.reference_code,
-          checkout_session_id: data.checkout_session_id,
-          expected_amount: Number(data.expected_amount),
-          currency: data.currency || '₱',
-          commission_rate: Number(data.commission_rate || 0.05),
-          commission_amount: Number(data.commission_amount || 0),
-          owner_gross_share: Number(data.owner_gross_share || 0),
-          hold_expires_at: data.hold_expires_at,
-          time_slot_label: data.time_slot_label,
-          court_name: data.court_name,
-          checkout_url: `https://checkout.paymongo.com/${data.checkout_session_id}`,
-          isSimulated: Boolean(input.is_demo),
-        };
-      }
-    } catch (rpcErr: any) {
-      return {
-        success: false,
-        error: rpcErr?.message || 'Database error initializing checkout session.',
-      };
-    }
-  }
-
-  // Strict Fail-Closed Rule for Live / Supabase-backed Facilities:
-  // If Edge Function and Database RPC could not be completed, NEVER fabricate simulated reservation or payment IDs.
+  // Strict Fail-Closed Rule for Live & Supabase-backed Facilities:
+  // If the Edge Function is unavailable or fails, NEVER bypass via direct RPC or fabricate payment URLs.
   return {
     success: false,
     error: 'Unable to establish authoritative backend checkout session with payment provider. Please verify connection and retry.',

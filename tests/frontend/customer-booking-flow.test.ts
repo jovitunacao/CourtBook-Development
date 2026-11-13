@@ -1023,6 +1023,189 @@ let passed = 0;
   console.log('✓ Test 27: Failed and expired status handling passed');
 }
 
+// Test 28: Phase 5.7C — Edge-Function-Only Checkout & Zero Direct RPC Fallback
+{
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+
+  const prevUrl = process.env.VITE_SUPABASE_URL;
+  const prevKey = process.env.VITE_SUPABASE_PUBLISHABLE_KEY;
+  process.env.VITE_SUPABASE_URL = 'https://phase57c-test.supabase.co';
+  process.env.VITE_SUPABASE_PUBLISHABLE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.phase57c_publishable_test_key_value';
+
+  const originalFetch = globalThis.fetch;
+
+  try {
+    const mod = await import('../../src/lib/supabaseClient?phase57c=' + Date.now());
+    assert.ok(mod.supabase, 'Configured test module must initialize Supabase client');
+
+    let rpcCallCount = 0;
+    const origRpc = mod.supabase.rpc.bind(mod.supabase);
+    (mod.supabase as any).rpc = async (fnName: string, ...args: any[]) => {
+      rpcCallCount++;
+      throw new Error(`FORBIDDEN: Direct client RPC fallback invoked for ${fnName}`);
+    };
+
+    try {
+      // Case A: Frontend-only fictional demo simulation still works with zero network / RPC calls
+      let fetchCalls = 0;
+      globalThis.fetch = async () => {
+        fetchCalls++;
+        throw new Error('Must not call network in frontend-only demo');
+      };
+
+      const frontendDemoRes = await mod.createBookingCheckoutSession({
+        facility_id: 'd0000002-0000-4000-8000-000000000001',
+        court_id: 'd0000003-0000-4000-8000-000000000001',
+        customer_name: 'Demo Player',
+        customer_phone: '09171234567',
+        booking_date: '2026-11-26',
+        start_time: '2026-11-26T08:00:00.000Z',
+        duration_minutes: 60,
+        hourly_rate: 450,
+        idempotency_key: 'idem_phase57c_frontend_demo_123456',
+        is_frontend_demo: true,
+      });
+      assert.equal(frontendDemoRes.success, true);
+      assert.equal(frontendDemoRes.isSimulated, true);
+      assert.equal(frontendDemoRes.expected_amount, 450);
+      assert.equal(frontendDemoRes.checkout_url, undefined);
+      assert.equal(fetchCalls, 0);
+      assert.equal(rpcCallCount, 0);
+
+      // Case B: Live booking succeeds via create-checkout-session Edge Function
+      const edgeUrlsCalled: string[] = [];
+      globalThis.fetch = async (url: any) => {
+        edgeUrlsCalled.push(String(url));
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            success: true,
+            reservation_id: 'res-edge-111',
+            payment_id: 'pay-edge-111',
+            reference_code: 'CB-EDGE1111',
+            checkout_session_id: 'cs_live_real_123',
+            expected_amount: 500,
+            currency: '₱',
+            commission_rate: 0.05,
+            commission_amount: 25,
+            owner_gross_share: 475,
+            hold_expires_at: '2099-01-01T00:00:00.000Z',
+            time_slot_label: '08:00 AM – 09:00 AM',
+            court_name: 'Center Court',
+            checkout_url: 'https://checkout.paymongo.com/cs_live_real_123',
+            lookup_token: 'tok_signed_abc',
+            is_simulated: false,
+          }),
+        } as any;
+      };
+
+      const liveSuccessRes = await mod.createBookingCheckoutSession({
+        facility_id: '11111111-1111-4111-8111-111111111111',
+        court_id: '22222222-2222-4222-8222-222222222222',
+        customer_name: 'Live Customer',
+        customer_phone: '09171234567',
+        booking_date: '2026-11-26',
+        start_time: '2026-11-26T08:00:00.000Z',
+        duration_minutes: 60,
+        idempotency_key: 'idem_phase57c_live_success_123456',
+        is_demo: false,
+        is_frontend_demo: false,
+      });
+      assert.equal(liveSuccessRes.success, true);
+      assert.equal(liveSuccessRes.checkout_url, 'https://checkout.paymongo.com/cs_live_real_123');
+      assert.equal(liveSuccessRes.lookup_token, 'tok_signed_abc');
+      assert.ok(edgeUrlsCalled[0].endsWith('/functions/v1/create-checkout-session'));
+      assert.equal(rpcCallCount, 0);
+
+      // Case C: Live booking conflict (409) preserved without RPC fallback
+      globalThis.fetch = async () => {
+        return {
+          ok: false,
+          status: 409,
+          json: async () => ({
+            success: false,
+            error: 'Selected court time slot is already reserved.',
+          }),
+        } as any;
+      };
+
+      const conflictRes = await mod.createBookingCheckoutSession({
+        facility_id: '11111111-1111-4111-8111-111111111111',
+        court_id: '22222222-2222-4222-8222-222222222222',
+        customer_name: 'Live Customer',
+        customer_phone: '09171234567',
+        booking_date: '2026-11-26',
+        start_time: '2026-11-26T08:00:00.000Z',
+        duration_minutes: 60,
+        idempotency_key: 'idem_phase57c_conflict_123456',
+        is_demo: false,
+        is_frontend_demo: false,
+      });
+      assert.equal(conflictRes.success, false);
+      assert.equal(conflictRes.isConflict, true);
+      assert.equal(conflictRes.checkout_url, undefined);
+      assert.equal(rpcCallCount, 0);
+
+      // Case D: Edge Function unavailable (404 / network error) fails closed WITHOUT direct RPC or fake payment URL
+      for (const mode of ['404', 'network_error'] as const) {
+        globalThis.fetch = async () => {
+          if (mode === '404') {
+            return {
+              ok: false,
+              status: 404,
+              json: async () => ({ error: 'Edge Function not deployed' }),
+            } as any;
+          }
+          throw new Error('Network unreachable');
+        };
+
+        // Both live (is_demo: false) and Supabase-backed demo (is_demo: true, is_frontend_demo: false) must fail closed
+        for (const isDbDemo of [false, true]) {
+          const failRes = await mod.createBookingCheckoutSession({
+            facility_id: 'd0000002-0000-4000-8000-000000000001',
+            court_id: 'd0000003-0000-4000-8000-000000000001',
+            customer_name: 'Backend Checkout Guest',
+            customer_phone: '09171234567',
+            booking_date: '2026-11-26',
+            start_time: '2026-11-26T08:00:00.000Z',
+            duration_minutes: 60,
+            idempotency_key: `idem_phase57c_fail_${mode}_${isDbDemo}_123456`,
+            is_demo: isDbDemo,
+            is_frontend_demo: false,
+          });
+          assert.equal(failRes.success, false, `Checkout must fail closed on ${mode} (is_demo=${isDbDemo})`);
+          assert.equal(failRes.checkout_url, undefined, 'Failed checkout must NEVER return a fabricated payment URL');
+          assert.equal(rpcCallCount, 0, 'Must NEVER invoke direct supabase.rpc fallback');
+        }
+      }
+    } finally {
+      (mod.supabase as any).rpc = origRpc;
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (prevUrl === undefined) delete process.env.VITE_SUPABASE_URL;
+    else process.env.VITE_SUPABASE_URL = prevUrl;
+    if (prevKey === undefined) delete process.env.VITE_SUPABASE_PUBLISHABLE_KEY;
+    else process.env.VITE_SUPABASE_PUBLISHABLE_KEY = prevKey;
+  }
+
+  // Static guard: verify supabaseClient.ts contains zero privileged checkout RPC calls or fabricated PayMongo URLs
+  const clientSource = fs.readFileSync(path.resolve(process.cwd(), 'src/lib/supabaseClient.ts'), 'utf8');
+  assert.ok(
+    !clientSource.includes('create_booking_checkout_session'),
+    'src/lib/supabaseClient.ts must NOT call create_booking_checkout_session directly'
+  );
+  assert.ok(
+    !clientSource.includes('checkout.paymongo.com/'),
+    'src/lib/supabaseClient.ts must NOT construct fabricated PayMongo checkout URLs'
+  );
+
+  passed++;
+  console.log('✓ Test 28: Edge-Function-only checkout, zero RPC fallback, and zero fabricated URLs passed');
+}
+
 console.log(`\n======================================================`);
 console.log(`ALL ${passed} CUSTOMER BOOKING UNIT TESTS PASSED!`);
 console.log(`======================================================`);
