@@ -12,6 +12,7 @@
 
 import { serve } from 'https://deno.land/std@0.177.0/http/server.ts';
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.117.3';
+import { mintGuestLookupToken } from '../_shared/guestLookupToken.ts';
 
 const corsHeaders: Record<string, string> = {
   'Access-Control-Allow-Origin': '*',
@@ -103,9 +104,17 @@ serve(async (req: Request) => {
       );
     }
 
+    const lookupSecret = Deno.env.get('BOOKING_LOOKUP_TOKEN_SECRET') || supabaseServiceKey;
+    const lookupToken = await mintGuestLookupToken({
+      reservationId: String(data.reservation_id),
+      referenceCode: String(data.reference_code),
+      secret: lookupSecret,
+      ttlSeconds: 86400,
+    });
+
     // 2. If already bound and replayed idempotently, return existing session details
     if (data.idempotent_replayed && data.checkout_url && !data.checkout_session_id.startsWith('cs_pending_')) {
-      return new Response(JSON.stringify(data), {
+      return new Response(JSON.stringify({ ...data, lookup_token: lookupToken }), {
         status: 200,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       });
@@ -192,8 +201,8 @@ serve(async (req: Request) => {
               ],
               payment_method_types: ['card', 'gcash', 'paymaya', 'grab_pay'],
               reference_number: data.reference_code,
-              success_url: `${appBaseUrl}/booking/success?ref=${data.reference_code}`,
-              cancel_url: `${appBaseUrl}/booking/cancelled?ref=${data.reference_code}`,
+              success_url: `${appBaseUrl}/booking/success?ref=${data.reference_code}&token=${encodeURIComponent(lookupToken)}`,
+              cancel_url: `${appBaseUrl}/booking/cancelled?ref=${data.reference_code}&token=${encodeURIComponent(lookupToken)}`,
               metadata: {
                 reservation_id: data.reservation_id,
                 payment_id: data.payment_id,
@@ -284,14 +293,15 @@ serve(async (req: Request) => {
         ...data,
         checkout_session_id: providerCheckoutId,
         checkout_url: checkoutUrl,
+        lookup_token: lookupToken,
         is_simulated: isSimulated,
       }),
       { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[create-checkout-session] Unhandled exception:', err);
     return new Response(
-      JSON.stringify({ error: 'Internal server error', details: msg }),
+      JSON.stringify({ error: 'Unable to initialize checkout session. Please try again.' }),
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   }

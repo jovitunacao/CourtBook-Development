@@ -1193,6 +1193,7 @@ export interface CreateBookingCheckoutResult {
   time_slot_label?: string;
   court_name?: string;
   checkout_url?: string;
+  lookup_token?: string;
   idempotent_replayed?: boolean;
   isConflict?: boolean;
   isSimulated?: boolean;
@@ -1311,6 +1312,7 @@ export async function createBookingCheckoutSession(
           time_slot_label: json.time_slot_label,
           court_name: json.court_name,
           checkout_url: json.checkout_url,
+          lookup_token: json.lookup_token,
           idempotent_replayed: Boolean(json.idempotent_replayed),
           isSimulated: Boolean(json.is_simulated),
         };
@@ -1418,36 +1420,45 @@ export interface VerifyBookingPaymentStatusResult {
   hold_expires_at?: string;
   total_price?: number;
   currency?: string;
+  duration_minutes?: number;
+  customer_name?: string;
   facility_name?: string;
+  facility_address?: string;
   court_name?: string;
+  sport_type?: string;
   booking_date?: string;
   time_slot_label?: string;
   confirmed_at?: string;
+  settlement_verified?: boolean;
+  has_capture_evidence?: boolean;
   error?: string;
 }
 
 /**
  * Authoritative payment status retrieval:
- * Queries the backend for server-verified reservation and payment state using
- * reference_code and reservation_id.
+ * Queries the backend for server-verified reservation, payment, and settlement state.
+ * Supports recovery via unguessable reservation_id, customer contact verification, or token.
  * 
  * Never marks a reservation paid from frontend state.
  * Fails closed if the backend returns incomplete or unverifiable state.
  */
 export async function verifyPublicBookingPaymentStatus(input: {
   reference_code: string;
-  reservation_id: string;
+  reservation_id?: string;
   payment_id?: string;
   customer_phone_or_email?: string;
+  lookup_token?: string;
 }): Promise<VerifyBookingPaymentStatusResult> {
   const refCode = input.reference_code.trim();
-  const resId = input.reservation_id.trim();
+  const resId = (input.reservation_id || '').trim();
+  const contact = (input.customer_phone_or_email || '').trim();
+  const token = (input.lookup_token || '').trim();
 
-  if (!refCode || !resId) {
+  if (!refCode || (!resId && !contact && !token)) {
     return {
       verified: false,
       status: 'failed',
-      error: 'Missing required reservation reference or ID for status verification.',
+      error: 'Missing required reservation reference, ID, or customer contact for status verification.',
     };
   }
 
@@ -1468,58 +1479,78 @@ export async function verifyPublicBookingPaymentStatus(input: {
     const res = await fetch(endpoint, {
       method: 'POST',
       headers,
-        body: JSON.stringify({
-          reference_code: refCode,
-          reservation_id: resId,
-          payment_id: input.payment_id,
-          contact: input.customer_phone_or_email,
-        }),
-      });
+      body: JSON.stringify({
+        reference_code: refCode,
+        reservation_id: resId || undefined,
+        payment_id: input.payment_id,
+        contact: contact || undefined,
+        lookup_token: token || undefined,
+      }),
+    });
 
-      if (res.ok) {
+    if (res.ok) {
+      const json = await res.json().catch(() => null);
+      // Authoritative verification contract:
+      // Must contain success: true, matching reference_code and matching reservation_id (if specified)
+      if (
+        json &&
+        json.success === true &&
+        json.reference_code === refCode &&
+        (!resId || json.reservation_id === resId)
+      ) {
+        const rawStatus = String(json.status || json.reservation_status || '').toLowerCase().trim();
+        let status: AuthoritativeBookingStatus = 'pending';
+        if (rawStatus === 'confirmed' || rawStatus === 'captured') status = 'confirmed';
+        else if (rawStatus === 'processing') status = 'processing';
+        else if (rawStatus === 'expired') status = 'expired';
+        else if (rawStatus === 'cancelled') status = 'cancelled';
+        else if (rawStatus === 'failed') status = 'failed';
+
+        // Strictly require verified flag, capture evidence, and settlement verification from backend
+        const hasCaptureEvidence = Boolean(json.has_capture_evidence);
+        const settlementVerified = Boolean(json.settlement_verified);
+        const verified =
+          Boolean(json.verified) &&
+          status === 'confirmed' &&
+          hasCaptureEvidence &&
+          settlementVerified;
+
+        return {
+          verified,
+          status: verified ? 'confirmed' : status === 'confirmed' ? 'processing' : status,
+          reservation_id: json.reservation_id,
+          reference_code: json.reference_code,
+          payment_id: json.payment_id,
+          payment_status: json.payment_status,
+          hold_expires_at: json.hold_expires_at,
+          total_price: json.total_price !== undefined ? Number(json.total_price) : undefined,
+          currency: json.currency || '₱',
+          duration_minutes: json.duration_minutes !== undefined ? Number(json.duration_minutes) : undefined,
+          customer_name: json.customer_name,
+          facility_name: json.facility_name,
+          facility_address: json.facility_address,
+          court_name: json.court_name,
+          sport_type: json.sport_type,
+          booking_date: json.booking_date,
+          time_slot_label: json.time_slot_label,
+          confirmed_at: verified ? json.confirmed_at || undefined : undefined,
+          settlement_verified: settlementVerified,
+          has_capture_evidence: hasCaptureEvidence,
+        };
+      } else if (json && json.error) {
+        return {
+          verified: false,
+          status: 'failed',
+          error: json.error,
+        };
+      }
+      } else if (res.status === 403) {
         const json = await res.json().catch(() => null);
-        // Authoritative verification contract:
-        // Must contain success: true, matching reference_code and reservation_id
-        if (
-          json &&
-          json.success === true &&
-          json.reference_code === refCode &&
-          json.reservation_id === resId
-        ) {
-          const rawStatus = String(json.status || json.reservation_status || '').toLowerCase().trim();
-          let status: AuthoritativeBookingStatus = 'pending';
-          if (rawStatus === 'confirmed' || rawStatus === 'captured') status = 'confirmed';
-          else if (rawStatus === 'processing') status = 'processing';
-          else if (rawStatus === 'expired') status = 'expired';
-          else if (rawStatus === 'cancelled') status = 'cancelled';
-          else if (rawStatus === 'failed') status = 'failed';
-
-          // Strictly require verified flag from backend
-          const verified = Boolean(json.verified) && status === 'confirmed';
-
-          return {
-            verified,
-            status,
-            reservation_id: json.reservation_id,
-            reference_code: json.reference_code,
-            payment_id: json.payment_id,
-            payment_status: json.payment_status,
-            hold_expires_at: json.hold_expires_at,
-            total_price: json.total_price ? Number(json.total_price) : undefined,
-            currency: json.currency || '₱',
-            facility_name: json.facility_name,
-            court_name: json.court_name,
-            booking_date: json.booking_date,
-            time_slot_label: json.time_slot_label,
-            confirmed_at: json.confirmed_at || json.updated_at,
-          };
-        } else if (json && json.error) {
-          return {
-            verified: false,
-            status: 'failed',
-            error: json.error,
-          };
-        }
+        return {
+          verified: false,
+          status: 'failed',
+          error: json?.error || 'Access denied. Booking lookup verification failed.',
+        };
       } else if (res.status === 404) {
         return {
           verified: false,
@@ -1531,6 +1562,13 @@ export async function verifyPublicBookingPaymentStatus(input: {
           verified: false,
           status: 'pending',
           error: 'Rate limit exceeded. Please wait a moment before checking status again.',
+        };
+      } else if (res.status === 400) {
+        const json = await res.json().catch(() => null);
+        return {
+          verified: false,
+          status: 'failed',
+          error: json?.error || 'Invalid booking lookup request parameters.',
         };
       }
     } catch {

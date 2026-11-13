@@ -830,7 +830,11 @@ let passed = 0;
         court_name: 'Center Court',
         booking_date: '2026-11-20',
         time_slot_label: '08:00 AM – 09:00 AM',
+        duration_minutes: 60,
+        customer_name: 'Maria Santos',
         confirmed_at: '2026-11-20T08:05:00.000Z',
+        has_capture_evidence: true,
+        settlement_verified: true,
       }),
     } as any;
   };

@@ -406,6 +406,14 @@ function CourtBookMainContent() {
           {/* Aliases & Redirects */}
           <Route path="/book" element={<Navigate to="/book/sport" replace />} />
           <Route path="/venues" element={<Navigate to="/book/venues" replace />} />
+          <Route
+            path="/booking/success"
+            element={<Navigate to={`/book/confirmation${location.search}`} replace />}
+          />
+          <Route
+            path="/booking/cancelled"
+            element={<Navigate to={`/book/payment${location.search}`} replace />}
+          />
 
           {/* Administrative Views */}
           <Route

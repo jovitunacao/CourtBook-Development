@@ -229,7 +229,17 @@ export const CustomerBookingProvider: React.FC<{ children: React.ReactNode }> = 
     return '';
   });
 
-  const [checkoutResult, setCheckoutResult] = useState<CreateBookingCheckoutResult | null>(null);
+  const [checkoutResult, setCheckoutResult] = useState<CreateBookingCheckoutResult | null>(() => {
+    try {
+      const stored = sessionStorage.getItem(STORAGE_KEY);
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        return parsed.checkoutResult || null;
+      }
+    } catch {}
+    return null;
+  });
+
   const [confirmedPassDetails, setConfirmedPassDetails] = useState<CustomerConfirmationDetails | null>(() => {
     try {
       const stored = sessionStorage.getItem(STORAGE_KEY);
@@ -255,6 +265,7 @@ export const CustomerBookingProvider: React.FC<{ children: React.ReactNode }> = 
         customerName,
         customerPhone,
         customerEmail,
+        checkoutResult,
         confirmedPassDetails,
       };
       sessionStorage.setItem(STORAGE_KEY, JSON.stringify(draft));
@@ -272,6 +283,7 @@ export const CustomerBookingProvider: React.FC<{ children: React.ReactNode }> = 
     customerName,
     customerPhone,
     customerEmail,
+    checkoutResult,
     confirmedPassDetails,
   ]);
 
