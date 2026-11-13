@@ -65,10 +65,29 @@ export const ConfirmationPage: React.FC = () => {
     confirmedPassDetails,
     setConfirmedPassDetails,
     checkoutResult,
+    setCheckoutResult,
     customerPhone,
     customerEmail,
     resetBooking,
   } = useCustomerBooking();
+
+  // Capture one-time URL credentials into ephemeral component state and strip them from the browser URL/history
+  const [capturedToken, setCapturedToken] = useState<string | null>(() => queryToken);
+  const [capturedResId, setCapturedResId] = useState<string | null>(() => queryRes);
+  const [capturedPayId, setCapturedPayId] = useState<string | null>(() => queryPay);
+
+  useEffect(() => {
+    if (queryToken && queryToken !== capturedToken) setCapturedToken(queryToken);
+    if (queryRes && queryRes !== capturedResId) setCapturedResId(queryRes);
+    if (queryPay && queryPay !== capturedPayId) setCapturedPayId(queryPay);
+
+    if (queryToken || queryRes || queryPay) {
+      const nextUrl = queryRef
+        ? `/book/confirmation?ref=${encodeURIComponent(queryRef)}`
+        : '/book/confirmation';
+      navigate(nextUrl, { replace: true });
+    }
+  }, [queryRef, queryToken, queryRes, queryPay, capturedToken, capturedResId, capturedPayId, navigate]);
 
   const [isLoadingRef, setIsLoadingRef] = useState<boolean>(false);
   const [refError, setRefError] = useState<string | null>(null);
@@ -76,18 +95,19 @@ export const ConfirmationPage: React.FC = () => {
   const [recoveryContact, setRecoveryContact] = useState<string>('');
   const [isVerifyingContact, setIsVerifyingContact] = useState<boolean>(false);
 
-  const hasAutoVerificationCredential = Boolean(
-    queryToken || queryRes || checkoutResult?.lookup_token || checkoutResult?.reservation_id
-  );
+  const effectiveToken = capturedToken || checkoutResult?.lookup_token || '';
+  const effectiveContact = (customerPhone || customerEmail || '').trim();
+  const hasAutoVerificationCredential = Boolean(effectiveToken || effectiveContact);
 
   const runAuthoritativeLookup = useCallback(async () => {
     if (!queryRef) return;
 
-    const targetResId = queryRes || checkoutResult?.reservation_id;
-    const targetToken = queryToken || checkoutResult?.lookup_token;
-    if (!targetResId && !targetToken) {
+    if (!effectiveToken && !effectiveContact) {
       return;
     }
+
+    const targetResId = capturedResId || checkoutResult?.reservation_id;
+    const targetPayId = capturedPayId || checkoutResult?.payment_id;
 
     setIsLoadingRef(true);
     setRefError(null);
@@ -95,9 +115,9 @@ export const ConfirmationPage: React.FC = () => {
     const res = await verifyPublicBookingPaymentStatus({
       reference_code: queryRef,
       reservation_id: targetResId || undefined,
-      payment_id: queryPay || checkoutResult?.payment_id,
-      lookup_token: targetToken || undefined,
-      customer_phone_or_email: customerPhone || customerEmail || undefined,
+      payment_id: targetPayId || undefined,
+      lookup_token: effectiveToken || undefined,
+      customer_phone_or_email: effectiveContact || undefined,
     });
 
     setIsLoadingRef(false);
@@ -106,6 +126,11 @@ export const ConfirmationPage: React.FC = () => {
     const authoritativePass = buildAuthoritativeConfirmation(res);
     if (authoritativePass) {
       setConfirmedPassDetails(authoritativePass);
+      setCapturedToken(null);
+      if (checkoutResult?.lookup_token) {
+        const { lookup_token: _omitToken, ...rest } = checkoutResult;
+        setCheckoutResult(rest);
+      }
     } else if (res.verified && res.status === 'confirmed') {
       setRefError(
         'Server verified payment, but complete authoritative booking details were unavailable. Please refresh to retry.'
@@ -123,16 +148,16 @@ export const ConfirmationPage: React.FC = () => {
     }
   }, [
     queryRef,
-    queryToken,
-    queryRes,
-    queryPay,
+    effectiveToken,
+    effectiveContact,
+    capturedResId,
+    capturedPayId,
     checkoutResult,
-    customerPhone,
-    customerEmail,
+    setCheckoutResult,
     setConfirmedPassDetails,
   ]);
 
-  // Auto-verify when returning from hosted checkout with queryRef and credential (token or session reservation_id)
+  // Auto-verify when returning from hosted checkout with queryRef and valid authorization (token or guest contact)
   useEffect(() => {
     if (!queryRef || confirmedPassDetails || !hasAutoVerificationCredential) return;
     runAuthoritativeLookup();
@@ -148,8 +173,8 @@ export const ConfirmationPage: React.FC = () => {
 
     const res = await verifyPublicBookingPaymentStatus({
       reference_code: queryRef,
-      reservation_id: queryRes || undefined,
-      lookup_token: queryToken || undefined,
+      reservation_id: capturedResId || undefined,
+      lookup_token: effectiveToken || undefined,
       customer_phone_or_email: recoveryContact.trim(),
     });
 
@@ -159,6 +184,7 @@ export const ConfirmationPage: React.FC = () => {
     const authoritativePass = buildAuthoritativeConfirmation(res);
     if (authoritativePass) {
       setConfirmedPassDetails(authoritativePass);
+      setCapturedToken(null);
     } else {
       setRefError(
         res.error ||

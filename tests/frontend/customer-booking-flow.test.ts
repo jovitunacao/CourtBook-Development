@@ -764,7 +764,7 @@ let passed = 0;
 {
   const { verifyPublicBookingPaymentStatus } = await import('../../src/lib/supabaseClient');
 
-  // Case A: Missing required reference or reservation ID
+  // Case A: Missing required reference or guest credential (reservation_id alone is insufficient)
   const invalidResult = await verifyPublicBookingPaymentStatus({
     reference_code: '',
     reservation_id: '',
@@ -772,11 +772,19 @@ let passed = 0;
   assert.equal(invalidResult.verified, false, 'Missing input must return verified: false');
   assert.equal(invalidResult.status, 'failed');
 
-  // Case B: Unverified / pending status when backend is unconfirmed
+  const uuidOnlyResult = await verifyPublicBookingPaymentStatus({
+    reference_code: 'CB-TEST9999',
+    reservation_id: 'res-9999-unverified',
+  });
+  assert.equal(uuidOnlyResult.verified, false, 'reservation_id alone must fail closed');
+  assert.equal(uuidOnlyResult.status, 'failed');
+
+  // Case B: Unverified / pending status when backend is unreachable
   const unverifiedResult = await verifyPublicBookingPaymentStatus({
     reference_code: 'CB-TEST9999',
     reservation_id: 'res-9999-unverified',
     payment_id: 'pay-9999-unverified',
+    customer_phone_or_email: '09171234567',
   });
   assert.equal(unverifiedResult.verified, false, 'Unconfirmed status must never report verified: true');
   assert.equal(unverifiedResult.status, 'pending');
@@ -840,10 +848,20 @@ let passed = 0;
   };
 
   try {
+    // reservation_id alone without token or contact must fail closed
+    const unauthRes = await verifyPublicBookingPaymentStatus({
+      reference_code: mockReferenceCode,
+      reservation_id: mockReservationId,
+      payment_id: mockPaymentId,
+    });
+    assert.equal(unauthRes.verified, false, 'reservation_id alone must fail closed');
+    assert.equal(unauthRes.status, 'failed');
+
     const verifiedResult = await verifyPublicBookingPaymentStatus({
       reference_code: mockReferenceCode,
       reservation_id: mockReservationId,
       payment_id: mockPaymentId,
+      customer_phone_or_email: '09171234567',
     });
 
     assert.equal(verifiedResult.verified, true, 'Server-confirmed capture must report verified: true');
@@ -867,13 +885,13 @@ let passed = 0;
 
   const originalFetch = globalThis.fetch;
 
-  // Mock server returning reference code mismatch / 404
+  // Mock server returning reference code mismatch / 403
   globalThis.fetch = async () => {
     return {
       ok: false,
-      status: 404,
+      status: 403,
       json: async () => ({
-        error: 'Reservation not found or reference code mismatch',
+        error: 'Guest verification failed. Please check your booking reference and contact details.',
       }),
     } as any;
   };
@@ -882,11 +900,12 @@ let passed = 0;
     const result = await verifyPublicBookingPaymentStatus({
       reference_code: 'CB-FORGED99',
       reservation_id: 'd1111111-1111-4111-8111-111111111111',
+      customer_phone_or_email: '09171234567',
     });
 
     assert.equal(result.verified, false, 'Forged lookup must not verify');
     assert.equal(result.status, 'failed');
-    assert.ok(result.error?.includes('not found') || result.error?.includes('mismatch'));
+    assert.ok(result.error?.includes('verification failed') || result.error?.includes('mismatch'));
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -920,6 +939,7 @@ let passed = 0;
     const result = await verifyPublicBookingPaymentStatus({
       reference_code: 'CB-TEST123',
       reservation_id: 'target-uuid-sent',
+      customer_phone_or_email: '09171234567',
     });
 
     // Must fail closed because returned reservation_id does not match target-uuid-sent
@@ -960,6 +980,7 @@ let passed = 0;
     const expiredRes = await verifyPublicBookingPaymentStatus({
       reference_code: 'CB-EXPIRED',
       reservation_id: 'res-expired-111',
+      customer_phone_or_email: '09171234567',
     });
 
     assert.equal(expiredRes.verified, false);
@@ -989,6 +1010,7 @@ let passed = 0;
     const failedRes = await verifyPublicBookingPaymentStatus({
       reference_code: 'CB-FAILED',
       reservation_id: 'res-failed-111',
+      customer_phone_or_email: '09171234567',
     });
 
     assert.equal(failedRes.verified, false);

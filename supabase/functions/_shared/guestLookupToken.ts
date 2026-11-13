@@ -4,9 +4,12 @@
 // ==============================================================================
 
 const TOKEN_DOMAIN = 'courtbook-guest-lookup-v1';
+const EXPECTED_SCOPE = 'booking_status';
+const DEFAULT_TTL_SECONDS = 7200; // 2 hours
 
 export interface GuestLookupTokenPayload {
   v: number;
+  scope: 'booking_status';
   res: string; // reservation_id (UUID)
   ref: string; // reference_code (CB-...)
   iat: number; // issued at (epoch seconds)
@@ -62,9 +65,10 @@ export async function mintGuestLookupToken(params: {
   ttlSeconds?: number;
 }): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
-  const ttl = params.ttlSeconds ?? 86400; // 24 hours default
+  const ttl = params.ttlSeconds ?? DEFAULT_TTL_SECONDS;
   const payload: GuestLookupTokenPayload = {
     v: 1,
+    scope: EXPECTED_SCOPE,
     res: params.reservationId.trim(),
     ref: params.referenceCode.trim().toUpperCase(),
     iat: now,
@@ -113,6 +117,7 @@ export async function verifyGuestLookupToken(
     const parsed = JSON.parse(new TextDecoder().decode(payloadBytes)) as Partial<GuestLookupTokenPayload>;
     if (
       parsed.v !== 1 ||
+      parsed.scope !== EXPECTED_SCOPE ||
       typeof parsed.res !== 'string' ||
       typeof parsed.ref !== 'string' ||
       typeof parsed.exp !== 'number'

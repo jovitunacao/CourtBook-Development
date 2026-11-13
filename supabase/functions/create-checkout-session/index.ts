@@ -94,9 +94,16 @@ serve(async (req: Request) => {
     });
 
     if (error) {
-      const isConflict = error.message.includes('already reserved') || error.message.includes('exclusion_violation');
+      console.error('[create-checkout-session] create_booking_checkout_session RPC error:', error.message);
+      const isConflict =
+        error.message.includes('already reserved') || error.message.includes('exclusion_violation');
       return new Response(
-        JSON.stringify({ success: false, error: error.message }),
+        JSON.stringify({
+          success: false,
+          error: isConflict
+            ? 'Selected court time slot is already reserved. Please select another slot.'
+            : 'Unable to initialize checkout for the selected booking details. Please verify your information and try again.',
+        }),
         {
           status: isConflict ? 409 : 400,
           headers: { ...corsHeaders, 'Content-Type': 'application/json' },
@@ -109,7 +116,7 @@ serve(async (req: Request) => {
       reservationId: String(data.reservation_id),
       referenceCode: String(data.reference_code),
       secret: lookupSecret,
-      ttlSeconds: 86400,
+      ttlSeconds: 7200,
     });
 
     // 2. If already bound and replayed idempotently, return existing session details
@@ -215,8 +222,11 @@ serve(async (req: Request) => {
 
       if (!pmRes.ok) {
         const pmErr = await pmRes.text();
+        console.error('[create-checkout-session] PayMongo API error:', pmRes.status, pmErr);
         return new Response(
-          JSON.stringify({ error: `PayMongo API error: ${pmErr}` }),
+          JSON.stringify({
+            error: 'Payment provider is temporarily unable to create a checkout session. Please try again shortly.',
+          }),
           { status: 502, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       }
@@ -277,12 +287,15 @@ serve(async (req: Request) => {
     }
 
     if (!bindSuccess) {
+      console.error('[create-checkout-session] Checkout session binding failure:', {
+        referenceCode: data.reference_code,
+        bindErrorMsg,
+      });
       return new Response(
         JSON.stringify({
-          error: `Checkout binding error after recovery retries: ${bindErrorMsg}`,
-          payment_id: data.payment_id,
+          error: 'Unable to finalize checkout session binding. Please retry to recover your booking hold.',
           reference_code: data.reference_code,
-          recovery_instruction: 'Retry request with same idempotency key to recover bound session without creating duplicate sessions.'
+          recovery_instruction: 'Retry request with same idempotency key to recover bound session without creating duplicate sessions.',
         }),
         { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );

@@ -251,9 +251,16 @@ export const CustomerBookingProvider: React.FC<{ children: React.ReactNode }> = 
     return null;
   });
 
-  // Save non-sensitive draft to sessionStorage on state changes
+  // Save non-sensitive draft to sessionStorage on state changes (never persist signed lookup_token in storage)
   useEffect(() => {
     try {
+      const sanitizedCheckoutResult = checkoutResult
+        ? (() => {
+            const { lookup_token: _omitToken, ...rest } = checkoutResult;
+            return rest;
+          })()
+        : null;
+
       const draft = {
         selectedSport,
         selectedLocation,
@@ -265,7 +272,7 @@ export const CustomerBookingProvider: React.FC<{ children: React.ReactNode }> = 
         customerName,
         customerPhone,
         customerEmail,
-        checkoutResult,
+        checkoutResult: sanitizedCheckoutResult,
         confirmedPassDetails,
       };
       sessionStorage.setItem(STORAGE_KEY, JSON.stringify(draft));

@@ -5,7 +5,7 @@
 // ==============================================================================
 
 import React, { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { ShieldCheck, AlertCircle, Loader2 } from 'lucide-react';
 import { BookingPageLayout } from '../../components/booking/BookingPageLayout';
 import { useCustomerBooking } from '../../context/CustomerBookingContext';
@@ -19,6 +19,7 @@ import { CustomerConfirmationDetails } from '../../types/customerBooking';
 
 export const PaymentReviewPage: React.FC = () => {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const {
     inventorySource,
     activeFacility,
@@ -37,6 +38,16 @@ export const PaymentReviewPage: React.FC = () => {
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isSimulating, setIsSimulating] = useState<boolean>(false);
+
+  // Strip any signed lookup_token from URL if redirected via /booking/cancelled
+  useEffect(() => {
+    if (searchParams.get('token')) {
+      const ref = searchParams.get('ref');
+      navigate(ref ? `/book/payment?ref=${encodeURIComponent(ref)}` : '/book/payment', {
+        replace: true,
+      });
+    }
+  }, [searchParams, navigate]);
 
   // Missing prerequisites check
   const isMissingPrerequisites =

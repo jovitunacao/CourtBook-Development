@@ -10,10 +10,13 @@
 //     * Non-empty verified_capture_evidence with webhook_event_id & provider_event_id
 //     * Verified & processed provider_webhook_events record
 //     * Settlement journal entry in financial_transactions (booking_settlement)
+//       including metadata cross-checks against provider_payment_id & webhook_event_id
 //   - Durable server-side rate limiting via check_and_increment_rate_limit (004)
-//     across both client IP (anti-enumeration) and reference key
-//   - Cryptographic guest lookup_token verification, UUIDv4 reservation_id, or
-//     normalized customer phone/email verification
+//     across client IP, IP+reference, and global reference buckets (FAIL-CLOSED: 503)
+//   - Trusted proxy IP extraction (never blindly trusts spoofed forwarding headers)
+//   - Strict guest authorization: requires valid signed lookup_token OR verified
+//     customer phone/email (reservation_id alone cannot authorize lookup)
+//   - Anti-enumeration: identical 403 for unauthenticated not-found vs contact mismatch
 //   - Safe public error handling (never leaks SQL, stack traces, or internal IDs)
 // ==============================================================================
 
@@ -47,19 +50,21 @@ export interface SupabaseAdminLike {
 export interface GetBookingStatusDeps {
   supabaseAdmin: SupabaseAdminLike;
   lookupSecret: string;
-  rateLimitMap?: Map<string, { count: number; resetAt: number }>;
+  remoteAddr?: string;
+  trustedProxyIpHeader?: string;
+  trustedProxyHops?: number;
   nowMs?: () => number;
 }
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const REF_CODE_REGEX = /^CB-[A-Z0-9-]{6,30}$/i;
+const IPV4_REGEX = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/;
+const IPV6_REGEX = /^[0-9a-f:]{2,45}$/i;
 const VALID_CAPTURE_EVENT_TYPES = new Set([
   'payment.paid',
   'checkout_session.payment.paid',
   'payment.captured',
 ]);
-
-const defaultMemoryRateLimitMap = new Map<string, { count: number; resetAt: number }>();
 
 function jsonResponse(body: Record<string, unknown>, status: number, extraHeaders?: Record<string, string>): Response {
   return new Response(JSON.stringify(body), {
@@ -72,24 +77,51 @@ function jsonResponse(body: Record<string, unknown>, status: number, extraHeader
   });
 }
 
-function checkMemoryRateLimit(
-  map: Map<string, { count: number; resetAt: number }>,
-  key: string,
-  limit: number,
-  windowMs: number,
-  nowMs: number
-): { allowed: boolean; retryAfter: number } {
-  const entry = map.get(key);
-  if (!entry || nowMs > entry.resetAt) {
-    map.set(key, { count: 1, resetAt: nowMs + windowMs });
-    return { allowed: true, retryAfter: 0 };
+function isValidIpAddress(candidate: string): boolean {
+  const trimmed = candidate.trim();
+  if (!trimmed || trimmed.length > 45) return false;
+  if (IPV4_REGEX.test(trimmed)) return true;
+  if (trimmed.includes(':') && IPV6_REGEX.test(trimmed)) return true;
+  return false;
+}
+
+/**
+ * Resolves the client IP using trusted proxy configuration or connection remoteAddr.
+ * Never blindly trusts client-controlled forwarding headers (x-forwarded-for left side, etc.).
+ */
+export function resolveClientIp(req: Request, deps: GetBookingStatusDeps): string {
+  // 1. Explicit single-value header written & overwritten by trusted edge/proxy (e.g. 'cf-connecting-ip', 'fly-client-ip')
+  const trustedHeaderName = (deps.trustedProxyIpHeader || '').trim().toLowerCase();
+  if (trustedHeaderName) {
+    const headerVal = (req.headers.get(trustedHeaderName) || '').trim();
+    if (isValidIpAddress(headerVal)) {
+      return headerVal.replace(/[^a-z0-9.:_-]/gi, '_');
+    }
   }
-  if (entry.count >= limit) {
-    const retryAfter = Math.ceil((entry.resetAt - nowMs) / 1000);
-    return { allowed: false, retryAfter: Math.max(1, retryAfter) };
+
+  // 2. Trusted X-Forwarded-For hop count (count from right, where trusted proxies append)
+  if (typeof deps.trustedProxyHops === 'number' && deps.trustedProxyHops >= 1) {
+    const xff = req.headers.get('x-forwarded-for') || '';
+    const parts = xff
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (parts.length > 0) {
+      const idx = Math.max(0, parts.length - Math.floor(deps.trustedProxyHops));
+      const candidate = parts[idx];
+      if (candidate && isValidIpAddress(candidate)) {
+        return candidate.replace(/[^a-z0-9.:_-]/gi, '_');
+      }
+    }
   }
-  entry.count += 1;
-  return { allowed: true, retryAfter: 0 };
+
+  // 3. Direct TCP remote address from runtime connection info
+  if (deps.remoteAddr && isValidIpAddress(deps.remoteAddr)) {
+    return deps.remoteAddr.trim().replace(/[^a-z0-9.:_-]/gi, '_');
+  }
+
+  // 4. Fallback bucket when no trusted proxy/socket IP is available
+  return 'unverified_client';
 }
 
 async function evaluateDurableRateLimit(
@@ -97,10 +129,7 @@ async function evaluateDurableRateLimit(
   rateKey: string,
   maxAttempts: number,
   windowSeconds: number
-): Promise<{ allowed: boolean; retryAfter: number }> {
-  const memMap = deps.rateLimitMap || defaultMemoryRateLimitMap;
-  const now = deps.nowMs ? deps.nowMs() : Date.now();
-
+): Promise<{ ok: boolean; allowed: boolean; retryAfter: number }> {
   try {
     const { data: rlData, error: rlErr } = await deps.supabaseAdmin.rpc('check_and_increment_rate_limit', {
       p_rate_key: rateKey,
@@ -110,19 +139,18 @@ async function evaluateDurableRateLimit(
 
     if (!rlErr && rlData && typeof rlData.allowed === 'boolean') {
       return {
+        ok: true,
         allowed: rlData.allowed,
         retryAfter: Number(rlData.retry_after_seconds) || windowSeconds,
       };
     }
 
-    if (rlErr) {
-      console.error('[get-booking-status] Durable rate limit RPC error:', rlErr.message || 'unknown');
-    }
+    console.error('[get-booking-status] Durable rate limit RPC failed or returned invalid data:', rlErr?.message || 'invalid_payload');
+    return { ok: false, allowed: false, retryAfter: 0 };
   } catch (err) {
     console.error('[get-booking-status] Durable rate limit RPC exception:', err);
+    return { ok: false, allowed: false, retryAfter: 0 };
   }
-
-  return checkMemoryRateLimit(memMap, rateKey, maxAttempts, windowSeconds * 1000, now);
 }
 
 function normalizePhPhoneDigits(raw: string): string {
@@ -192,7 +220,7 @@ export async function handleGetBookingStatusRequest(
     const contact = (body.contact || '').trim();
     const lookupToken = (body.lookup_token || '').trim();
 
-    // 1. Strict validation of reference_code and credential presence
+    // 1. Strict validation of reference_code and guest authorization credential
     if (!referenceCode || !REF_CODE_REGEX.test(referenceCode)) {
       return jsonResponse(
         { error: 'A valid booking reference code is required (e.g. CB-XXXXXXXX).' },
@@ -200,11 +228,13 @@ export async function handleGetBookingStatusRequest(
       );
     }
 
-    if (!reservationId && !contact && !lookupToken) {
+    // Strict guest authorization: reservation_id alone CANNOT authorize a lookup.
+    // Caller must present either a valid signed lookup_token OR guest contact (phone/email).
+    if (!contact && !lookupToken) {
       return jsonResponse(
         {
           error:
-            'Guest verification is required. Please provide a valid booking token, reservation ID, or booking contact.',
+            'Guest verification is required. Please provide a valid booking lookup token or the phone/email used for the booking.',
         },
         400
       );
@@ -218,15 +248,16 @@ export async function handleGetBookingStatusRequest(
       return jsonResponse({ error: 'Invalid payment identifier format.' }, 400);
     }
 
-    // 2. Durable multi-bucket rate limiting (IP + Reference)
-    const rawIp =
-      req.headers.get('cf-connecting-ip') ||
-      req.headers.get('x-real-ip') ||
-      req.headers.get('x-forwarded-for')?.split(',')[0] ||
-      'unknown';
-    const cleanIp = rawIp.trim().replace(/[^a-z0-9.:_-]/gi, '_') || 'unknown';
+    // 2. Durable multi-bucket rate limiting (IP + IP/Ref + Global Ref) — FAIL CLOSED
+    const cleanIp = resolveClientIp(req, deps);
 
     const ipRate = await evaluateDurableRateLimit(deps, `status_ip_${cleanIp}`, 30, 60);
+    if (!ipRate.ok) {
+      return jsonResponse(
+        { error: 'Booking status verification is temporarily unavailable. Please try again shortly.' },
+        503
+      );
+    }
     if (!ipRate.allowed) {
       return jsonResponse(
         { error: 'Too many status requests. Please wait a moment before trying again.' },
@@ -241,11 +272,37 @@ export async function handleGetBookingStatusRequest(
       12,
       60
     );
+    if (!refRate.ok) {
+      return jsonResponse(
+        { error: 'Booking status verification is temporarily unavailable. Please try again shortly.' },
+        503
+      );
+    }
     if (!refRate.allowed) {
       return jsonResponse(
         { error: 'Rate limit exceeded for this reference code. Please wait a moment before trying again.' },
         429,
         { 'Retry-After': String(refRate.retryAfter) }
+      );
+    }
+
+    const globalRefRate = await evaluateDurableRateLimit(
+      deps,
+      `status_ref_global_${referenceCode}`,
+      30,
+      60
+    );
+    if (!globalRefRate.ok) {
+      return jsonResponse(
+        { error: 'Booking status verification is temporarily unavailable. Please try again shortly.' },
+        503
+      );
+    }
+    if (!globalRefRate.allowed) {
+      return jsonResponse(
+        { error: 'Too many verification attempts for this booking reference. Please wait a moment before trying again.' },
+        429,
+        { 'Retry-After': String(globalRefRate.retryAfter) }
       );
     }
 
@@ -314,17 +371,24 @@ export async function handleGetBookingStatusRequest(
     }
 
     if (!reservation) {
+      // Anti-enumeration: without a valid signed lookup_token, return identical 403 as contact mismatch
+      if (!tokenReservationId) {
+        return jsonResponse(
+          { error: 'Guest verification failed. Please check your booking reference and contact details.' },
+          403
+        );
+      }
       return jsonResponse(
         { error: 'Reservation record not found. Please verify your booking reference code.' },
         404
       );
     }
 
-    // 5. Guest contact verification (mandatory if no token/UUID, and always verified if supplied)
-    if (contact || (!tokenReservationId && !reservationId)) {
+    // 5. Guest contact verification (mandatory if no valid tokenReservationId, and always verified if contact supplied)
+    if (contact || !tokenReservationId) {
       if (!doesContactMatch(contact, reservation.customer_phone, reservation.customer_email)) {
         return jsonResponse(
-          { error: 'Customer contact details do not match the reservation on file.' },
+          { error: 'Guest verification failed. Please check your booking reference and contact details.' },
           403
         );
       }
@@ -496,11 +560,13 @@ export async function handleGetBookingStatusRequest(
       hasVerifiedWebhookRecord;
 
     // 10. Settlement Journal Association Check (005A1 + 005C financial_transactions)
+    // Note: financial_transactions links to reservation via reference_id (no direct payment_id FK column in 005A1/005B);
+    // cross-check metadata fields written by 005C post_booking_settlement_event when present.
     let hasSettlementJournal = false;
-    if (payment && rawPayStatus === 'captured') {
+    if (payment && rawPayStatus === 'captured' && hasValidEvidence) {
       const { data: txData, error: txError } = await deps.supabaseAdmin
         .from('financial_transactions')
-        .select('id, transaction_number, organization_id, facility_id, transaction_type, reference_id')
+        .select('id, transaction_number, organization_id, facility_id, transaction_type, reference_id, metadata')
         .eq('reference_id', reservation.id)
         .eq('transaction_type', 'booking_settlement')
         .eq('organization_id', facility.organization_id)
@@ -516,7 +582,24 @@ export async function handleGetBookingStatusRequest(
         txData.facility_id === reservation.facility_id &&
         txData.transaction_type === 'booking_settlement'
       ) {
-        hasSettlementJournal = true;
+        const txMeta =
+          txData.metadata && typeof txData.metadata === 'object' && !Array.isArray(txData.metadata)
+            ? (txData.metadata as Record<string, unknown>)
+            : null;
+
+        const txMetaConsistent =
+          txMeta !== null &&
+          String(txMeta.webhook_event_id || '').trim() === evidenceWebhookId &&
+          String(txMeta.provider_payment_id || '').trim() === String(payment.provider_payment_id).trim() &&
+          String(txMeta.checkout_session_id || '').trim() === String(payment.checkout_session_id).trim() &&
+          (!txMeta.reservation_id || String(txMeta.reservation_id) === reservation.id) &&
+          (txMeta.gross_amount === undefined ||
+            (Number.isFinite(Number(txMeta.gross_amount)) &&
+              Math.abs(Number(txMeta.gross_amount) - capturedAmount) < 0.001));
+
+        if (txMetaConsistent) {
+          hasSettlementJournal = true;
+        }
       }
     }
 

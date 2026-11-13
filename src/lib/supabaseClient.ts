@@ -1437,7 +1437,7 @@ export interface VerifyBookingPaymentStatusResult {
 /**
  * Authoritative payment status retrieval:
  * Queries the backend for server-verified reservation, payment, and settlement state.
- * Supports recovery via unguessable reservation_id, customer contact verification, or token.
+ * Requires a valid signed lookup_token or verified customer phone/email contact.
  * 
  * Never marks a reservation paid from frontend state.
  * Fails closed if the backend returns incomplete or unverifiable state.
@@ -1454,11 +1454,11 @@ export async function verifyPublicBookingPaymentStatus(input: {
   const contact = (input.customer_phone_or_email || '').trim();
   const token = (input.lookup_token || '').trim();
 
-  if (!refCode || (!resId && !contact && !token)) {
+  if (!refCode || (!contact && !token)) {
     return {
       verified: false,
       status: 'failed',
-      error: 'Missing required reservation reference, ID, or customer contact for status verification.',
+      error: 'Missing required booking verification credential. Please provide a valid lookup token or your booking contact.',
     };
   }
 
@@ -1562,6 +1562,13 @@ export async function verifyPublicBookingPaymentStatus(input: {
           verified: false,
           status: 'pending',
           error: 'Rate limit exceeded. Please wait a moment before checking status again.',
+        };
+      } else if (res.status === 503) {
+        const json = await res.json().catch(() => null);
+        return {
+          verified: false,
+          status: 'pending',
+          error: json?.error || 'Booking verification is temporarily unavailable. Please try again shortly.',
         };
       } else if (res.status === 400) {
         const json = await res.json().catch(() => null);
