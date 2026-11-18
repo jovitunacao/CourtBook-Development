@@ -82,26 +82,30 @@ export function buildSignedHitPayWebhookFixture(options: {
 
 export function buildMockHitPayRefundResponse(overrides?: {
   id?: string;
-  payment_id?: string;
+  payment_id?: string | null;
   status?: 'succeeded' | 'completed' | 'refunded' | 'pending' | 'failed';
   amount_refunded?: string;
-  currency?: string;
+  currency?: string | null;
 }) {
   const id = overrides?.id || 'ref_hp_sandbox_fixture_001';
-  return {
+  const paymentId = overrides && 'payment_id' in overrides ? overrides.payment_id : 'chg_hp_12500';
+  const currency = overrides && 'currency' in overrides ? overrides.currency : 'PHP';
+
+  const body: Record<string, unknown> = {
     id,
-    payment_id: overrides?.payment_id || 'chg_hp_12500',
     status: overrides?.status || 'succeeded',
     amount_refunded: overrides?.amount_refunded || '4000.00',
-    currency: overrides?.currency || 'PHP',
     created_at: '2026-11-18T10:05:00Z',
     updated_at: '2026-11-18T10:05:00Z',
   };
+  if (paymentId) body.payment_id = paymentId;
+  if (currency) body.currency = currency;
+  return body;
 }
 
 export function buildSignedHitPayRefundWebhookFixture(options: {
   id: string;
-  paymentId: string;
+  paymentId?: string | null;
   paymentRequestId?: string;
   refundId?: string;
   status: 'refunded' | 'partially_refunded';
@@ -109,7 +113,7 @@ export function buildSignedHitPayRefundWebhookFixture(options: {
   amountRefunded?: string;
   refundedAmount?: string;
   refundAmount?: string;
-  currency?: string;
+  currency?: string | null;
   eventId?: string;
   eventTypeHeader?: string;
   eventObjectHeader?: string;
@@ -117,10 +121,13 @@ export function buildSignedHitPayRefundWebhookFixture(options: {
 }) {
   const payload: Record<string, unknown> = {
     id: options.id,
-    payment_id: options.paymentId,
     status: options.status,
-    currency: options.currency || 'PHP',
   };
+  const paymentId = 'paymentId' in options ? options.paymentId : options.id;
+  const currency = 'currency' in options ? options.currency : 'PHP';
+
+  if (paymentId) payload.payment_id = paymentId;
+  if (currency) payload.currency = currency;
   if (options.paymentRequestId) payload.payment_request_id = options.paymentRequestId;
   if (options.refundId) payload.refund_id = options.refundId;
   if (options.amount !== undefined) payload.amount = options.amount;

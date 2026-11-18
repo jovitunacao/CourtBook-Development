@@ -40,6 +40,7 @@ const MIGRATIONS = [
   '005d_financial_reconciliation_audit.sql',
   '005e_hitpay_sandbox_support.sql',
   '005f_hitpay_security_hardening.sql',
+  '005g_hitpay_refund_linkage_hardening.sql',
 ];
 
 async function main() {
@@ -405,7 +406,13 @@ async function main() {
         3000.00,
         'Partial refund 1',
         'ref_hp_12k_p1',
-        jsonb_build_object('webhook_event_id', $2::uuid, 'gateway_refund_verified', true, 'verified_refund_amount', 3000.00),
+        jsonb_build_object(
+          'webhook_event_id', $2::uuid,
+          'gateway_refund_verified', true,
+          'verified_refund_amount', 3000.00,
+          'gateway_refund_payment_id', 'chg_hp_12k_001',
+          'gateway_refund_currency', 'PHP'
+        ),
         'wh_refund_hp_12k_p1',
         true
       ) AS res;
@@ -437,7 +444,13 @@ async function main() {
         3000.00,
         'Partial refund 1 retry',
         'ref_hp_12k_p1',
-        jsonb_build_object('webhook_event_id', $2::uuid, 'gateway_refund_verified', true, 'verified_refund_amount', 3000.00),
+        jsonb_build_object(
+          'webhook_event_id', $2::uuid,
+          'gateway_refund_verified', true,
+          'verified_refund_amount', 3000.00,
+          'gateway_refund_payment_id', 'chg_hp_12k_001',
+          'gateway_refund_currency', 'PHP'
+        ),
         'wh_refund_hp_12k_p1_dup',
         true
       ) AS res;
@@ -469,7 +482,13 @@ async function main() {
         4000.00,
         'Partial refund 2',
         'ref_hp_12k_p2',
-        jsonb_build_object('webhook_event_id', $2::uuid, 'gateway_refund_verified', true, 'verified_refund_amount', 4000.00),
+        jsonb_build_object(
+          'webhook_event_id', $2::uuid,
+          'gateway_refund_verified', true,
+          'verified_refund_amount', 4000.00,
+          'gateway_refund_payment_id', 'chg_hp_12k_001',
+          'gateway_refund_currency', 'PHP'
+        ),
         'wh_refund_hp_12k_p2',
         true
       ) AS res;
@@ -513,6 +532,175 @@ async function main() {
     `, [orgId]);
     assert.equal(ledgerCountAfterAmbig.rows[0].cnt, ledgerCountBeforeAmbig.rows[0].cnt, 'Ambiguous refund must post 0 ledger entries');
 
+    // 4.4B Missing currency, non-PHP currency, missing payment linkage, and mismatched linkage reject with 0 ledger entries
+    const whNoCurrency = await db.query<{ id: string }>(`
+      INSERT INTO public.provider_webhook_events (
+        provider_name, provider_event_id, event_type, signature_verification_status,
+        signature_header, payload_hash, processing_state, payload
+      ) VALUES (
+        'hitpay', 'evt_hp_ref_no_curr', 'charge.updated', 'verified',
+        'nc1', repeat('6', 64), 'pending',
+        jsonb_build_object(
+          'refund_id', 'ref_hp_12k_no_curr',
+          'payment_id', 'chg_hp_12k_001',
+          'payment_request_id', 'req_hp_12k_001',
+          'status', 'partially_refunded',
+          'amount_refunded', '500.00'
+        )
+      ) RETURNING id;
+    `);
+    await assert.rejects(() =>
+      db.query(`
+        SELECT public.process_verified_refund_event(
+          $1::uuid, 500.00, 'Missing currency', 'ref_hp_12k_no_curr',
+          jsonb_build_object(
+            'webhook_event_id', $2::uuid,
+            'gateway_refund_verified', true,
+            'verified_refund_amount', 500.00,
+            'gateway_refund_payment_id', 'chg_hp_12k_001',
+            'gateway_refund_currency', 'PHP'
+          ),
+          'wh_refund_hp_no_curr', true
+        );
+      `, [co12kData.payment_id, whNoCurrency.rows[0].id])
+    );
+
+    const whNonPhpCurrency = await db.query<{ id: string }>(`
+      INSERT INTO public.provider_webhook_events (
+        provider_name, provider_event_id, event_type, signature_verification_status,
+        signature_header, payload_hash, processing_state, payload
+      ) VALUES (
+        'hitpay', 'evt_hp_ref_usd', 'charge.updated', 'verified',
+        'nc2', repeat('7', 64), 'pending',
+        jsonb_build_object(
+          'refund_id', 'ref_hp_12k_usd',
+          'payment_id', 'chg_hp_12k_001',
+          'payment_request_id', 'req_hp_12k_001',
+          'status', 'partially_refunded',
+          'amount_refunded', '500.00',
+          'currency', 'USD'
+        )
+      ) RETURNING id;
+    `);
+    await assert.rejects(() =>
+      db.query(`
+        SELECT public.process_verified_refund_event(
+          $1::uuid, 500.00, 'USD currency', 'ref_hp_12k_usd',
+          jsonb_build_object(
+            'webhook_event_id', $2::uuid,
+            'gateway_refund_verified', true,
+            'verified_refund_amount', 500.00,
+            'gateway_refund_payment_id', 'chg_hp_12k_001',
+            'gateway_refund_currency', 'USD'
+          ),
+          'wh_refund_hp_usd', true
+        );
+      `, [co12kData.payment_id, whNonPhpCurrency.rows[0].id])
+    );
+
+    const whNoPayLink = await db.query<{ id: string }>(`
+      INSERT INTO public.provider_webhook_events (
+        provider_name, provider_event_id, event_type, signature_verification_status,
+        signature_header, payload_hash, processing_state, payload
+      ) VALUES (
+        'hitpay', 'evt_hp_ref_no_link', 'charge.updated', 'verified',
+        'nl1', repeat('8', 64), 'pending',
+        jsonb_build_object(
+          'refund_id', 'ref_hp_12k_no_link',
+          'payment_request_id', 'req_hp_12k_001',
+          'status', 'partially_refunded',
+          'amount_refunded', '500.00',
+          'currency', 'PHP'
+        )
+      ) RETURNING id;
+    `);
+    await assert.rejects(() =>
+      db.query(`
+        SELECT public.process_verified_refund_event(
+          $1::uuid, 500.00, 'Missing linkage', 'ref_hp_12k_no_link',
+          jsonb_build_object(
+            'webhook_event_id', $2::uuid,
+            'gateway_refund_verified', true,
+            'verified_refund_amount', 500.00,
+            'gateway_refund_payment_id', 'chg_hp_12k_001',
+            'gateway_refund_currency', 'PHP'
+          ),
+          'wh_refund_hp_no_link', true
+        );
+      `, [co12kData.payment_id, whNoPayLink.rows[0].id])
+    );
+
+    const whMismatchPayLink = await db.query<{ id: string }>(`
+      INSERT INTO public.provider_webhook_events (
+        provider_name, provider_event_id, event_type, signature_verification_status,
+        signature_header, payload_hash, processing_state, payload
+      ) VALUES (
+        'hitpay', 'evt_hp_ref_mismatch_link', 'charge.updated', 'verified',
+        'ml1', repeat('9', 64), 'pending',
+        jsonb_build_object(
+          'refund_id', 'ref_hp_12k_mismatch_link',
+          'payment_id', 'chg_hp_other_999',
+          'payment_request_id', 'req_hp_12k_001',
+          'status', 'partially_refunded',
+          'amount_refunded', '500.00',
+          'currency', 'PHP'
+        )
+      ) RETURNING id;
+    `);
+    await assert.rejects(() =>
+      db.query(`
+        SELECT public.process_verified_refund_event(
+          $1::uuid, 500.00, 'Mismatched webhook payment_id', 'ref_hp_12k_mismatch_link',
+          jsonb_build_object(
+            'webhook_event_id', $2::uuid,
+            'gateway_refund_verified', true,
+            'verified_refund_amount', 500.00,
+            'gateway_refund_payment_id', 'chg_hp_12k_001',
+            'gateway_refund_currency', 'PHP'
+          ),
+          'wh_refund_hp_mismatch_link', true
+        );
+      `, [co12kData.payment_id, whMismatchPayLink.rows[0].id])
+    );
+
+    const whGatewayMismatch = await db.query<{ id: string }>(`
+      INSERT INTO public.provider_webhook_events (
+        provider_name, provider_event_id, event_type, signature_verification_status,
+        signature_header, payload_hash, processing_state, payload
+      ) VALUES (
+        'hitpay', 'evt_hp_ref_gw_mismatch', 'charge.updated', 'verified',
+        'gml1', repeat('a', 63) || '9', 'pending',
+        jsonb_build_object(
+          'refund_id', 'ref_hp_12k_gw_mismatch',
+          'payment_id', 'chg_hp_12k_001',
+          'payment_request_id', 'req_hp_12k_001',
+          'status', 'partially_refunded',
+          'amount_refunded', '500.00',
+          'currency', 'PHP'
+        )
+      ) RETURNING id;
+    `);
+    await assert.rejects(() =>
+      db.query(`
+        SELECT public.process_verified_refund_event(
+          $1::uuid, 500.00, 'Mismatched gateway evidence payment_id', 'ref_hp_12k_gw_mismatch',
+          jsonb_build_object(
+            'webhook_event_id', $2::uuid,
+            'gateway_refund_verified', true,
+            'verified_refund_amount', 500.00,
+            'gateway_refund_payment_id', 'chg_hp_other_999',
+            'gateway_refund_currency', 'PHP'
+          ),
+          'wh_refund_hp_gw_mismatch', true
+        );
+      `, [co12kData.payment_id, whGatewayMismatch.rows[0].id])
+    );
+
+    const ledgerCountAfterLinkageReject = await db.query<{ cnt: string }>(`
+      SELECT count(*)::text AS cnt FROM public.ledger_entries WHERE organization_id = $1::uuid;
+    `, [orgId]);
+    assert.equal(ledgerCountAfterLinkageReject.rows[0].cnt, ledgerCountBeforeAmbig.rows[0].cnt, 'Missing currency & missing/mismatched linkage must post 0 ledger entries');
+
     // 4.5 Final refund (₱5,000.00) bringing total to ₱12,000.00 + repeated final delivery idempotency
     const whRefFinal = await db.query<{ id: string }>(`
       INSERT INTO public.provider_webhook_events (
@@ -537,7 +725,13 @@ async function main() {
         5000.00,
         'Final refund completing full reversal',
         'ref_hp_12k_final',
-        jsonb_build_object('webhook_event_id', $2::uuid, 'gateway_refund_verified', true, 'verified_refund_amount', 5000.00),
+        jsonb_build_object(
+          'webhook_event_id', $2::uuid,
+          'gateway_refund_verified', true,
+          'verified_refund_amount', 5000.00,
+          'gateway_refund_payment_id', 'chg_hp_12k_001',
+          'gateway_refund_currency', 'PHP'
+        ),
         'wh_refund_hp_12k_final',
         false
       ) AS res;
@@ -569,14 +763,20 @@ async function main() {
         5000.00,
         'Final refund retry',
         'ref_hp_12k_final',
-        jsonb_build_object('webhook_event_id', $2::uuid, 'gateway_refund_verified', true, 'verified_refund_amount', 5000.00),
+        jsonb_build_object(
+          'webhook_event_id', $2::uuid,
+          'gateway_refund_verified', true,
+          'verified_refund_amount', 5000.00,
+          'gateway_refund_payment_id', 'chg_hp_12k_001',
+          'gateway_refund_currency', 'PHP'
+        ),
         'wh_refund_hp_12k_final_dup',
         false
       ) AS res;
     `, [co12kData.payment_id, whRefFinalDup.rows[0].id]);
     assert.equal(refFinalDupRes.rows[0].res.idempotent_replayed, true);
     assert.equal(refFinalDupRes.rows[0].res.status, 'refunded');
-    console.log('✓ Check 4: Repeated partial refunds, repeated deliveries, final refund & ambiguous refund rejection passed');
+    console.log('✓ Check 4: Repeated partial refunds, repeated deliveries, final refund & currency/linkage enforcement passed');
 
     // Check 5: PayMongo regression parity via service_role in same ledger after 005f
     await db.exec('BEGIN; SET LOCAL ROLE service_role;');

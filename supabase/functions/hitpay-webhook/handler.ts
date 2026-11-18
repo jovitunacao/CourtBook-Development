@@ -499,14 +499,13 @@ export async function handleHitPayWebhookRequest(
   // 6. Handle verified Refund Webhook Events (safe repeated partial & final refunds)
   if (normalized.status === 'refunded') {
     const providerRefundId = (normalized.refundId || '').trim();
-    const lookupPaymentId = String(
+    const explicitPayloadPaymentId = String(
       parsedPayload.payment_id ||
         parsedPayload.charge_id ||
         parsedPayload.provider_payment_id ||
-        (headerEventObject.toLowerCase() === 'charge' ? parsedPayload.id : '') ||
-        normalized.providerPaymentId ||
         ''
     ).trim();
+    const webhookCurrency = String(parsedPayload.currency || '').trim().toUpperCase();
 
     if (!providerRefundId) {
       return failInbox(
@@ -516,9 +515,25 @@ export async function handleHitPayWebhookRequest(
       );
     }
 
-    if (lookupPaymentId && providerRefundId === lookupPaymentId) {
+    if (!explicitPayloadPaymentId) {
+      return failInbox(
+        'Missing payment linkage in HitPay refund webhook: payment_id or charge_id matching the captured payment is required.',
+        422,
+        'ambiguous_refund_event'
+      );
+    }
+
+    if (providerRefundId === explicitPayloadPaymentId) {
       return failInbox(
         'Ambiguous HitPay refund webhook: refund_id cannot equal original charge/payment_id.',
+        422,
+        'ambiguous_refund_event'
+      );
+    }
+
+    if (webhookCurrency !== 'PHP') {
+      return failInbox(
+        `Missing or non-PHP HitPay refund webhook currency "${webhookCurrency || 'missing'}". Explicit PHP currency is required.`,
         422,
         'ambiguous_refund_event'
       );
@@ -538,8 +553,8 @@ export async function handleHitPayWebhookRequest(
       );
     }
 
-    // Resolve internal payment record safely
-    let paymentRecord: {
+    // Resolve internal payment record strictly via original captured provider_payment_id
+    type RefundPaymentRow = {
       id: string;
       provider_payment_id?: string | null;
       checkout_session_id?: string | null;
@@ -548,39 +563,70 @@ export async function handleHitPayWebhookRequest(
       refunded_amount?: number | string | null;
       currency?: string | null;
       verified_capture_evidence?: Record<string, unknown> | null;
-    } | null = null;
+    };
 
-    if (lookupPaymentId) {
-      const { data: byPay } = await deps.supabaseAdmin
-        .from('payments')
-        .select(
-          'id, provider_payment_id, checkout_session_id, status, captured_amount, refunded_amount, currency, verified_capture_evidence'
-        )
-        .eq('provider_name', 'hitpay')
-        .eq('provider_payment_id', lookupPaymentId)
-        .maybeSingle();
-      if (byPay) paymentRecord = byPay;
-    }
-    if (!paymentRecord && normalized.checkoutSessionId) {
-      const { data: bySess } = await deps.supabaseAdmin
-        .from('payments')
-        .select(
-          'id, provider_payment_id, checkout_session_id, status, captured_amount, refunded_amount, currency, verified_capture_evidence'
-        )
-        .eq('provider_name', 'hitpay')
-        .eq('checkout_session_id', normalized.checkoutSessionId)
-        .maybeSingle();
-      if (bySess) paymentRecord = bySess;
-    }
+    const { data: byPay } = await deps.supabaseAdmin
+      .from('payments')
+      .select(
+        'id, provider_payment_id, checkout_session_id, status, captured_amount, refunded_amount, currency, verified_capture_evidence'
+      )
+      .eq('provider_name', 'hitpay')
+      .eq('provider_payment_id', explicitPayloadPaymentId)
+      .maybeSingle();
+
+    const paymentRecord: RefundPaymentRow | null = byPay || null;
 
     if (!paymentRecord) {
+      if (normalized.checkoutSessionId) {
+        const { data: bySess } = await deps.supabaseAdmin
+          .from('payments')
+          .select('id, provider_payment_id')
+          .eq('provider_name', 'hitpay')
+          .eq('checkout_session_id', normalized.checkoutSessionId)
+          .maybeSingle();
+
+        if (bySess) {
+          return failInbox(
+            `Mismatched HitPay refund linkage: webhook payment_id "${explicitPayloadPaymentId}" does not match original captured payment "${bySess.provider_payment_id || 'none'}".`,
+            422,
+            'ambiguous_refund_event'
+          );
+        }
+      }
+
       return failInbox('Associated HitPay payment record not found for refund webhook.', 404);
     }
 
+    const storedPaymentId = String(paymentRecord.provider_payment_id || '').trim();
+    if (!storedPaymentId || storedPaymentId !== explicitPayloadPaymentId) {
+      return failInbox(
+        `Mismatched HitPay refund linkage: webhook payment_id "${explicitPayloadPaymentId}" does not match original captured payment "${storedPaymentId || 'missing'}".`,
+        422,
+        'ambiguous_refund_event'
+      );
+    }
+
     if (
-      paymentRecord.provider_payment_id &&
-      providerRefundId === paymentRecord.provider_payment_id
+      normalized.checkoutSessionId &&
+      paymentRecord.checkout_session_id &&
+      normalized.checkoutSessionId !== paymentRecord.checkout_session_id
     ) {
+      return failInbox(
+        `Mismatched HitPay refund linkage: payment_request_id "${normalized.checkoutSessionId}" does not match stored checkout_session_id "${paymentRecord.checkout_session_id}".`,
+        422,
+        'ambiguous_refund_event'
+      );
+    }
+
+    if (String(paymentRecord.currency || '').trim().toUpperCase() !== 'PHP') {
+      return failInbox(
+        `Stored payment currency "${paymentRecord.currency || 'missing'}" is not PHP.`,
+        422,
+        'ambiguous_refund_event'
+      );
+    }
+
+    if (providerRefundId === storedPaymentId) {
       return failInbox(
         'Ambiguous HitPay refund webhook: refund_id matches stored charge ID.',
         422,
@@ -588,7 +634,8 @@ export async function handleHitPayWebhookRequest(
       );
     }
 
-    // If this specific refund_id was already recorded on the payment, replay idempotently without double-posting
+    // If this specific refund_id was already recorded on the payment (and linkage & PHP currency passed),
+    // replay idempotently without double-posting
     const existingEvidence =
       paymentRecord.verified_capture_evidence &&
       typeof paymentRecord.verified_capture_evidence === 'object'
@@ -650,23 +697,31 @@ export async function handleHitPayWebhookRequest(
       );
     }
 
-    const remoteRefundCurrency = String(remoteRefund.currency || 'PHP').trim().toUpperCase();
+    const remoteRefundCurrency = String(remoteRefund.currency || '').trim().toUpperCase();
     if (remoteRefundCurrency !== 'PHP') {
       return failInbox(
-        `Authoritative HitPay refund currency "${remoteRefundCurrency}" is not PHP.`,
+        `Authoritative HitPay refund API missing or non-PHP currency "${remoteRefundCurrency || 'missing'}".`,
         422,
         'ambiguous_refund_event'
       );
     }
 
-    const remoteChargeId = String(remoteRefund.payment_id || remoteRefund.charge_id || '').trim();
-    if (
-      remoteChargeId &&
-      paymentRecord.provider_payment_id &&
-      remoteChargeId !== paymentRecord.provider_payment_id
-    ) {
+    const remoteChargeId = String(
+      remoteRefund.payment_id ||
+        remoteRefund.charge_id ||
+        (remoteRefund as Record<string, unknown>).provider_payment_id ||
+        ''
+    ).trim();
+    if (!remoteChargeId) {
       return failInbox(
-        `Ambiguous HitPay refund linkage: refund belongs to payment "${remoteChargeId}", expected "${paymentRecord.provider_payment_id}".`,
+        'Missing payment linkage in HitPay refund API response: payment_id/charge_id is required.',
+        422,
+        'ambiguous_refund_event'
+      );
+    }
+    if (remoteChargeId !== storedPaymentId) {
+      return failInbox(
+        `Ambiguous HitPay refund linkage: refund belongs to payment "${remoteChargeId}", expected "${storedPaymentId}".`,
         422,
         'ambiguous_refund_event'
       );
@@ -748,6 +803,8 @@ export async function handleHitPayWebhookRequest(
           provider_name: 'hitpay',
           gateway_refund_verified: true,
           verified_refund_amount: verifiedIncrementalAmount,
+          gateway_refund_payment_id: remoteChargeId,
+          gateway_refund_currency: remoteRefundCurrency,
         },
         p_idempotency_key: `wh_refund_hp_${providerRefundId}_${paymentRecord.id}`,
         p_is_partial: String(parsedPayload.status || '').toLowerCase() === 'partially_refunded',

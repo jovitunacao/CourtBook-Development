@@ -1128,6 +1128,8 @@ let passed = 0;
   assert.equal(partial1Json.status, 'partially_refunded');
   assert.equal(partial1Json.total_refunded, 4000);
   assert.equal(processedRpcs.length, 3);
+  assert.equal((processedRpcs[2].params.p_refund_evidence as any).gateway_refund_payment_id, 'chg_hp_12500');
+  assert.equal((processedRpcs[2].params.p_refund_evidence as any).gateway_refund_currency, 'PHP');
 
   // 4H-2: Repeated delivery of first partial refund (new event_id, same refund_id ref_hp_p1) -> idempotent replay!
   const partial1DupFixture = buildSignedHitPayRefundWebhookFixture({
@@ -1319,6 +1321,176 @@ let passed = 0;
     assert.equal(ambigJson.code, 'ambiguous_refund_event');
   }
   assert.equal(processedRpcs.length, 5, 'Ambiguous refund payloads must NEVER post ledger entries');
+
+  // 4H-7: Hardened currency & captured payment linkage enforcement (webhook AND GET /v1/refund/{id} API)
+  const hardenedRefundRejectCases = [
+    {
+      label: 'missing currency on webhook payload',
+      fixture: buildSignedHitPayRefundWebhookFixture({
+        id: 'chg_hp_12500',
+        paymentId: 'chg_hp_12500',
+        paymentRequestId: 'req_hp_12500',
+        refundId: 'ref_hp_no_curr_wh',
+        eventId: 'evt_hp_no_curr_wh',
+        status: 'partially_refunded',
+        amountRefunded: '100.00',
+        currency: null,
+      }),
+      remoteOverride: undefined,
+    },
+    {
+      label: 'non-PHP currency on webhook payload',
+      fixture: buildSignedHitPayRefundWebhookFixture({
+        id: 'chg_hp_12500',
+        paymentId: 'chg_hp_12500',
+        paymentRequestId: 'req_hp_12500',
+        refundId: 'ref_hp_usd_wh',
+        eventId: 'evt_hp_usd_wh',
+        status: 'partially_refunded',
+        amountRefunded: '100.00',
+        currency: 'USD',
+      }),
+      remoteOverride: undefined,
+    },
+    {
+      label: 'missing currency on GET /v1/refund API response (no PHP default fallback)',
+      fixture: buildSignedHitPayRefundWebhookFixture({
+        id: 'chg_hp_12500',
+        paymentId: 'chg_hp_12500',
+        paymentRequestId: 'req_hp_12500',
+        refundId: 'ref_hp_no_curr_api',
+        eventId: 'evt_hp_no_curr_api',
+        status: 'partially_refunded',
+        amountRefunded: '100.00',
+        currency: 'PHP',
+      }),
+      remoteOverride: buildMockHitPayRefundResponse({
+        id: 'ref_hp_no_curr_api',
+        payment_id: 'chg_hp_12500',
+        amount_refunded: '100.00',
+        currency: null,
+      }),
+    },
+    {
+      label: 'missing payment_id linkage on webhook payload even when payment_request_id is present',
+      fixture: buildSignedHitPayRefundWebhookFixture({
+        id: 'req_hp_12500',
+        paymentId: null,
+        paymentRequestId: 'req_hp_12500',
+        refundId: 'ref_hp_no_payid_wh',
+        eventId: 'evt_hp_no_payid_wh',
+        status: 'partially_refunded',
+        amountRefunded: '100.00',
+        currency: 'PHP',
+      }),
+      remoteOverride: undefined,
+    },
+    {
+      label: 'missing payment_id linkage on GET /v1/refund API response',
+      fixture: buildSignedHitPayRefundWebhookFixture({
+        id: 'chg_hp_12500',
+        paymentId: 'chg_hp_12500',
+        paymentRequestId: 'req_hp_12500',
+        refundId: 'ref_hp_no_payid_api',
+        eventId: 'evt_hp_no_payid_api',
+        status: 'partially_refunded',
+        amountRefunded: '100.00',
+        currency: 'PHP',
+      }),
+      remoteOverride: buildMockHitPayRefundResponse({
+        id: 'ref_hp_no_payid_api',
+        payment_id: null,
+        amount_refunded: '100.00',
+        currency: 'PHP',
+      }),
+    },
+    {
+      label: 'mismatched payment_id linkage on webhook payload against captured payment_request_id',
+      fixture: buildSignedHitPayRefundWebhookFixture({
+        id: 'chg_hp_other_999',
+        paymentId: 'chg_hp_other_999',
+        paymentRequestId: 'req_hp_12500',
+        refundId: 'ref_hp_mismatch_wh',
+        eventId: 'evt_hp_mismatch_wh',
+        status: 'partially_refunded',
+        amountRefunded: '100.00',
+        currency: 'PHP',
+      }),
+      remoteOverride: undefined,
+    },
+    {
+      label: 'mismatched payment_id linkage on GET /v1/refund API response',
+      fixture: buildSignedHitPayRefundWebhookFixture({
+        id: 'chg_hp_12500',
+        paymentId: 'chg_hp_12500',
+        paymentRequestId: 'req_hp_12500',
+        refundId: 'ref_hp_mismatch_api',
+        eventId: 'evt_hp_mismatch_api',
+        status: 'partially_refunded',
+        amountRefunded: '100.00',
+        currency: 'PHP',
+      }),
+      remoteOverride: buildMockHitPayRefundResponse({
+        id: 'ref_hp_mismatch_api',
+        payment_id: 'chg_hp_other_999',
+        amount_refunded: '100.00',
+        currency: 'PHP',
+      }),
+    },
+    {
+      label: 'mismatched payment_id linkage even on existing refund_id replay attempt',
+      fixture: buildSignedHitPayRefundWebhookFixture({
+        id: 'chg_hp_other_999',
+        paymentId: 'chg_hp_other_999',
+        paymentRequestId: 'req_hp_12500',
+        refundId: 'ref_hp_p1',
+        eventId: 'evt_hp_replay_mismatch',
+        status: 'partially_refunded',
+        amountRefunded: '4000.00',
+        currency: 'PHP',
+      }),
+      remoteOverride: undefined,
+    },
+  ];
+
+  for (const testCase of hardenedRefundRejectCases) {
+    const res = await handleHitPayWebhookRequest(
+      new Request('https://lockacourt.com/functions/v1/hitpay-webhook', {
+        method: 'POST',
+        headers: testCase.fixture.headers,
+        body: testCase.fixture.rawBody,
+      }),
+      {
+        supabaseAdmin: mockWebhookDb,
+        env: whEnv,
+        fetchFn: async () =>
+          new Response(
+            JSON.stringify(
+              testCase.remoteOverride ||
+                buildMockHitPayRefundResponse({
+                  id: String(testCase.fixture.payload.refund_id || 'ref_hp_fallback'),
+                  payment_id: 'chg_hp_12500',
+                  amount_refunded: '100.00',
+                  currency: 'PHP',
+                })
+            ),
+            { status: 200 }
+          ),
+      }
+    );
+    assert.equal(
+      res.status,
+      422,
+      `Expected HTTP 422 rejection for ${testCase.label}, got ${res.status}`
+    );
+    const json = await res.json();
+    assert.equal(json.code, 'ambiguous_refund_event', `Expected ambiguous_refund_event for ${testCase.label}`);
+  }
+  assert.equal(
+    processedRpcs.length,
+    5,
+    'Missing currency, missing linkage, and mismatched linkage refunds must NEVER post ledger entries'
+  );
 
   passed++;
   console.log('✓ Suite 4: hitpay-webhook raw-body HMAC, ref verification & repeated/ambiguous refund safety passed');
