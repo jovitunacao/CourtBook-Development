@@ -79,3 +79,66 @@ export function buildSignedHitPayWebhookFixture(options: {
 
   return { payload, rawBody, signature, headers };
 }
+
+export function buildMockHitPayRefundResponse(overrides?: {
+  id?: string;
+  payment_id?: string;
+  status?: 'succeeded' | 'completed' | 'refunded' | 'pending' | 'failed';
+  amount_refunded?: string;
+  currency?: string;
+}) {
+  const id = overrides?.id || 'ref_hp_sandbox_fixture_001';
+  return {
+    id,
+    payment_id: overrides?.payment_id || 'chg_hp_12500',
+    status: overrides?.status || 'succeeded',
+    amount_refunded: overrides?.amount_refunded || '4000.00',
+    currency: overrides?.currency || 'PHP',
+    created_at: '2026-11-18T10:05:00Z',
+    updated_at: '2026-11-18T10:05:00Z',
+  };
+}
+
+export function buildSignedHitPayRefundWebhookFixture(options: {
+  id: string;
+  paymentId: string;
+  paymentRequestId?: string;
+  refundId?: string;
+  status: 'refunded' | 'partially_refunded';
+  amount?: string;
+  amountRefunded?: string;
+  refundedAmount?: string;
+  refundAmount?: string;
+  currency?: string;
+  eventId?: string;
+  eventTypeHeader?: string;
+  eventObjectHeader?: string;
+  salt?: string;
+}) {
+  const payload: Record<string, unknown> = {
+    id: options.id,
+    payment_id: options.paymentId,
+    status: options.status,
+    currency: options.currency || 'PHP',
+  };
+  if (options.paymentRequestId) payload.payment_request_id = options.paymentRequestId;
+  if (options.refundId) payload.refund_id = options.refundId;
+  if (options.amount !== undefined) payload.amount = options.amount;
+  if (options.amountRefunded !== undefined) payload.amount_refunded = options.amountRefunded;
+  if (options.refundedAmount !== undefined) payload.refunded_amount = options.refundedAmount;
+  if (options.refundAmount !== undefined) payload.refund_amount = options.refundAmount;
+  if (options.eventId) payload.event_id = options.eventId;
+
+  const rawBody = JSON.stringify(payload);
+  const signature = signOfflineHitPayWebhookBody(rawBody, options.salt || OFFLINE_HITPAY_TEST_SALT);
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'Hitpay-Signature': signature,
+    'Hitpay-Event-Type': options.eventTypeHeader || 'updated',
+    'Hitpay-Event-Object': options.eventObjectHeader || 'charge',
+  };
+
+  return { payload, rawBody, signature, headers };
+}
+

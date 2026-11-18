@@ -39,6 +39,7 @@ const MIGRATIONS = [
   '005c_booking_payment_integration.sql',
   '005d_financial_reconciliation_audit.sql',
   '005e_hitpay_sandbox_support.sql',
+  '005f_hitpay_security_hardening.sql',
 ];
 
 async function main() {
@@ -103,6 +104,63 @@ async function main() {
     }
     console.log('✓ Check 1: All 4 provider_name CHECK constraints updated for hitpay');
 
+    // Check 1B: Edge-only ACL verification on create_booking_checkout_session (005f)
+    const aclCheck = await db.query<{
+      sig: string;
+      pub_exec: boolean;
+      anon_exec: boolean;
+      auth_exec: boolean;
+      svc_exec: boolean;
+    }>(`
+      SELECT
+        p.oid::regprocedure::text AS sig,
+        has_function_privilege('public', p.oid, 'EXECUTE') AS pub_exec,
+        has_function_privilege('anon', p.oid, 'EXECUTE') AS anon_exec,
+        has_function_privilege('authenticated', p.oid, 'EXECUTE') AS auth_exec,
+        has_function_privilege('service_role', p.oid, 'EXECUTE') AS svc_exec
+      FROM pg_proc p
+      JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE n.nspname = 'public'
+        AND p.proname = 'create_booking_checkout_session';
+    `);
+    assert.ok(aclCheck.rows.length >= 1, 'create_booking_checkout_session must exist');
+    for (const fnRow of aclCheck.rows) {
+      assert.equal(fnRow.pub_exec, false, `PUBLIC must NOT execute ${fnRow.sig}`);
+      assert.equal(fnRow.anon_exec, false, `anon must NOT execute ${fnRow.sig}`);
+      assert.equal(fnRow.auth_exec, false, `authenticated must NOT execute ${fnRow.sig}`);
+      assert.equal(fnRow.svc_exec, true, `service_role MUST execute ${fnRow.sig}`);
+    }
+
+    for (const blockedRole of ['anon', 'authenticated']) {
+      await db.exec('BEGIN;');
+      let denied = false;
+      try {
+        await db.exec(`SET LOCAL ROLE ${blockedRole};`);
+        await db.query(`
+          SELECT public.create_booking_checkout_session(
+            'idem_acl_blocked_001',
+            gen_random_uuid(),
+            gen_random_uuid(),
+            'Blocked Caller',
+            '09170000000',
+            'blocked@example.com',
+            current_date + 2,
+            now() + interval '2 days',
+            60,
+            'hitpay'
+          );
+        `);
+      } catch (err: any) {
+        if (String(err?.message || '').toLowerCase().includes('permission denied')) {
+          denied = true;
+        }
+      } finally {
+        await db.exec('ROLLBACK;');
+      }
+      assert.equal(denied, true, `Role ${blockedRole} must fail with permission denied on create_booking_checkout_session`);
+    }
+    console.log('✓ Check 1B: create_booking_checkout_session restricted to service_role ONLY (PUBLIC/anon/authenticated denied)');
+
     // Setup isolated organization, facility, courts (₱350/hr and ₱12,000/hr)
     const orgRes = await db.query<{ id: string }>(`
       INSERT INTO public.organizations (name, slug, billing_email)
@@ -140,7 +198,8 @@ async function main() {
     const slot3Iso = `${yyyyMmDd}T06:00:00Z`; // 02:00 PM Asia/Manila
     const slot4Iso = `${yyyyMmDd}T08:00:00Z`; // 04:00 PM Asia/Manila
 
-    // Check 2: HitPay ₱350.00 booking + strict provider mismatch rejection + valid bind + webhook capture
+    // Check 2: HitPay ₱350.00 booking via service_role + strict provider mismatch rejection + valid bind + webhook capture
+    await db.exec('BEGIN; SET LOCAL ROLE service_role;');
     const co350 = await db.query<{ res: any }>(`
       SELECT public.create_booking_checkout_session(
         'idem_005e_hitpay_350_001',
@@ -155,6 +214,7 @@ async function main() {
         'hitpay'
       ) AS res;
     `, [facId, court350Id, yyyyMmDd, slot1Iso]);
+    await db.exec('COMMIT;');
     const co350Data = co350.rows[0].res;
     assert.equal(co350Data.provider_name, 'hitpay');
     assert.equal(Number(co350Data.expected_amount), 350);
@@ -191,6 +251,34 @@ async function main() {
       );
     `, [co350Data.payment_id, co350Data.reservation_id]);
 
+    // Reference mismatch in HitPay webhook must fail closed before settlement
+    const wh350WrongRef = await db.query<{ id: string }>(`
+      INSERT INTO public.provider_webhook_events (
+        provider_name, provider_event_id, event_type, signature_verification_status,
+        signature_header, payload_hash, processing_state, payload
+      ) VALUES (
+        'hitpay', 'hp_pr_req_hp_350_wrong_ref', 'payment_request.completed', 'verified',
+        'abc_wrong', repeat('0', 64), 'pending',
+        jsonb_build_object(
+          'id', 'req_hp_350_001',
+          'payment_request_id', 'req_hp_350_001',
+          'payment_id', 'chg_hp_350_wrong',
+          'status', 'completed',
+          'amount', '350.00',
+          'currency', 'PHP',
+          'reference_number', 'CB-MISMATCHED-REF'
+        )
+      ) RETURNING id;
+    `);
+    await assert.rejects(() =>
+      db.query(`
+        SELECT public.process_verified_payment_event(
+          $1::uuid, 'hitpay', 'hp_pr_req_hp_350_wrong_ref',
+          'chg_hp_350_wrong', 'req_hp_350_001', 350.00, 'PHP', 'wh_proc_hp_350_wrong'
+        );
+      `, [wh350WrongRef.rows[0].id])
+    );
+
     const wh350 = await db.query<{ id: string }>(`
       INSERT INTO public.provider_webhook_events (
         provider_name, provider_event_id, event_type, signature_verification_status,
@@ -217,7 +305,7 @@ async function main() {
       ) AS res;
     `, [wh350.rows[0].id]);
     assert.equal(proc350.rows[0].res.outcome, 'confirmed_and_settled');
-    console.log('✓ Check 2: HitPay ₱350.00 capture, strict provider bind & 5% commission settlement passed');
+    console.log('✓ Check 2: HitPay ₱350.00 capture, reference verification, strict provider bind & 5% commission settlement passed');
 
     // Check 3: HitPay ₱12,000.00 high-amount decimal regression (>= 10000 NOT divided by 100!)
     const co12k = await db.query<{ res: any }>(`
@@ -285,51 +373,220 @@ async function main() {
     const dup12k = await db.query<{ res: any }>(`
       SELECT public.process_verified_payment_event(
         $1::uuid, 'hitpay', 'hp_chg_alt_12k_001_charge.created',
-        'alt_chg_12k_001', 'req_hp_12k_001', 12000.00, 'PHP', 'wh_proc_hp_12k_dup'
+        'alt_chg_12k_001', 'req_hp_12k_001', 12000.00, 'PHP', 'wh_proc_hp_12k_dup',
+        jsonb_build_object('reference_number', $2::text)
       ) AS res;
-    `, [wh12kCharge.rows[0].id]);
+    `, [wh12kCharge.rows[0].id, co12kData.reference_code]);
     assert.equal(dup12k.rows[0].res.idempotent_replayed, true);
     console.log('✓ Check 3: HitPay ₱12,000.00 decimal parsing & secondary webhook idempotency passed');
 
-    // Check 4: HitPay verified refund reversal ('charge.updated')
-    const whRefund12k = await db.query<{ id: string }>(`
+    // Check 4: Repeated partial refunds, repeated deliveries, final refund & ambiguous refund rejection
+    // 4.1 First partial refund (₱3,000.00 of ₱12,000.00)
+    const whRefPart1 = await db.query<{ id: string }>(`
       INSERT INTO public.provider_webhook_events (
         provider_name, provider_event_id, event_type, signature_verification_status,
         signature_header, payload_hash, processing_state, payload
       ) VALUES (
-        'hitpay', 'evt_hp_ref_12k', 'charge.updated', 'verified',
-        'ghi', repeat('d', 64), 'pending',
+        'hitpay', 'evt_hp_ref_12k_p1', 'charge.updated', 'verified',
+        'ghi1', repeat('d', 64), 'pending',
         jsonb_build_object(
-          'refund_id', 'ref_hp_12k_001',
+          'refund_id', 'ref_hp_12k_p1',
           'payment_id', 'chg_hp_12k_001',
           'payment_request_id', 'req_hp_12k_001',
-          'status', 'refunded',
-          'amount', '12000.00',
+          'status', 'partially_refunded',
+          'amount_refunded', '3000.00',
           'currency', 'PHP'
         )
       ) RETURNING id;
     `);
-    const refRes = await db.query<{ res: any }>(`
+    const refPart1Res = await db.query<{ res: any }>(`
       SELECT public.process_verified_refund_event(
         $1::uuid,
-        12000.00,
-        'Customer requested refund',
-        'ref_hp_12k_001',
-        jsonb_build_object('webhook_event_id', $2::uuid),
-        'wh_refund_hp_12k_001',
+        3000.00,
+        'Partial refund 1',
+        'ref_hp_12k_p1',
+        jsonb_build_object('webhook_event_id', $2::uuid, 'gateway_refund_verified', true, 'verified_refund_amount', 3000.00),
+        'wh_refund_hp_12k_p1',
+        true
+      ) AS res;
+    `, [co12kData.payment_id, whRefPart1.rows[0].id]);
+    assert.equal(refPart1Res.rows[0].res.status, 'partially_refunded');
+    assert.equal(Number(refPart1Res.rows[0].res.total_refunded), 3000);
+
+    // 4.2 Repeated delivery of partial refund 1 with a new webhook row -> idempotent replay!
+    const whRefPart1Dup = await db.query<{ id: string }>(`
+      INSERT INTO public.provider_webhook_events (
+        provider_name, provider_event_id, event_type, signature_verification_status,
+        signature_header, payload_hash, processing_state, payload
+      ) VALUES (
+        'hitpay', 'evt_hp_ref_12k_p1_dup', 'charge.updated', 'verified',
+        'ghi1b', repeat('1', 64), 'pending',
+        jsonb_build_object(
+          'refund_id', 'ref_hp_12k_p1',
+          'payment_id', 'chg_hp_12k_001',
+          'payment_request_id', 'req_hp_12k_001',
+          'status', 'partially_refunded',
+          'amount_refunded', '3000.00',
+          'currency', 'PHP'
+        )
+      ) RETURNING id;
+    `);
+    const refPart1DupRes = await db.query<{ res: any }>(`
+      SELECT public.process_verified_refund_event(
+        $1::uuid,
+        3000.00,
+        'Partial refund 1 retry',
+        'ref_hp_12k_p1',
+        jsonb_build_object('webhook_event_id', $2::uuid, 'gateway_refund_verified', true, 'verified_refund_amount', 3000.00),
+        'wh_refund_hp_12k_p1_dup',
+        true
+      ) AS res;
+    `, [co12kData.payment_id, whRefPart1Dup.rows[0].id]);
+    assert.equal(refPart1DupRes.rows[0].res.idempotent_replayed, true);
+    assert.equal(Number(refPart1DupRes.rows[0].res.total_refunded), 3000);
+
+    // 4.3 Second partial refund (₱4,000.00) on the same charge with cumulative amount_refunded ('7000.00')
+    const whRefPart2 = await db.query<{ id: string }>(`
+      INSERT INTO public.provider_webhook_events (
+        provider_name, provider_event_id, event_type, signature_verification_status,
+        signature_header, payload_hash, processing_state, payload
+      ) VALUES (
+        'hitpay', 'evt_hp_ref_12k_p2', 'charge.updated', 'verified',
+        'ghi2', repeat('2', 64), 'pending',
+        jsonb_build_object(
+          'refund_id', 'ref_hp_12k_p2',
+          'payment_id', 'chg_hp_12k_001',
+          'payment_request_id', 'req_hp_12k_001',
+          'status', 'partially_refunded',
+          'amount_refunded', '7000.00',
+          'currency', 'PHP'
+        )
+      ) RETURNING id;
+    `);
+    const refPart2Res = await db.query<{ res: any }>(`
+      SELECT public.process_verified_refund_event(
+        $1::uuid,
+        4000.00,
+        'Partial refund 2',
+        'ref_hp_12k_p2',
+        jsonb_build_object('webhook_event_id', $2::uuid, 'gateway_refund_verified', true, 'verified_refund_amount', 4000.00),
+        'wh_refund_hp_12k_p2',
+        true
+      ) AS res;
+    `, [co12kData.payment_id, whRefPart2.rows[0].id]);
+    assert.equal(refPart2Res.rows[0].res.status, 'partially_refunded');
+    assert.equal(Number(refPart2Res.rows[0].res.total_refunded), 7000);
+
+    // 4.4 Ambiguous refund (missing distinct refund_id) & conflicting refund fields fail closed without posting ledger entries
+    const ledgerCountBeforeAmbig = await db.query<{ cnt: string }>(`
+      SELECT count(*)::text AS cnt FROM public.ledger_entries WHERE organization_id = $1::uuid;
+    `, [orgId]);
+    const whRefAmbig = await db.query<{ id: string }>(`
+      INSERT INTO public.provider_webhook_events (
+        provider_name, provider_event_id, event_type, signature_verification_status,
+        signature_header, payload_hash, processing_state, payload
+      ) VALUES (
+        'hitpay', 'evt_hp_ref_12k_ambig', 'charge.updated', 'verified',
+        'ghi_amb', repeat('3', 64), 'pending',
+        jsonb_build_object(
+          'id', 'chg_hp_12k_001',
+          'payment_id', 'chg_hp_12k_001',
+          'payment_request_id', 'req_hp_12k_001',
+          'status', 'partially_refunded',
+          'amount_refunded', '1000.00',
+          'refunded_amount', '2000.00',
+          'currency', 'PHP'
+        )
+      ) RETURNING id;
+    `);
+    await assert.rejects(() =>
+      db.query(`
+        SELECT public.process_verified_refund_event(
+          $1::uuid, 1000.00, 'Ambiguous refund', 'chg_hp_12k_001',
+          jsonb_build_object('webhook_event_id', $2::uuid),
+          'wh_refund_hp_12k_ambig', true
+        );
+      `, [co12kData.payment_id, whRefAmbig.rows[0].id])
+    );
+    const ledgerCountAfterAmbig = await db.query<{ cnt: string }>(`
+      SELECT count(*)::text AS cnt FROM public.ledger_entries WHERE organization_id = $1::uuid;
+    `, [orgId]);
+    assert.equal(ledgerCountAfterAmbig.rows[0].cnt, ledgerCountBeforeAmbig.rows[0].cnt, 'Ambiguous refund must post 0 ledger entries');
+
+    // 4.5 Final refund (₱5,000.00) bringing total to ₱12,000.00 + repeated final delivery idempotency
+    const whRefFinal = await db.query<{ id: string }>(`
+      INSERT INTO public.provider_webhook_events (
+        provider_name, provider_event_id, event_type, signature_verification_status,
+        signature_header, payload_hash, processing_state, payload
+      ) VALUES (
+        'hitpay', 'evt_hp_ref_12k_final', 'charge.updated', 'verified',
+        'ghi3', repeat('4', 64), 'pending',
+        jsonb_build_object(
+          'refund_id', 'ref_hp_12k_final',
+          'payment_id', 'chg_hp_12k_001',
+          'payment_request_id', 'req_hp_12k_001',
+          'status', 'refunded',
+          'amount_refunded', '12000.00',
+          'currency', 'PHP'
+        )
+      ) RETURNING id;
+    `);
+    const refFinalRes = await db.query<{ res: any }>(`
+      SELECT public.process_verified_refund_event(
+        $1::uuid,
+        5000.00,
+        'Final refund completing full reversal',
+        'ref_hp_12k_final',
+        jsonb_build_object('webhook_event_id', $2::uuid, 'gateway_refund_verified', true, 'verified_refund_amount', 5000.00),
+        'wh_refund_hp_12k_final',
         false
       ) AS res;
-    `, [co12kData.payment_id, whRefund12k.rows[0].id]);
-    assert.equal(refRes.rows[0].res.status, 'refunded');
-    console.log('✓ Check 4: HitPay verified refund reversal (₱12,000.00) passed');
+    `, [co12kData.payment_id, whRefFinal.rows[0].id]);
+    assert.equal(refFinalRes.rows[0].res.status, 'refunded');
+    assert.equal(Number(refFinalRes.rows[0].res.total_refunded), 12000);
 
-    // Check 5: PayMongo regression parity in same ledger after 005e
+    // Repeated delivery of final refund replays cleanly without error
+    const whRefFinalDup = await db.query<{ id: string }>(`
+      INSERT INTO public.provider_webhook_events (
+        provider_name, provider_event_id, event_type, signature_verification_status,
+        signature_header, payload_hash, processing_state, payload
+      ) VALUES (
+        'hitpay', 'evt_hp_ref_12k_final_dup', 'charge.updated', 'verified',
+        'ghi3b', repeat('5', 64), 'pending',
+        jsonb_build_object(
+          'refund_id', 'ref_hp_12k_final',
+          'payment_id', 'chg_hp_12k_001',
+          'payment_request_id', 'req_hp_12k_001',
+          'status', 'refunded',
+          'amount_refunded', '12000.00',
+          'currency', 'PHP'
+        )
+      ) RETURNING id;
+    `);
+    const refFinalDupRes = await db.query<{ res: any }>(`
+      SELECT public.process_verified_refund_event(
+        $1::uuid,
+        5000.00,
+        'Final refund retry',
+        'ref_hp_12k_final',
+        jsonb_build_object('webhook_event_id', $2::uuid, 'gateway_refund_verified', true, 'verified_refund_amount', 5000.00),
+        'wh_refund_hp_12k_final_dup',
+        false
+      ) AS res;
+    `, [co12kData.payment_id, whRefFinalDup.rows[0].id]);
+    assert.equal(refFinalDupRes.rows[0].res.idempotent_replayed, true);
+    assert.equal(refFinalDupRes.rows[0].res.status, 'refunded');
+    console.log('✓ Check 4: Repeated partial refunds, repeated deliveries, final refund & ambiguous refund rejection passed');
+
+    // Check 5: PayMongo regression parity via service_role in same ledger after 005f
+    await db.exec('BEGIN; SET LOCAL ROLE service_role;');
     const coPm = await db.query<{ res: any }>(`
       SELECT public.create_booking_checkout_session(
         'idem_005e_paymongo_001', $1::uuid, $2::uuid, 'Pedro Reyes', '09173334455', 'pedro@example.com',
         $3::date, $4::timestamptz, 60, 'paymongo'
       ) AS res;
     `, [facId, court350Id, yyyyMmDd, slot3Iso]);
+    await db.exec('COMMIT;');
     const coPmData = coPm.rows[0].res;
     await db.query(`
       SELECT public.bind_provider_checkout_session(
@@ -397,9 +654,9 @@ async function main() {
       ) VALUES (
         'hitpay', 'evt_hp_late_001', 'payment_request.completed', 'verified',
         'jkl', repeat('f', 64), 'pending',
-        jsonb_build_object('id', 'req_hp_late_001', 'payment_id', 'chg_hp_late_001', 'status', 'completed', 'amount', '350.00', 'currency', 'PHP')
+        jsonb_build_object('id', 'req_hp_late_001', 'payment_id', 'chg_hp_late_001', 'status', 'completed', 'amount', '350.00', 'currency', 'PHP', 'reference_number', $1::text)
       ) RETURNING id;
-    `);
+    `, [coLateData.reference_code]);
     const procLate = await db.query<{ res: any }>(`
       SELECT public.process_verified_payment_event(
         $1::uuid, 'hitpay', 'evt_hp_late_001', 'chg_hp_late_001', 'req_hp_late_001',

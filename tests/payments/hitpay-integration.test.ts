@@ -50,6 +50,8 @@ import {
   OFFLINE_HITPAY_TEST_API_KEY,
   OFFLINE_HITPAY_TEST_SALT,
   buildMockHitPayPaymentRequestResponse,
+  buildMockHitPayRefundResponse,
+  buildSignedHitPayRefundWebhookFixture,
   buildSignedHitPayWebhookFixture,
   signOfflineHitPayWebhookBody,
 } from './hitpay-fixtures';
@@ -124,38 +126,45 @@ let passed = 0;
   assert.equal(emptyCfg.webhookSalt, '');
   assert.equal(emptyCfg.isConfigured, false);
 
-  // Unconfigured HitPayAdapter reports isConfigured() === false & fails closed with provider_not_configured
+  // Unconfigured HitPayAdapter reports isReady === false & isConfigured() === false & fails closed with provider_not_configured
   let unconfiguredFetchCalls = 0;
-  const unconfiguredAdapter = new HitPayAdapter({
-    env: {},
-    fetchFn: async () => {
-      unconfiguredFetchCalls++;
-      return new Response('{}', { status: 200 });
-    },
-  });
-  assert.equal(unconfiguredAdapter.isConfigured(), false);
-  await assert.rejects(
-    () =>
-      unconfiguredAdapter.createCheckoutSession({
-        amountCentavos: 35000,
-        currency: 'PHP',
-        description: 'LockaCourt: Court A',
-        customerName: 'Juan Dela Cruz',
-        referenceCode: 'CB-UNCONF-001',
-        successUrl: 'https://lockacourt.com/booking/success',
-        cancelUrl: 'https://lockacourt.com/booking/cancelled',
-      }),
-    (err: unknown) => err instanceof HitPayNotConfiguredError && err.code === 'provider_not_configured'
-  );
+  for (const partialAdapterEnv of [
+    {},
+    { HITPAY_ENV: 'sandbox', HITPAY_SANDBOX_API_KEY: TEST_API_KEY },
+    { HITPAY_ENV: 'sandbox', HITPAY_SANDBOX_WEBHOOK_SALT: TEST_SALT },
+  ]) {
+    const partialAdapter = new HitPayAdapter({
+      env: partialAdapterEnv,
+      fetchFn: async () => {
+        unconfiguredFetchCalls++;
+        return new Response('{}', { status: 200 });
+      },
+    });
+    assert.equal(partialAdapter.isReady, false);
+    assert.equal(partialAdapter.isConfigured(), false);
+    await assert.rejects(
+      () =>
+        partialAdapter.createCheckoutSession({
+          amountCentavos: 35000,
+          currency: 'PHP',
+          description: 'LockaCourt: Court A',
+          customerName: 'Juan Dela Cruz',
+          referenceCode: 'CB-UNCONF-001',
+          successUrl: 'https://lockacourt.com/booking/success',
+          cancelUrl: 'https://lockacourt.com/booking/cancelled',
+        }),
+      (err: unknown) => err instanceof HitPayNotConfiguredError && err.code === 'provider_not_configured'
+    );
+  }
   assert.equal(unconfiguredFetchCalls, 0, 'Must never call HitPay API when credentials are unconfigured');
 
-  // Registry returns HitPayAdapter
+  // Registry returns HitPayAdapter with dynamic readiness matching env credentials
   const regAdapter = PaymentProviderRegistry.getAdapter('hitpay');
   assert.equal(regAdapter.providerName, 'hitpay');
-  assert.equal(regAdapter.isReady, true);
+  assert.equal(regAdapter.isReady, Boolean(process.env.HITPAY_SANDBOX_API_KEY && process.env.HITPAY_SANDBOX_WEBHOOK_SALT));
 
-  // Successful createCheckoutSession request contract
-  const calls: Array<{ url: string; method: string; headers: Record<string, string>; body?: any }> = [];
+  // Successful createCheckoutSession request contract (application/x-www-form-urlencoded + URLSearchParams)
+  const calls: Array<{ url: string; method: string; headers: Record<string, string>; bodyRaw?: string; form?: URLSearchParams }> = [];
   const hpAdapter = new HitPayAdapter({
     env: { HITPAY_ENV: 'sandbox', HITPAY_SANDBOX_API_KEY: TEST_API_KEY, HITPAY_SANDBOX_WEBHOOK_SALT: TEST_SALT },
     fetchFn: async (url, init) => {
@@ -165,11 +174,13 @@ let passed = 0;
           hdrs[k] = v;
         }
       }
+      const bodyRaw = init?.body ? String(init.body) : undefined;
       calls.push({
         url: String(url),
         method: init?.method || 'GET',
         headers: hdrs,
-        body: init?.body ? JSON.parse(String(init.body)) : undefined,
+        bodyRaw,
+        form: bodyRaw ? new URLSearchParams(bodyRaw) : undefined,
       });
       return new Response(
         JSON.stringify({
@@ -184,6 +195,7 @@ let passed = 0;
       );
     },
   });
+  assert.equal(hpAdapter.isReady, true);
 
   const hpSession = await hpAdapter.createCheckoutSession({
     amountCentavos: 1250000,
@@ -202,18 +214,19 @@ let passed = 0;
   assert.equal(hpSession.providerCheckoutId, 'req_hp_sandbox_001');
   assert.equal(calls.length, 1);
   assert.equal(calls[0].url, 'https://api.sandbox.hit-pay.com/v1/payment-requests');
+  assert.equal(calls[0].headers['Content-Type'], 'application/x-www-form-urlencoded');
   assert.equal(calls[0].headers['X-BUSINESS-API-KEY'], TEST_API_KEY);
   assert.equal(calls[0].headers['X-Requested-With'], 'XMLHttpRequest');
-  assert.equal(calls[0].body.amount, '12500.00');
-  assert.equal(calls[0].body.currency, 'PHP');
-  assert.equal(calls[0].body.reference_number, 'CB-HP-12500');
-  assert.equal(calls[0].body.allow_repeated_payments, false);
+  assert.equal(calls[0].form?.get('amount'), '12500.00');
+  assert.equal(calls[0].form?.get('currency'), 'PHP');
+  assert.equal(calls[0].form?.get('reference_number'), 'CB-HP-12500');
+  assert.equal(calls[0].form?.get('allow_repeated_payments'), 'false');
 
   // Timeout recovery via GET without issuing duplicate POST
   let postAttempts = 0;
   let getAttempts = 0;
   const recoveringAdapter = new HitPayAdapter({
-    env: { HITPAY_ENV: 'sandbox', HITPAY_SANDBOX_API_KEY: TEST_API_KEY },
+    env: { HITPAY_ENV: 'sandbox', HITPAY_SANDBOX_API_KEY: TEST_API_KEY, HITPAY_SANDBOX_WEBHOOK_SALT: TEST_SALT },
     fetchFn: async (url, init) => {
       if ((init?.method || 'GET') === 'POST') {
         postAttempts++;
@@ -254,7 +267,7 @@ let passed = 0;
 
   // Unrecoverable timeout fails closed with HitPayReconciliationError
   const failClosedAdapter = new HitPayAdapter({
-    env: { HITPAY_ENV: 'sandbox', HITPAY_SANDBOX_API_KEY: TEST_API_KEY },
+    env: { HITPAY_ENV: 'sandbox', HITPAY_SANDBOX_API_KEY: TEST_API_KEY, HITPAY_SANDBOX_WEBHOOK_SALT: TEST_SALT },
     fetchFn: async (_url, init) => {
       if ((init?.method || 'GET') === 'POST') {
         return new Response('Upstream error', { status: 504 });
@@ -355,18 +368,23 @@ let passed = 0;
   };
 
   // 3A: Omitted provider_name resolves server-side to HitPay + binds provider_name='hitpay' + LockaCourt URL
-  let capturedHitPayBody: any = null;
+  const capturedReq: { form: URLSearchParams | null; contentType: string } = {
+    form: null,
+    contentType: '',
+  };
   const okRes = await handleCreateCheckoutSessionRequest(
     new Request('https://lockacourt.com/functions/v1/create-checkout-session', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(validBody),
+      body: JSON.stringify({ ...validBody, payment_methods: ['paynow_online', 'gcash'] }),
     }),
     {
       supabaseAdmin: mockSupabaseAdmin,
       env: baseEnv,
       fetchFn: async (_url, init) => {
-        capturedHitPayBody = JSON.parse(String(init?.body));
+        const hdrs = (init?.headers || {}) as Record<string, string>;
+        capturedReq.contentType = hdrs['Content-Type'] || '';
+        capturedReq.form = new URLSearchParams(String(init?.body || ''));
         return new Response(
           JSON.stringify({
             id: 'req_hp_edge_001',
@@ -387,9 +405,11 @@ let passed = 0;
   assert.equal(okJson.is_simulated, false);
   assert.equal(okJson.checkout_session_id, 'req_hp_edge_001');
   assert.ok(okJson.checkout_url.includes('sandbox.hit-pay.com'));
-  assert.ok(capturedHitPayBody.purpose.startsWith('LockaCourt:'));
-  assert.ok(capturedHitPayBody.redirect_url.startsWith('https://lockacourt.com/booking/success'));
-  assert.equal(capturedHitPayBody.webhook, 'https://test-project.supabase.co/functions/v1/hitpay-webhook');
+  assert.equal(capturedReq.contentType, 'application/x-www-form-urlencoded');
+  assert.ok(capturedReq.form?.get('purpose')?.startsWith('LockaCourt:'));
+  assert.ok(capturedReq.form?.get('redirect_url')?.startsWith('https://lockacourt.com/booking/success'));
+  assert.equal(capturedReq.form?.get('webhook'), 'https://test-project.supabase.co/functions/v1/hitpay-webhook');
+  assert.deepEqual(capturedReq.form?.getAll('payment_methods[]'), ['paynow_online', 'gcash']);
   assert.equal(rpcCalls[0].params.p_provider_name, 'hitpay');
   assert.equal(rpcCalls[1].params.p_provider_name, 'hitpay');
 
@@ -541,8 +561,63 @@ let passed = 0;
 // ==============================================================================
 {
   const inboxRows = new Map<string, any>();
+  const inboxOps: Array<{ op: 'insert' | 'select' | 'update'; key?: string }> = [];
   const processedRpcs: Array<{ fn: string; params: Record<string, unknown> }> = [];
   let rowSeq = 1;
+
+  const mockReservations = new Map<string, any>([
+    ['res-hp-12500', { id: 'res-hp-12500', reference_code: 'CB-HP-12500', status: 'pending' }],
+    ['res-hp-after-invalid', { id: 'res-hp-after-invalid', reference_code: 'CB-HP-AFTER-INV', status: 'pending' }],
+    ['res-hp-ref-mismatch', { id: 'res-hp-ref-mismatch', reference_code: 'CB-HP-EXPECTED-REF', status: 'pending' }],
+  ]);
+
+  const mockPayments = new Map<string, any>([
+    [
+      'pay-hp-12500',
+      {
+        id: 'pay-hp-12500',
+        reservation_id: 'res-hp-12500',
+        provider_name: 'hitpay',
+        checkout_session_id: 'req_hp_12500',
+        provider_payment_id: 'chg_hp_12500',
+        status: 'pending',
+        captured_amount: 0,
+        refunded_amount: 0,
+        currency: 'PHP',
+        verified_capture_evidence: {},
+      },
+    ],
+    [
+      'pay-hp-after-invalid',
+      {
+        id: 'pay-hp-after-invalid',
+        reservation_id: 'res-hp-after-invalid',
+        provider_name: 'hitpay',
+        checkout_session_id: 'req_hp_after_invalid',
+        provider_payment_id: null,
+        status: 'pending',
+        captured_amount: 0,
+        refunded_amount: 0,
+        currency: 'PHP',
+        verified_capture_evidence: {},
+      },
+    ],
+    [
+      'pay-hp-ref-mismatch',
+      {
+        id: 'pay-hp-ref-mismatch',
+        reservation_id: 'res-hp-ref-mismatch',
+        provider_name: 'hitpay',
+        checkout_session_id: 'req_hp_ref_mismatch',
+        provider_payment_id: null,
+        status: 'pending',
+        captured_amount: 0,
+        refunded_amount: 0,
+        currency: 'PHP',
+        verified_capture_evidence: {},
+      },
+    ],
+  ]);
 
   const mockWebhookDb = {
     from: (table: string) => {
@@ -552,6 +627,7 @@ let passed = 0;
             select: () => ({
               single: async () => {
                 const key = `${row.provider_name}:${row.provider_event_id}`;
+                inboxOps.push({ op: 'insert', key });
                 if (inboxRows.has(key)) {
                   return { data: null, error: { code: '23505', message: 'duplicate key value violates unique constraint' } };
                 }
@@ -570,6 +646,7 @@ let passed = 0;
                 return chain;
               },
               single: async () => {
+                inboxOps.push({ op: 'select', key: String(filters.provider_event_id || filters.id || '') });
                 for (const row of inboxRows.values()) {
                   if (
                     (!filters.id || row.id === filters.id) &&
@@ -587,6 +664,7 @@ let passed = 0;
           update: (patch: any) => {
             const filters: Record<string, unknown> = {};
             const execUpdate = () => {
+              inboxOps.push({ op: 'update', key: String(filters.id || '') });
               for (const row of inboxRows.values()) {
                 if (
                   (!filters.id || row.id === filters.id) &&
@@ -622,8 +700,36 @@ let passed = 0;
                 return chain;
               },
               maybeSingle: async () => {
-                if (filters.provider_payment_id === 'chg_hp_12500') {
-                  return { data: { id: 'pay-hp-12500' }, error: null };
+                for (const p of mockPayments.values()) {
+                  if (
+                    (!filters.provider_name || p.provider_name === filters.provider_name) &&
+                    (!filters.provider_payment_id || p.provider_payment_id === filters.provider_payment_id) &&
+                    (!filters.checkout_session_id || p.checkout_session_id === filters.checkout_session_id)
+                  ) {
+                    return { data: { ...p, verified_capture_evidence: { ...p.verified_capture_evidence } }, error: null };
+                  }
+                }
+                return { data: null, error: null };
+              },
+            };
+            return chain;
+          },
+        };
+      }
+      if (table === 'reservations') {
+        return {
+          select: () => {
+            const filters: Record<string, unknown> = {};
+            const chain: any = {
+              eq: (col: string, val: unknown) => {
+                filters[col] = val;
+                return chain;
+              },
+              maybeSingle: async () => {
+                for (const r of mockReservations.values()) {
+                  if (!filters.id || r.id === filters.id) {
+                    return { data: { ...r }, error: null };
+                  }
                 }
                 return { data: null, error: null };
               },
@@ -636,15 +742,62 @@ let passed = 0;
     },
     rpc: async (fn: string, params: Record<string, unknown> = {}) => {
       processedRpcs.push({ fn, params });
-      for (const row of inboxRows.values()) {
-        if (row.id === params.p_webhook_event_id) {
-          row.processing_state = 'processed';
+      if (fn === 'process_verified_payment_event') {
+        for (const p of mockPayments.values()) {
+          if (p.checkout_session_id === params.p_checkout_session_id) {
+            p.status = 'captured';
+            p.captured_amount = Number(params.p_captured_amount);
+            p.provider_payment_id = String(params.p_provider_payment_id);
+          }
         }
+        for (const row of inboxRows.values()) {
+          if (row.id === params.p_webhook_event_id) {
+            row.processing_state = 'processed';
+          }
+        }
+        return { data: { success: true, outcome: 'confirmed_and_settled' }, error: null };
       }
-      return {
-        data: { success: true, outcome: fn === 'process_verified_refund_event' ? 'refunded' : 'confirmed_and_settled' },
-        error: null,
-      };
+      if (fn === 'process_verified_refund_event') {
+        const pay = mockPayments.get(String(params.p_payment_id));
+        if (!pay) return { data: null, error: { message: 'Payment not found' } };
+        const refId = String(params.p_provider_refund_id);
+        const evKey = `refund_${refId}`;
+        if (pay.verified_capture_evidence[evKey]) {
+          return {
+            data: {
+              success: true,
+              payment_id: pay.id,
+              provider_refund_id: refId,
+              refund_amount: Number(params.p_refund_amount),
+              total_refunded: pay.refunded_amount,
+              status: pay.status,
+              idempotent_replayed: true,
+            },
+            error: null,
+          };
+        }
+        pay.refunded_amount = Math.round((pay.refunded_amount + Number(params.p_refund_amount)) * 100) / 100;
+        pay.status = pay.refunded_amount >= pay.captured_amount ? 'refunded' : 'partially_refunded';
+        pay.verified_capture_evidence[evKey] = { amount: Number(params.p_refund_amount) };
+        const evObj = (params.p_refund_evidence || {}) as Record<string, unknown>;
+        for (const row of inboxRows.values()) {
+          if (row.id === evObj.webhook_event_id) {
+            row.processing_state = 'processed';
+          }
+        }
+        return {
+          data: {
+            success: true,
+            payment_id: pay.id,
+            provider_refund_id: refId,
+            refund_amount: Number(params.p_refund_amount),
+            total_refunded: pay.refunded_amount,
+            status: pay.status,
+          },
+          error: null,
+        };
+      }
+      return { data: null, error: { message: `Unexpected RPC: ${fn}` } };
     },
   };
 
@@ -740,6 +893,44 @@ let passed = 0;
   assert.equal(processedRpcs[0].params.p_captured_amount, 12500);
   assert.equal(processedRpcs[0].params.p_checkout_session_id, 'req_hp_12500');
 
+  // 4B-2: Reference mismatch between HitPay authoritative response & stored reservation fails closed (400)
+  const whRefMismatch = buildSignedHitPayWebhookFixture({
+    id: 'req_hp_ref_mismatch',
+    paymentId: 'chg_hp_ref_mismatch',
+    status: 'completed',
+    amount: '350.00',
+    referenceNumber: 'CB-WRONG-REF',
+    eventTypeHeader: 'completed',
+    eventObjectHeader: 'payment_request',
+  });
+  const refMismatchRes = await handleHitPayWebhookRequest(
+    new Request('https://lockacourt.com/functions/v1/hitpay-webhook', {
+      method: 'POST',
+      headers: whRefMismatch.headers,
+      body: whRefMismatch.rawBody,
+    }),
+    {
+      supabaseAdmin: mockWebhookDb,
+      env: whEnv,
+      fetchFn: async () =>
+        new Response(
+          JSON.stringify(
+            buildMockHitPayPaymentRequestResponse({
+              id: 'req_hp_ref_mismatch',
+              status: 'completed',
+              amount: '350.00',
+              reference_number: 'CB-WRONG-REF',
+            })
+          ),
+          { status: 200 }
+        ),
+    }
+  );
+  assert.equal(refMismatchRes.status, 400);
+  const refMismatchJson = await refMismatchRes.json();
+  assert.equal(refMismatchJson.code, 'reference_mismatch');
+  assert.equal(processedRpcs.length, 1, 'Reference mismatch must NOT settle payment');
+
   // 4C: Duplicate webhook replay returns already_processed without re-calling RPC
   const whReplay = await handleHitPayWebhookRequest(
     new Request('https://lockacourt.com/functions/v1/hitpay-webhook', {
@@ -784,24 +975,64 @@ let passed = 0;
   );
   assert.equal(conflictRes.status, 409);
 
-  // 4E: Forged signature returns 401 and executes ZERO financial RPCs
-  const forgedBody = JSON.stringify({
-    id: 'req_hp_forged',
-    payment_id: 'chg_forged',
+  // 4E: Forged signature returns 401 BEFORE any inbox insert/update/dedup lookup,
+  //     and a subsequent valid delivery with the same event ID settles normally!
+  const validAfterInvalid = buildSignedHitPayWebhookFixture({
+    id: 'req_hp_after_invalid',
+    paymentId: 'chg_hp_after_invalid',
     status: 'completed',
     amount: '350.00',
-    currency: 'PHP',
+    referenceNumber: 'CB-HP-AFTER-INV',
+    eventTypeHeader: 'completed',
+    eventObjectHeader: 'payment_request',
   });
+  const inboxSizeBeforeForged = inboxRows.size;
+  const inboxOpsBeforeForged = inboxOps.length;
+
   const forgedRes = await handleHitPayWebhookRequest(
     new Request('https://lockacourt.com/functions/v1/hitpay-webhook', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Hitpay-Signature': 'f'.repeat(64) },
-      body: forgedBody,
+      headers: {
+        'Content-Type': 'application/json',
+        'Hitpay-Signature': 'f'.repeat(64),
+        'Hitpay-Event-Type': 'completed',
+        'Hitpay-Event-Object': 'payment_request',
+      },
+      body: validAfterInvalid.rawBody,
     }),
     { supabaseAdmin: mockWebhookDb, env: whEnv }
   );
   assert.equal(forgedRes.status, 401);
+  assert.equal(inboxRows.size, inboxSizeBeforeForged, 'Invalid signature must NOT insert into provider_webhook_events');
+  assert.equal(inboxOps.length, inboxOpsBeforeForged, 'Invalid signature must perform ZERO inbox reads/writes/lookups');
   assert.equal(processedRpcs.length, 1);
+
+  // Now deliver the authentic signed event for req_hp_after_invalid -> settles normally!
+  const subsequentValidRes = await handleHitPayWebhookRequest(
+    new Request('https://lockacourt.com/functions/v1/hitpay-webhook', {
+      method: 'POST',
+      headers: validAfterInvalid.headers,
+      body: validAfterInvalid.rawBody,
+    }),
+    {
+      supabaseAdmin: mockWebhookDb,
+      env: whEnv,
+      fetchFn: async () =>
+        new Response(
+          JSON.stringify(
+            buildMockHitPayPaymentRequestResponse({
+              id: 'req_hp_after_invalid',
+              status: 'completed',
+              amount: '350.00',
+              reference_number: 'CB-HP-AFTER-INV',
+            })
+          ),
+          { status: 200 }
+        ),
+    }
+  );
+  assert.equal(subsequentValidRes.status, 200);
+  assert.equal(processedRpcs.length, 2, 'Subsequent valid delivery must settle cleanly after earlier invalid signature');
 
   // 4F: Signed live payload rejected in sandbox mode (400) with zero financial RPC
   const liveWhBody = JSON.stringify({
@@ -821,7 +1052,7 @@ let passed = 0;
     { supabaseAdmin: mockWebhookDb, env: whEnv }
   );
   assert.equal(liveWhRes.status, 400);
-  assert.equal(processedRpcs.length, 1);
+  assert.equal(processedRpcs.length, 2);
 
   // 4G: Authoritative GET returning 'pending' rejects capture (400) with zero financial RPC
   const spoofingBody = JSON.stringify({
@@ -854,38 +1085,243 @@ let passed = 0;
     }
   );
   assert.equal(spoofingRes.status, 400);
-  assert.equal(processedRpcs.length, 1);
+  assert.equal(processedRpcs.length, 2);
 
-  // 4H: Verified HitPay refund webhook ('charge.updated') invokes process_verified_refund_event
-  const refundBody = JSON.stringify({
-    event_id: 'evt_hp_refund_001',
-    id: 'ref_hp_001',
-    payment_id: 'chg_hp_12500',
-    payment_request_id: 'req_hp_12500',
-    status: 'refunded',
+  // 4H: Repeated Partial Refunds, Repeated Deliveries, Final Refund & Ambiguous Refund Rejection
+  // 4H-1: First partial refund (₱4,000.00 on ₱12,500.00 charge)
+  const partial1Fixture = buildSignedHitPayRefundWebhookFixture({
+    id: 'chg_hp_12500',
+    paymentId: 'chg_hp_12500',
+    paymentRequestId: 'req_hp_12500',
+    refundId: 'ref_hp_p1',
+    status: 'partially_refunded',
     amount: '12500.00',
-    currency: 'PHP',
+    amountRefunded: '4000.00',
   });
-  const refundRes = await handleHitPayWebhookRequest(
+  const partial1Res = await handleHitPayWebhookRequest(
     new Request('https://lockacourt.com/functions/v1/hitpay-webhook', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Hitpay-Signature': signHitPayBody(refundBody),
-        'Hitpay-Event-Type': 'updated',
-        'Hitpay-Event-Object': 'charge',
+      headers: partial1Fixture.headers,
+      body: partial1Fixture.rawBody,
+    }),
+    {
+      supabaseAdmin: mockWebhookDb,
+      env: whEnv,
+      fetchFn: async (url) => {
+        assert.equal(String(url), 'https://api.sandbox.hit-pay.com/v1/refund/ref_hp_p1');
+        return new Response(
+          JSON.stringify(
+            buildMockHitPayRefundResponse({
+              id: 'ref_hp_p1',
+              payment_id: 'chg_hp_12500',
+              status: 'succeeded',
+              amount_refunded: '4000.00',
+            })
+          ),
+          { status: 200 }
+        );
       },
-      body: refundBody,
+    }
+  );
+  assert.equal(partial1Res.status, 200);
+  const partial1Json = await partial1Res.json();
+  assert.equal(partial1Json.status, 'partially_refunded');
+  assert.equal(partial1Json.total_refunded, 4000);
+  assert.equal(processedRpcs.length, 3);
+
+  // 4H-2: Repeated delivery of first partial refund (new event_id, same refund_id ref_hp_p1) -> idempotent replay!
+  const partial1DupFixture = buildSignedHitPayRefundWebhookFixture({
+    id: 'chg_hp_12500',
+    paymentId: 'chg_hp_12500',
+    paymentRequestId: 'req_hp_12500',
+    refundId: 'ref_hp_p1',
+    eventId: 'evt_hp_p1_retry_2',
+    status: 'partially_refunded',
+    amount: '12500.00',
+    amountRefunded: '4000.00',
+  });
+  const partial1DupRes = await handleHitPayWebhookRequest(
+    new Request('https://lockacourt.com/functions/v1/hitpay-webhook', {
+      method: 'POST',
+      headers: partial1DupFixture.headers,
+      body: partial1DupFixture.rawBody,
     }),
     { supabaseAdmin: mockWebhookDb, env: whEnv }
   );
-  assert.equal(refundRes.status, 200);
-  assert.equal(processedRpcs.length, 2);
-  assert.equal(processedRpcs[1].fn, 'process_verified_refund_event');
-  assert.equal(processedRpcs[1].params.p_refund_amount, 12500);
+  assert.equal(partial1DupRes.status, 200);
+  const partial1DupJson = await partial1DupRes.json();
+  assert.equal(partial1DupJson.idempotent_replayed, true);
+  assert.equal(processedRpcs.length, 3, 'Repeated partial refund delivery must NOT post another ledger entry');
+
+  // 4H-3: Second partial refund (₱3,500.00) on the same charge with cumulative amount_refunded='7500.00'
+  //       verified against GET /v1/refund/ref_hp_p2 returning incremental '3500.00'
+  const partial2Fixture = buildSignedHitPayRefundWebhookFixture({
+    id: 'chg_hp_12500',
+    paymentId: 'chg_hp_12500',
+    paymentRequestId: 'req_hp_12500',
+    refundId: 'ref_hp_p2',
+    status: 'partially_refunded',
+    amount: '12500.00',
+    amountRefunded: '7500.00',
+  });
+  const partial2Res = await handleHitPayWebhookRequest(
+    new Request('https://lockacourt.com/functions/v1/hitpay-webhook', {
+      method: 'POST',
+      headers: partial2Fixture.headers,
+      body: partial2Fixture.rawBody,
+    }),
+    {
+      supabaseAdmin: mockWebhookDb,
+      env: whEnv,
+      fetchFn: async (url) => {
+        assert.equal(String(url), 'https://api.sandbox.hit-pay.com/v1/refund/ref_hp_p2');
+        return new Response(
+          JSON.stringify(
+            buildMockHitPayRefundResponse({
+              id: 'ref_hp_p2',
+              payment_id: 'chg_hp_12500',
+              status: 'succeeded',
+              amount_refunded: '3500.00',
+            })
+          ),
+          { status: 200 }
+        );
+      },
+    }
+  );
+  assert.equal(partial2Res.status, 200);
+  const partial2Json = await partial2Res.json();
+  assert.equal(partial2Json.status, 'partially_refunded');
+  assert.equal(partial2Json.total_refunded, 7500);
+  assert.equal(processedRpcs.length, 4);
+
+  // 4H-4: Final refund (₱5,000.00) completing ₱12,500.00 total
+  const finalRefundFixture = buildSignedHitPayRefundWebhookFixture({
+    id: 'chg_hp_12500',
+    paymentId: 'chg_hp_12500',
+    paymentRequestId: 'req_hp_12500',
+    refundId: 'ref_hp_p3',
+    status: 'refunded',
+    amount: '12500.00',
+    amountRefunded: '12500.00',
+  });
+  const finalRefundRes = await handleHitPayWebhookRequest(
+    new Request('https://lockacourt.com/functions/v1/hitpay-webhook', {
+      method: 'POST',
+      headers: finalRefundFixture.headers,
+      body: finalRefundFixture.rawBody,
+    }),
+    {
+      supabaseAdmin: mockWebhookDb,
+      env: whEnv,
+      fetchFn: async (url) => {
+        assert.equal(String(url), 'https://api.sandbox.hit-pay.com/v1/refund/ref_hp_p3');
+        return new Response(
+          JSON.stringify(
+            buildMockHitPayRefundResponse({
+              id: 'ref_hp_p3',
+              payment_id: 'chg_hp_12500',
+              status: 'succeeded',
+              amount_refunded: '5000.00',
+            })
+          ),
+          { status: 200 }
+        );
+      },
+    }
+  );
+  assert.equal(finalRefundRes.status, 200);
+  const finalRefundJson = await finalRefundRes.json();
+  assert.equal(finalRefundJson.status, 'refunded');
+  assert.equal(finalRefundJson.total_refunded, 12500);
+  assert.equal(processedRpcs.length, 5);
+
+  // 4H-5: Repeated delivery of final refund (even with a different event_id) replays idempotently
+  const finalDupFixture = buildSignedHitPayRefundWebhookFixture({
+    id: 'chg_hp_12500',
+    paymentId: 'chg_hp_12500',
+    paymentRequestId: 'req_hp_12500',
+    refundId: 'ref_hp_p3',
+    eventId: 'evt_hp_p3_retry_2',
+    status: 'refunded',
+    amount: '12500.00',
+    amountRefunded: '12500.00',
+  });
+  const finalDupRes = await handleHitPayWebhookRequest(
+    new Request('https://lockacourt.com/functions/v1/hitpay-webhook', {
+      method: 'POST',
+      headers: finalDupFixture.headers,
+      body: finalDupFixture.rawBody,
+    }),
+    { supabaseAdmin: mockWebhookDb, env: whEnv }
+  );
+  assert.equal(finalDupRes.status, 200);
+  const finalDupJson = await finalDupRes.json();
+  assert.equal(finalDupJson.idempotent_replayed, true);
+  assert.equal(processedRpcs.length, 5, 'Repeated final refund delivery must NOT post duplicate reversal');
+
+  // 4H-6: Ambiguous refund payloads (missing distinct refund_id, conflicting fields, unverified amount mismatch) fail closed (422)
+  const ambiguousFixtures = [
+    // Missing refund_id (charge ID only)
+    buildSignedHitPayRefundWebhookFixture({
+      id: 'chg_hp_12500',
+      paymentId: 'chg_hp_12500',
+      eventId: 'evt_hp_ambig_1',
+      status: 'partially_refunded',
+      amount: '100.00',
+    }),
+    // Conflicting refunded_amount vs amount_refunded
+    buildSignedHitPayRefundWebhookFixture({
+      id: 'chg_hp_12500',
+      paymentId: 'chg_hp_12500',
+      refundId: 'ref_hp_ambig_2',
+      eventId: 'evt_hp_ambig_2',
+      status: 'partially_refunded',
+      amountRefunded: '100.00',
+      refundedAmount: '200.00',
+    }),
+    // Unclear charge-level payload amount ('12500.00') with no amount_refunded/refund_amount while GET /v1/refund returns '100.00'
+    buildSignedHitPayRefundWebhookFixture({
+      id: 'chg_hp_12500',
+      paymentId: 'chg_hp_12500',
+      refundId: 'ref_hp_ambig_3',
+      eventId: 'evt_hp_ambig_3',
+      status: 'partially_refunded',
+      amount: '12500.00',
+    }),
+  ];
+  for (const ambig of ambiguousFixtures) {
+    const ambigRes = await handleHitPayWebhookRequest(
+      new Request('https://lockacourt.com/functions/v1/hitpay-webhook', {
+        method: 'POST',
+        headers: ambig.headers,
+        body: ambig.rawBody,
+      }),
+      {
+        supabaseAdmin: mockWebhookDb,
+        env: whEnv,
+        fetchFn: async () =>
+          new Response(
+            JSON.stringify(
+              buildMockHitPayRefundResponse({
+                id: String(ambig.payload.refund_id || 'ref_hp_ambig_3'),
+                payment_id: 'chg_hp_12500',
+                status: 'succeeded',
+                amount_refunded: '100.00',
+              })
+            ),
+            { status: 200 }
+          ),
+      }
+    );
+    assert.equal(ambigRes.status, 422, 'Ambiguous refund payload must be quarantined with HTTP 422');
+    const ambigJson = await ambigRes.json();
+    assert.equal(ambigJson.code, 'ambiguous_refund_event');
+  }
+  assert.equal(processedRpcs.length, 5, 'Ambiguous refund payloads must NEVER post ledger entries');
 
   passed++;
-  console.log('✓ Suite 4: hitpay-webhook raw-body HMAC, replay safety & authoritative GET verification passed');
+  console.log('✓ Suite 4: hitpay-webhook raw-body HMAC, ref verification & repeated/ambiguous refund safety passed');
 }
 
 // ==============================================================================

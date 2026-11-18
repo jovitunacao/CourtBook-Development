@@ -436,3 +436,45 @@ curl -i -X POST https://<project-ref>.supabase.co/functions/v1/create-booking \
   -d '{"customer_name": "Test"}'
 ```
 
+---
+
+## 9. Stage 2 Payment Gateway Integration: HitPay Sandbox Setup & Webhook Registration
+
+LockaCourt (`lockacourt.com`, operated by **AratReserve**) integrates **HitPay Sandbox** strictly in sandbox mode while preserving **PayMongo** (`ACTIVE_PAYMENT_PROVIDER="paymongo"`) as the default active gateway and keeping automatic payouts disabled.
+
+### Readiness Requirements & Fail-Closed Configuration
+Both `HITPAY_SANDBOX_API_KEY` and `HITPAY_SANDBOX_WEBHOOK_SALT` must be configured in Supabase Edge Function secrets before HitPay checkout or webhook settlement is enabled:
+- When either credential is missing, `create-checkout-session` and `hitpay-webhook` fail closed with HTTP `503` (`code: "provider_not_configured"`), creating **no** slot hold, payment row, or provider API call, and **never** silently falling back to PayMongo or simulation.
+- `HitPayAdapter.isReady` and `HitPayAdapter.isConfigured()` require both `HITPAY_SANDBOX_API_KEY` and `HITPAY_SANDBOX_WEBHOOK_SALT` and strictly reject live-prefixed keys, `HITPAY_ENV=live/production`, or non-sandbox URLs.
+- Checkout initialization uses `POST https://api.sandbox.hit-pay.com/v1/payment-requests` encoded as `application/x-www-form-urlencoded` (`URLSearchParams`, including repeated `payment_methods[]` entries).
+- `public.create_booking_checkout_session` is restricted by Migration `005f_hitpay_security_hardening.sql` to `service_role` only (`PUBLIC`, `anon`, `authenticated` revoked).
+
+### Edge Function Gateway Configuration (`supabase/config.toml`)
+External HitPay webhook deliveries do not include a Supabase user JWT. The checked-in `supabase/config.toml` sets:
+
+```toml
+[functions.hitpay-webhook]
+verify_jwt = false
+```
+
+Because gateway JWT checks are bypassed only for `hitpay-webhook`, the handler enforces **raw-body HMAC-SHA256 verification** (`Hitpay-Signature`) using `HITPAY_SANDBOX_WEBHOOK_SALT` **before** any JSON parsing or `provider_webhook_events` insert, update, or deduplication lookup.
+
+### HitPay Sandbox Dashboard Webhook Registration
+When you have created your HitPay Sandbox account:
+1. Log in to the **HitPay Sandbox Dashboard** (`https://dashboard.sandbox.hit-pay.com`).
+2. Navigate to **Settings → Payment Gateway → Webhook** (or **Developers → Webhooks**).
+3. Click **New Webhook** and enter your Supabase Edge Function URL:
+   ```
+   https://<your-project-ref>.supabase.co/functions/v1/hitpay-webhook
+   ```
+4. Subscribe to these webhook event types:
+   - `payment_request.completed`
+   - `charge.created`
+   - `charge.updated`
+5. Ensure legacy form-urlencoded webhooks remain disabled — LockaCourt strictly requires modern JSON webhooks with `Hitpay-Signature`, `Hitpay-Event-Type`, and `Hitpay-Event-Object` headers.
+6. Copy the generated **Webhook Salt** and **Sandbox API Key** into Supabase Edge Function secrets (never commit real values to Git or `.env.example`):
+   ```bash
+   npx supabase secrets set HITPAY_SANDBOX_API_KEY="<your-sandbox-api-key>"
+   npx supabase secrets set HITPAY_SANDBOX_WEBHOOK_SALT="<your-sandbox-webhook-salt>"
+   ```
+7. **Live Sandbox Verification Needed Later:** Once connected to a real HitPay Sandbox account, confirm exact `charge.updated` payload fields for Dashboard-initiated partial/repeated refunds (specifically whether `refund_id` is always distinct and whether `amount_refunded` / `refunded_amount` is incremental vs cumulative across sequential partial refunds on the same charge).

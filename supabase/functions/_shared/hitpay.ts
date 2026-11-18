@@ -69,6 +69,7 @@ export interface HitPayNormalizedEvent {
   eventTimestamp: string;
   providerPaymentId?: string;
   checkoutSessionId?: string;
+  refundId?: string;
   referenceNumber?: string;
   capturedAmount?: number;
   currency?: string;
@@ -85,6 +86,21 @@ export interface HitPayPaymentRequestRecord {
   reference_number?: string;
   payment_methods?: string[];
   payments?: Array<Record<string, unknown>>;
+  created_at?: string;
+  updated_at?: string;
+  [key: string]: unknown;
+}
+
+export interface HitPayRefundRecord {
+  id: string;
+  payment_id?: string;
+  charge_id?: string;
+  status?: string;
+  amount_refunded?: string | number;
+  refunded_amount?: string | number;
+  amount?: string | number;
+  currency?: string;
+  reference_number?: string;
   created_at?: string;
   updated_at?: string;
   [key: string]: unknown;
@@ -374,12 +390,26 @@ export function normalizeHitPayWebhook(
   const currency = currencyRaw || undefined;
   const referenceNumber = String(payload.reference_number || '').trim() || undefined;
 
+  const refundObj =
+    payload.refund && typeof payload.refund === 'object'
+      ? (payload.refund as Record<string, unknown>)
+      : null;
+  const refundId =
+    String(
+      payload.refund_id ||
+        payload.provider_refund_id ||
+        (refundObj ? refundObj.id : '') ||
+        ''
+    ).trim() || undefined;
+
   const eventTimestamp =
     String(payload.updated_at || payload.created_at || '').trim() || new Date().toISOString();
 
   const providerEventId =
     String(payload.event_id || '').trim() ||
-    (isChargeEvent && rawId
+    (status === 'refunded' && refundId
+      ? `hp_ref_${refundId}_${eventType}`
+      : isChargeEvent && rawId
       ? `hp_chg_${rawId}_${eventType}`
       : checkoutSessionId
       ? `hp_pr_${checkoutSessionId}_${eventType}`
@@ -392,6 +422,7 @@ export function normalizeHitPayWebhook(
     eventTimestamp,
     providerPaymentId,
     checkoutSessionId,
+    refundId,
     referenceNumber,
     capturedAmount,
     currency,
@@ -427,11 +458,12 @@ export async function getHitPayPaymentRequestStatus(
   if (!cleanId) {
     return { ok: false, statusCode: 400, error: 'Missing HitPay payment request ID.' };
   }
-  if (!config.apiKey) {
+  if (!isHitPaySandboxConfigured(config)) {
     return {
       ok: false,
       statusCode: 503,
-      error: 'provider_not_configured: Missing HitPay sandbox API key.',
+      error:
+        'provider_not_configured: HitPay sandbox API key and webhook signing secret are required.',
     };
   }
 
@@ -461,6 +493,54 @@ export async function getHitPayPaymentRequestStatus(
     return { ok: true, statusCode: res.status, data: json };
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'HitPay status request failed';
+    return { ok: false, statusCode: 503, error: msg };
+  }
+}
+
+export async function getHitPayRefundStatus(
+  refundId: string,
+  config: HitPaySandboxConfig,
+  fetchFn: HitPayFetchLike = globalThis.fetch
+): Promise<{ ok: boolean; statusCode: number; data?: HitPayRefundRecord; error?: string }> {
+  const cleanId = (refundId || '').trim();
+  if (!cleanId) {
+    return { ok: false, statusCode: 400, error: 'Missing HitPay refund ID.' };
+  }
+  if (!isHitPaySandboxConfigured(config)) {
+    return {
+      ok: false,
+      statusCode: 503,
+      error:
+        'provider_not_configured: HitPay sandbox API key and webhook signing secret are required.',
+    };
+  }
+
+  try {
+    const res = await fetchWithTimeout(
+      `${config.baseUrl}/v1/refund/${encodeURIComponent(cleanId)}`,
+      {
+        method: 'GET',
+        headers: {
+          'X-BUSINESS-API-KEY': config.apiKey,
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+      },
+      config.timeoutMs,
+      fetchFn
+    );
+
+    const json = (await res.json().catch(() => null)) as HitPayRefundRecord | null;
+    if (!res.ok || !json || typeof json !== 'object') {
+      return {
+        ok: false,
+        statusCode: res.status,
+        error: `HitPay refund lookup failed with status ${res.status}.`,
+      };
+    }
+
+    return { ok: true, statusCode: res.status, data: json };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : 'HitPay refund lookup failed';
     return { ok: false, statusCode: 503, error: msg };
   }
 }
@@ -562,11 +642,7 @@ export async function createHitPaySandboxPaymentRequest(
   recovered: boolean;
   rawResponse: Record<string, unknown>;
 }> {
-  if (!config.apiKey) {
-    throw new HitPayNotConfiguredError(
-      'provider_not_configured: Missing HitPay sandbox API key (HITPAY_SANDBOX_API_KEY). Real HitPay checkout is disabled until credentials are configured.'
-    );
-  }
+  assertHitPaySandboxConfigured(config);
 
   const currency = assertHitPayPhpCurrency(params.currency);
   const decimalAmount = formatCentavosToHitPayDecimal(params.amountCentavos);
@@ -595,24 +671,28 @@ export async function createHitPaySandboxPaymentRequest(
     );
   }
 
-  const requestBody: Record<string, unknown> = {
-    amount: decimalAmount,
-    currency,
-    reference_number: params.referenceCode,
-    purpose: params.description,
-    name: params.customerName,
-    redirect_url: params.successUrl,
-    allow_repeated_payments: false,
-    send_sms: false,
-    send_email: Boolean(params.customerEmail),
-  };
+  const formParams = new URLSearchParams();
+  formParams.set('amount', decimalAmount);
+  formParams.set('currency', currency);
+  formParams.set('reference_number', params.referenceCode);
+  formParams.set('purpose', params.description);
+  formParams.set('name', params.customerName);
+  formParams.set('redirect_url', params.successUrl);
+  formParams.set('allow_repeated_payments', 'false');
+  formParams.set('send_sms', 'false');
+  formParams.set('send_email', params.customerEmail ? 'true' : 'false');
 
-  if (params.customerEmail) requestBody.email = params.customerEmail;
-  if (params.customerPhone) requestBody.phone = params.customerPhone;
-  if (params.webhookUrl) requestBody.webhook = params.webhookUrl;
-  if (params.expiresAt) requestBody.expiry_date = params.expiresAt;
+  if (params.customerEmail) formParams.set('email', params.customerEmail);
+  if (params.customerPhone) formParams.set('phone', params.customerPhone);
+  if (params.webhookUrl) formParams.set('webhook', params.webhookUrl);
+  if (params.expiresAt) formParams.set('expiry_date', params.expiresAt);
   if (params.paymentMethods && params.paymentMethods.length > 0) {
-    requestBody.payment_methods = params.paymentMethods;
+    for (const method of params.paymentMethods) {
+      const cleanMethod = String(method || '').trim();
+      if (cleanMethod) {
+        formParams.append('payment_methods[]', cleanMethod);
+      }
+    }
   }
 
   let response: Response;
@@ -622,11 +702,11 @@ export async function createHitPaySandboxPaymentRequest(
       {
         method: 'POST',
         headers: {
-          'Content-Type': 'application/json',
+          'Content-Type': 'application/x-www-form-urlencoded',
           'X-BUSINESS-API-KEY': config.apiKey,
           'X-Requested-With': 'XMLHttpRequest',
         },
-        body: JSON.stringify(requestBody),
+        body: formParams.toString(),
       },
       config.timeoutMs,
       fetchFn

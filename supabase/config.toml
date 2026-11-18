@@ -1,0 +1,9 @@
+# Supabase Edge Function Gateway Configuration (LockaCourt)
+#
+# External HitPay webhook callbacks arrive directly from HitPay without a Supabase user JWT.
+# Gateway JWT verification is disabled strictly for `hitpay-webhook`, while the function
+# strictly enforces raw-body HMAC-SHA256 `Hitpay-Signature` verification before touching
+# the database or settlement inbox.
+
+[functions.hitpay-webhook]
+verify_jwt = false

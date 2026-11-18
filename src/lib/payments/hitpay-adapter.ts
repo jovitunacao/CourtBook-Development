@@ -12,8 +12,11 @@ import type {
   ProviderCheckoutSessionResult,
 } from './types';
 import {
+  assertHitPaySandboxConfigured,
   createHitPaySandboxPaymentRequest,
   getHitPayPaymentRequestStatus,
+  getHitPayRefundStatus,
+  isHitPaySandboxConfigured,
   normalizeHitPayWebhook,
   resolveHitPaySandboxConfig,
   type HitPayFetchLike,
@@ -27,7 +30,6 @@ export interface HitPayAdapterOptions {
 
 export class HitPayAdapter implements PaymentProviderAdapter {
   readonly providerName = 'hitpay' as const;
-  readonly isReady = true;
 
   private readonly fetchFn: HitPayFetchLike;
   private readonly envOverrides?: Record<string, string | undefined>;
@@ -46,16 +48,21 @@ export class HitPayAdapter implements PaymentProviderAdapter {
       : {};
   }
 
+  get isReady(): boolean {
+    return this.isConfigured();
+  }
+
   /**
-   * Returns true only when sandbox configuration is valid and an API key is available.
+   * Returns true only when sandbox configuration is valid and BOTH API key and webhook salt are available.
    */
-  isConfigured(secretKey?: string): boolean {
+  isConfigured(secretKey?: string, webhookSalt?: string): boolean {
     try {
       const cfg = resolveHitPaySandboxConfig(this.getRuntimeEnv(), {
         apiKey: secretKey,
+        webhookSalt,
         timeoutMs: this.timeoutMs,
       });
-      return Boolean(cfg.apiKey);
+      return isHitPaySandboxConfigured(cfg);
     } catch {
       return false;
     }
@@ -73,6 +80,7 @@ export class HitPayAdapter implements PaymentProviderAdapter {
       apiKey: secretKey,
       timeoutMs: this.timeoutMs,
     });
+    assertHitPaySandboxConfigured(config);
 
     const res = await createHitPaySandboxPaymentRequest(
       {
@@ -108,6 +116,17 @@ export class HitPayAdapter implements PaymentProviderAdapter {
       timeoutMs: this.timeoutMs,
     });
     return getHitPayPaymentRequestStatus(paymentRequestId, config, this.fetchFn);
+  }
+
+  /**
+   * Authoritatively retrieves a HitPay Sandbox Refund record by ID.
+   */
+  async getRefundStatus(refundId: string, secretKey?: string) {
+    const config = resolveHitPaySandboxConfig(this.getRuntimeEnv(), {
+      apiKey: secretKey,
+      timeoutMs: this.timeoutMs,
+    });
+    return getHitPayRefundStatus(refundId, config, this.fetchFn);
   }
 
   /**

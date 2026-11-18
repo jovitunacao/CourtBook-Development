@@ -19,6 +19,7 @@ import {
   HitPayNotConfiguredError,
   HitPayReconciliationError,
   HitPayValidationError,
+  isHitPaySandboxConfigured,
   resolveHitPaySandboxConfig,
   type HitPayFetchLike,
 } from '../_shared/hitpay.ts';
@@ -196,7 +197,7 @@ export async function handleCreateCheckoutSessionRequest(
     if (providerName === 'hitpay') {
       try {
         hitpayConfig = resolveHitPaySandboxConfig(env);
-        if (!hitpayConfig.apiKey || !hitpayConfig.webhookSalt) {
+        if (!isHitPaySandboxConfigured(hitpayConfig)) {
           return jsonResponse(
             {
               success: false,
