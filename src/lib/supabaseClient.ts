@@ -1170,7 +1170,7 @@ export interface CreateBookingCheckoutInput {
   start_time: string; // ISO 8601 UTC
   duration_minutes: number;
   idempotency_key: string;
-  provider_name?: 'paymongo' | 'xendit' | 'manual_test';
+  provider_name?: 'paymongo' | 'hitpay' | 'xendit' | 'manual_test';
   is_demo?: boolean;
   is_frontend_demo?: boolean; // Explicit flag for frontend-only fictional inventory
   hourly_rate?: number; // Used to calculate accurate amounts for demo checkout
@@ -1183,6 +1183,7 @@ export interface CreateBookingCheckoutResult {
   reservation_id?: string;
   payment_id?: string;
   reference_code?: string;
+  provider_name?: string;
   checkout_session_id?: string;
   expected_amount?: number;
   currency?: string;
@@ -1197,6 +1198,8 @@ export interface CreateBookingCheckoutResult {
   idempotent_replayed?: boolean;
   isConflict?: boolean;
   isSimulated?: boolean;
+  code?: string;
+  status?: string;
   error?: string;
 }
 
@@ -1289,7 +1292,7 @@ export async function createBookingCheckoutSession(
           start_time: input.start_time,
           duration_minutes: input.duration_minutes,
           idempotency_key: idempotencyKey,
-          provider_name: input.provider_name || 'paymongo',
+          ...(input.provider_name ? { provider_name: input.provider_name } : {}),
         }),
       });
 
@@ -1301,6 +1304,7 @@ export async function createBookingCheckoutSession(
           reservation_id: json.reservation_id,
           payment_id: json.payment_id,
           reference_code: json.reference_code,
+          provider_name: json.provider_name,
           checkout_session_id: json.checkout_session_id,
           expected_amount: Number(json.expected_amount),
           currency: json.currency || '₱',
@@ -1328,6 +1332,9 @@ export async function createBookingCheckoutSession(
       if (json?.error) {
         return {
           success: false,
+          code: json.code,
+          status: json.status,
+          provider_name: json.provider_name,
           error: json.error,
         };
       }
@@ -1358,6 +1365,7 @@ export interface VerifyBookingPaymentStatusResult {
   reservation_id?: string;
   reference_code?: string;
   payment_id?: string;
+  provider_name?: string;
   payment_status?: string;
   hold_expires_at?: string;
   total_price?: number;
@@ -1407,7 +1415,7 @@ export async function verifyPublicBookingPaymentStatus(input: {
   // Invoke the authoritative backend get-booking-status Edge Function
   const endpoint = supabaseUrl
     ? `${supabaseUrl}/functions/v1/get-booking-status`
-    : 'https://backend.courtbook.ph/functions/v1/get-booking-status';
+    : 'https://lockacourt.com/functions/v1/get-booking-status';
 
   try {
     const headers: Record<string, string> = {
@@ -1463,6 +1471,7 @@ export async function verifyPublicBookingPaymentStatus(input: {
           reservation_id: json.reservation_id,
           reference_code: json.reference_code,
           payment_id: json.payment_id,
+          provider_name: json.provider_name,
           payment_status: json.payment_status,
           hold_expires_at: json.hold_expires_at,
           total_price: json.total_price !== undefined ? Number(json.total_price) : undefined,

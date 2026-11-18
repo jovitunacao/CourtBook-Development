@@ -64,6 +64,8 @@ const VALID_CAPTURE_EVENT_TYPES = new Set([
   'payment.paid',
   'checkout_session.payment.paid',
   'payment.captured',
+  'payment_request.completed',
+  'charge.created',
 ]);
 
 function jsonResponse(body: Record<string, unknown>, status: number, extraHeaders?: Record<string, string>): Response {
@@ -664,6 +666,7 @@ export async function handleGetBookingStatusRequest(
       reservation_id: reservation.id,
       reference_code: reservation.reference_code,
       payment_id: payment?.id || null,
+      provider_name: payment?.provider_name || null,
       total_price: reservationPrice,
       currency: reservation.currency || '₱',
       duration_minutes: Number(reservation.duration_minutes) || 60,

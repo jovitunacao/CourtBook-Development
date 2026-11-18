@@ -12,6 +12,7 @@ import type {
   ProviderCheckoutSessionResult
 } from './types';
 import { PayMongoAdapter } from './paymongo-adapter';
+import { HitPayAdapter } from './hitpay-adapter';
 
 /**
  * Xendit Provider Adapter Stub
@@ -57,7 +58,7 @@ export class ManualTestAdapter implements PaymentProviderAdapter {
     const simulatedId = `cs_manual_${params.referenceCode}`;
     return {
       providerCheckoutId: simulatedId,
-      checkoutUrl: `https://courtbook.app/test-checkout/${simulatedId}`,
+      checkoutUrl: `https://lockacourt.com/test-checkout/${simulatedId}`,
       isSimulated: true,
       rawResponse: {
         simulated: true,
@@ -87,6 +88,7 @@ export class ManualTestAdapter implements PaymentProviderAdapter {
 export class PaymentProviderRegistry {
   private static adapters: Map<PaymentProviderName, PaymentProviderAdapter> = new Map<PaymentProviderName, PaymentProviderAdapter>([
     ['paymongo', new PayMongoAdapter()],
+    ['hitpay', new HitPayAdapter()],
     ['xendit', new XenditAdapter()],
     ['manual_test', new ManualTestAdapter()]
   ]);

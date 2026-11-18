@@ -59,11 +59,18 @@ export const PaymentCheckoutBridge: React.FC<PaymentCheckoutBridgeProps> = ({
   const seconds = secondsRemaining % 60;
   const timeFormatted = `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
 
+  const detectedProvider =
+    checkoutResult?.provider_name === 'hitpay' ||
+    Boolean(checkoutResult?.checkout_url && checkoutResult.checkout_url.includes('hit-pay.com'))
+      ? 'hitpay'
+      : 'paymongo';
+  const providerDisplayName = detectedProvider === 'hitpay' ? 'HitPay' : 'PayMongo';
+
   const paymentChannels = [
     { name: 'GCash', tag: 'E-Wallet', color: 'bg-blue-50 text-blue-700 border-blue-200' },
     { name: 'Maya', tag: 'E-Wallet', color: 'bg-emerald-50 text-emerald-700 border-emerald-200' },
     { name: 'Credit / Debit Card', tag: 'Visa, Mastercard', color: 'bg-slate-50 text-slate-700 border-slate-200' },
-    { name: 'GrabPay', tag: 'E-Wallet', color: 'bg-green-50 text-green-700 border-green-200' },
+    { name: 'QR Ph', tag: 'InstaPay / PESONet', color: 'bg-green-50 text-green-700 border-green-200' },
     { name: 'Online Banking', tag: 'BPI, UnionBank, RCBC', color: 'bg-purple-50 text-purple-700 border-purple-200' },
   ];
 
@@ -78,7 +85,7 @@ export const PaymentCheckoutBridge: React.FC<PaymentCheckoutBridgeProps> = ({
             Securing Your Court Slot...
           </h3>
           <p className="text-xs text-slate-500 leading-relaxed">
-            Acquiring concurrency-safe hold and initializing PayMongo checkout session...
+            Acquiring concurrency-safe hold and initializing LockaCourt checkout session...
           </p>
         </div>
       </div>
@@ -152,7 +159,7 @@ export const PaymentCheckoutBridge: React.FC<PaymentCheckoutBridgeProps> = ({
               Step 7: Complete Payment
             </span>
             <h3 className="text-lg font-extrabold text-slate-900 mt-1">
-              PayMongo Official Checkout
+              {providerDisplayName} Official Checkout
             </h3>
           </div>
           <div className="text-right">
@@ -198,7 +205,7 @@ export const PaymentCheckoutBridge: React.FC<PaymentCheckoutBridgeProps> = ({
               rel="noopener noreferrer"
               className="w-full py-4 px-6 rounded-2xl bg-blue-600 hover:bg-blue-700 text-white text-sm font-extrabold flex items-center justify-center gap-2 transition-all shadow-md shadow-blue-500/20"
             >
-              <span>Open PayMongo Hosted Checkout</span>
+              <span>Open {providerDisplayName} Hosted Checkout</span>
               <ExternalLink className="w-4 h-4" />
             </a>
           )}
@@ -227,7 +234,7 @@ export const PaymentCheckoutBridge: React.FC<PaymentCheckoutBridgeProps> = ({
                   <span>{isCheckingStatus ? 'Verifying Authoritative Backend Status...' : 'Awaiting Authoritative Payment Capture'}</span>
                 </div>
                 <p className="text-[11px] text-slate-500 max-w-sm mx-auto">
-                  Complete your payment on the PayMongo checkout window. Once confirmed by the webhook, click below to verify and receive your digital pass.
+                  Complete your payment on the LockaCourt {providerDisplayName} checkout window. Once confirmed by the webhook, click below to verify and receive your digital pass.
                 </p>
                 {statusMessage && (
                   <p className="text-[11px] text-amber-700 font-medium pt-1">

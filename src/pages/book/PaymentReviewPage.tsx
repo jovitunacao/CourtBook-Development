@@ -129,7 +129,6 @@ export const PaymentReviewPage: React.FC = () => {
         start_time: selectedStartTimeIso!,
         duration_minutes: durationMinutes,
         idempotency_key: idempotencyKey,
-        provider_name: 'paymongo',
         is_demo: Boolean(activeFacility?.is_demo),
         is_frontend_demo: isFrontendDemo,
         hourly_rate: Number(activeCourt!.hourly_rate),
@@ -325,7 +324,7 @@ export const PaymentReviewPage: React.FC = () => {
     <BookingPageLayout
       currentStep={6}
       title="Review & Complete Payment"
-      subtitle="Pay securely via PayMongo (GCash, Maya, Credit/Debit Card, Bank Transfer)"
+      subtitle="Pay securely via LockaCourt Checkout (GCash, Maya, Cards, Online Banking, QR Ph)"
       backUrl="/book/details"
     >
       <PaymentCheckoutBridge

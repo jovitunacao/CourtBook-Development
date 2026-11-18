@@ -14,6 +14,8 @@
     "test:005b": "tsx tests/supabase/run-005b-validation-gate.ts",
     "test:005c": "tsx tests/supabase/run-005c-validation-gate.ts",
     "test:005d": "tsx tests/supabase/run-005d-validation-gate.ts",
+    "test:005e": "tsx tests/supabase/run-005e-validation-gate.ts",
+    "test:hitpay": "tsx tests/payments/hitpay-integration.test.ts",
     "test:frontend": "tsx tests/frontend/venue-directory.test.ts",
     "test:booking": "tsx tests/frontend/customer-booking-flow.test.ts",
     "test:status": "tsx tests/frontend/backend-payment-status.test.ts",

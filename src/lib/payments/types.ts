@@ -3,7 +3,7 @@
 // File: src/lib/payments/types.ts
 // ==============================================================================
 
-export type PaymentProviderName = 'paymongo' | 'xendit' | 'manual_test';
+export type PaymentProviderName = 'paymongo' | 'hitpay' | 'xendit' | 'manual_test';
 
 export interface CheckoutSessionParams {
   idempotencyKey: string;
@@ -66,6 +66,8 @@ export interface ProviderCheckoutSessionParams {
   referenceCode: string;
   successUrl: string;
   cancelUrl: string;
+  webhookUrl?: string;
+  expiresAt?: string;
   metadata?: Record<string, string>;
 }
 

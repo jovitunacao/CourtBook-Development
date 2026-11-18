@@ -174,7 +174,6 @@ export const CustomerBookingFlow: React.FC<CustomerBookingFlowProps> = ({
       start_time: selectedStartTimeIso,
       duration_minutes: durationMinutes,
       idempotency_key: idempotencyKey,
-      provider_name: 'paymongo',
     });
 
     setIsSubmittingCheckout(false);
