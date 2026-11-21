@@ -289,13 +289,13 @@ export const AdminPage: React.FC<AdminPageProps> = ({
             <div className="p-4 rounded-xl bg-slate-50 border border-slate-200/80 space-y-2">
               <div className="flex items-center gap-2 text-xs font-bold text-slate-800">
                 <Info className="w-4 h-4 text-blue-600 shrink-0" />
-                <span>Welcome to CourtBook / BookSuite!</span>
+                <span>Welcome to LockaCourt!</span>
               </div>
               <p className="text-xs text-slate-600 leading-relaxed">
                 Your owner account has been registered and verified in Supabase Auth. However, you do not have an active sports organization or facility associated with your account yet.
               </p>
               <p className="text-xs text-slate-500 leading-relaxed">
-                Self-service organization creation and court configuration will be enabled in <strong>Stage 3.3</strong>. Once completed, your organization's facilities and courts will appear here for management.
+                Complete your organization and court onboarding wizard to start managing your facilities on LockaCourt.
               </p>
             </div>
 

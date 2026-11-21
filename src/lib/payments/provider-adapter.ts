@@ -1,5 +1,5 @@
 // ==============================================================================
-// CourtBook / BookSuite — Payment Provider Registry & Adapter Factory
+// LockaCourt (AratReserve) — Payment Provider Registry & Adapter Factory
 // File: src/lib/payments/provider-adapter.ts
 // ==============================================================================
 

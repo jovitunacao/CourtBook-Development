@@ -1,5 +1,5 @@
 // ==============================================================================
-// CourtBook / BookSuite — Fictional Demo Venues Dataset
+// LockaCourt (AratReserve) — Fictional Demo Venues Dataset
 // File: src/data/demoVenues.ts
 // Description:
 //   12 fictional court businesses and 36 courts across Luzon, Visayas, and Mindanao.

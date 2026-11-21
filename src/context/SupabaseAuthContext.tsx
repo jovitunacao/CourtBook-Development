@@ -20,6 +20,7 @@ import {
   FacilityReservationsResult,
 } from '../lib/supabaseClient';
 import { FacilitySettings, Reservation } from '../types/booking';
+import { getAuthEmailRedirectUrl } from '../lib/appUrl';
 
 export type OnboardingState = 'loading' | 'needs_onboarding' | 'ready' | 'error';
 
@@ -502,6 +503,9 @@ export const SupabaseAuthProvider: React.FC<{ children: React.ReactNode }> = ({ 
       const { data, error } = await supabase.auth.signUp({
         email: cleanEmail,
         password,
+        options: {
+          emailRedirectTo: getAuthEmailRedirectUrl('/admin'),
+        },
       });
 
       const isDuplicateError = error && (

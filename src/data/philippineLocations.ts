@@ -1,5 +1,5 @@
 // ==============================================================================
-// CourtBook / BookSuite — Philippine Geographic Hierarchy Dataset
+// LockaCourt (AratReserve) — Philippine Geographic Hierarchy Dataset
 // File: src/data/philippineLocations.ts
 // ==============================================================================
 

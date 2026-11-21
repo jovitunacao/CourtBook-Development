@@ -1,5 +1,5 @@
 // ==============================================================================
-// CourtBook / BookSuite — Sports Category Registry & Taxonomy
+// LockaCourt (AratReserve) — Sports Category Registry & Taxonomy
 // File: src/data/sportsRegistry.ts
 // ==============================================================================
 

@@ -1,5 +1,5 @@
 // ==============================================================================
-// CourtBook / BookSuite — Step 2: Location Selection Page
+// LockaCourt (AratReserve) — Step 2: Location Selection Page
 // File: src/pages/book/LocationSelectionPage.tsx
 // Route: /book/location
 // ==============================================================================

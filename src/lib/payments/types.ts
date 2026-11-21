@@ -1,5 +1,5 @@
 // ==============================================================================
-// CourtBook / BookSuite — Payment Integration Types
+// LockaCourt (AratReserve) — Payment Integration Types
 // File: src/lib/payments/types.ts
 // ==============================================================================
 

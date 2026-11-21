@@ -1,5 +1,5 @@
 // ==============================================================================
-// CourtBook / BookSuite — Create-Booking Response Mapper & Validator
+// LockaCourt (AratReserve) — Create-Booking Response Mapper & Validator
 //
 // Maps the flat JSONB record returned by create_public_reservation_idempotent()
 // into the authoritative HTTP response envelope expected by the frontend.

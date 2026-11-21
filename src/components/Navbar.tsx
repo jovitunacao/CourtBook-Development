@@ -15,7 +15,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   currentTab: propCurrentTab,
   setCurrentTab,
   activeReservationsCount,
-  facilityName = 'CourtBook',
+  facilityName = 'LockaCourt',
   onOpenAuthModal,
 }) => {
   const navigate = useNavigate();
@@ -59,11 +59,19 @@ export const Navbar: React.FC<NavbarProps> = ({
 
   return (
     <header className="sticky top-0 z-40 bg-white/95 backdrop-blur-md border-b border-slate-200 shadow-xs">
-      {/* BookSuite Sub-banner */}
+      {/* AratReserve Parent Attribution Banner */}
       <div className="bg-slate-900 text-slate-300 text-xs py-1.5 px-4 text-center font-medium flex items-center justify-center gap-2">
         <span className="inline-block w-2 h-2 rounded-full bg-blue-400"></span>
         <span>
-          <strong className="text-white">BookSuite</strong> Product Ecosystem &bull; Phase 1 Prototype Demo
+          <strong className="text-white">LockaCourt</strong> &bull; Sports Court Booking Platform by{' '}
+          <a
+            href="https://aratreserve.com"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-blue-300 hover:text-white underline underline-offset-2 transition-colors"
+          >
+            AratReserve
+          </a>
         </span>
       </div>
 
@@ -80,11 +88,13 @@ export const Navbar: React.FC<NavbarProps> = ({
             <div>
               <div className="flex items-center gap-2">
                 <span className="font-extrabold text-xl tracking-tight text-slate-900 group-hover:text-blue-600 transition-colors">
-                  CourtBook
+                  LockaCourt
                 </span>
-                <span className="text-[10px] font-bold uppercase tracking-wider bg-blue-50 text-blue-700 px-2 py-0.5 rounded-full border border-blue-200">
-                  Phase 1
-                </span>
+                {!isConfigured && (
+                  <span className="text-[10px] font-bold uppercase tracking-wider bg-amber-50 text-amber-700 px-2 py-0.5 rounded-full border border-amber-200">
+                    Demo
+                  </span>
+                )}
               </div>
               <p className="text-[11px] text-slate-600 hidden sm:block -mt-0.5 truncate max-w-[180px]">
                 {facilityName}
@@ -124,7 +134,7 @@ export const Navbar: React.FC<NavbarProps> = ({
               }`}
             >
               <Shield className="w-4 h-4 text-blue-400" />
-              <span>Admin Demo</span>
+              <span>Owner Admin</span>
               {activeReservationsCount > 0 && (
                 <span className="ml-1 px-1.5 py-0.5 text-xs font-bold rounded-full bg-blue-500 text-white">
                   {activeReservationsCount}
@@ -267,7 +277,7 @@ export const Navbar: React.FC<NavbarProps> = ({
           >
             <span className="flex items-center gap-2">
               <Shield className="w-4 h-4 text-blue-400" />
-              Admin Demo (Reservations)
+              Owner Admin (Reservations)
             </span>
             {activeReservationsCount > 0 && (
               <span className="px-2 py-0.5 text-xs font-bold rounded-full bg-blue-500 text-white">

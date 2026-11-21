@@ -126,7 +126,7 @@ export const SupabaseStatusBanner: React.FC<SupabaseStatusBannerProps> = ({
                     : 'bg-amber-50 text-amber-700 border-amber-200'
                 }`}
               >
-                {isConfigured ? 'BookSuite-Dev (Live)' : 'Local / Demo Mode'}
+                {isConfigured ? 'LockaCourt (Live)' : 'Local / Demo Mode'}
               </span>
               {isAuthenticated && (
                 <span

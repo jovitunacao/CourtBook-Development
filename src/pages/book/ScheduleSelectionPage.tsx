@@ -1,5 +1,5 @@
 // ==============================================================================
-// CourtBook / BookSuite — Step 4: Schedule Selection Page
+// LockaCourt (AratReserve) — Step 4: Schedule Selection Page
 // File: src/pages/book/ScheduleSelectionPage.tsx
 // Route: /book/schedule
 // ==============================================================================

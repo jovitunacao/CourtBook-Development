@@ -1,10 +1,10 @@
 /**
- * CourtBook / BookSuite — Phase 3, Stage 3.3: Owner Onboarding Database Service Helpers
+ * LockaCourt (AratReserve) — Owner Onboarding Database Service Helpers
  *
  * Provides typed, secure, and validated Supabase client helpers for creating an owner's
  * organization, primary facility, and initial courts.
  *
- * Enforces all BookSuite database schema constraints and RLS security:
+ * Enforces all LockaCourt database schema constraints and RLS security:
  * - Organization creation via secure public.create_organization_with_owner RPC
  * - Facility creation strictly adhering to RLS owners_can_insert_facilities policy
  * - Court creation strictly adhering to RLS staff_can_manage_facility_courts policy

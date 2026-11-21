@@ -36,9 +36,9 @@ export const BookingConfirmationCard: React.FC<BookingConfirmationCardProps> = (
     const icsContent = [
       'BEGIN:VCALENDAR',
       'VERSION:2.0',
-      'PRODID:-//CourtBook Philippines//Customer Booking//EN',
+      'PRODID:-//LockaCourt//Customer Booking//EN',
       'BEGIN:VEVENT',
-      `UID:${details.referenceCode}-${Date.now()}@courtbook.app`,
+      `UID:${details.referenceCode}-${Date.now()}@lockacourt.com`,
       `DTSTAMP:${cleanDate}T000000Z`,
       `DTSTART:${cleanDate}T080000Z`,
       `DTEND:${cleanDate}T090000Z`,
@@ -54,7 +54,7 @@ export const BookingConfirmationCard: React.FC<BookingConfirmationCardProps> = (
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.setAttribute('download', `CourtBook-${details.referenceCode}.ics`);
+    link.setAttribute('download', `LockaCourt-${details.referenceCode}.ics`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);

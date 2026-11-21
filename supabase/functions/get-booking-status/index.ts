@@ -1,5 +1,5 @@
 // ==============================================================================
-// CourtBook / BookSuite — Authoritative Public Booking Status Verification Edge Function
+// LockaCourt (AratReserve) — Authoritative Public Booking Status Verification Edge Function
 // Endpoint: POST /get-booking-status
 // ==============================================================================
 

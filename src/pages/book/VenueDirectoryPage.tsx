@@ -1,5 +1,5 @@
 // ==============================================================================
-// CourtBook / BookSuite — Step 3: Venue Directory Page
+// LockaCourt (AratReserve) — Step 3: Venue Directory Page
 // File: src/pages/book/VenueDirectoryPage.tsx
 // Route: /book/venues
 // ==============================================================================

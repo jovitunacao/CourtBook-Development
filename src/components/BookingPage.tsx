@@ -898,7 +898,7 @@ export const BookingPage: React.FC<BookingPageProps> = ({
                     </span>
                   </div>
                   <p className="text-xs text-emerald-900/90 leading-relaxed">
-                    Your court reservation has been recorded in the CourtBook system. Your reference code is ready for check-in.
+                    Your court reservation has been recorded in the LockaCourt system. Your reference code is ready for check-in.
                   </p>
                 </div>
               </div>
@@ -938,7 +938,7 @@ export const BookingPage: React.FC<BookingPageProps> = ({
                   ? 'Local demonstration simulation — not stored in live database.'
                   : confirmedReservation.status === 'pending'
                   ? 'Hold placed in database awaiting staff review.'
-                  : 'Official booking recorded in CourtBook.'}
+                  : 'Official booking recorded in LockaCourt.'}
               </p>
               <div
                 className={`mt-4 inline-block px-4 py-1.5 rounded-full font-mono font-bold text-sm shadow-xs ${
@@ -1043,7 +1043,7 @@ export const BookingPage: React.FC<BookingPageProps> = ({
                   </>
                 ) : (
                   <>
-                    <p>• Reference #{confirmedReservation.referenceCode} is recorded in the CourtBook database.</p>
+                    <p>• Reference #{confirmedReservation.referenceCode} is recorded in the LockaCourt database.</p>
                     <p>• Present this reference code upon arrival at the venue for court check-in.</p>
                   </>
                 )}

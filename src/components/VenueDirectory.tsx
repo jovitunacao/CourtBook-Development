@@ -63,7 +63,7 @@ export const VenueDirectory: React.FC<VenueDirectoryProps> = ({
           </div>
           <div className="mt-8 flex items-center justify-center gap-2 text-xs font-semibold text-slate-500">
             <Loader2 className="w-4 h-4 animate-spin text-blue-600" />
-            <span>Fetching venues from CourtBook directory...</span>
+            <span>Fetching venues from LockaCourt directory...</span>
           </div>
         </div>
       </div>
@@ -153,7 +153,7 @@ export const VenueDirectory: React.FC<VenueDirectoryProps> = ({
         <div className="text-center max-w-2xl mx-auto mb-10 space-y-2">
           <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-blue-50 border border-blue-200 text-blue-700 text-xs font-bold uppercase tracking-wider">
             <Building2 className="w-3.5 h-3.5" />
-            <span>CourtBook Venue Directory</span>
+            <span>LockaCourt Venue Directory</span>
           </span>
           <h1 className="text-2xl sm:text-4xl font-extrabold text-slate-900 tracking-tight">
             Choose a Court Business

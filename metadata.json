@@ -1,6 +1,6 @@
 {
-  "name": "CourtBook - Sports Court Reservation System",
-  "description": "Book sports and pickleball courts in seconds. Fast, responsive reservation platform by BookSuite.",
+  "name": "LockaCourt - Sports Court Reservation Platform",
+  "description": "Book pickleball, badminton, tennis, and sports courts in seconds on LockaCourt, operated by AratReserve.",
   "requestFramePermissions": [],
   "majorCapabilities": [
     "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"

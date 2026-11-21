@@ -1,5 +1,5 @@
 // ==============================================================================
-// CourtBook / BookSuite — Step 1: Sport Selection Page
+// LockaCourt (AratReserve) — Step 1: Sport Selection Page
 // File: src/pages/book/SportSelectionPage.tsx
 // Route: /book/sport
 // ==============================================================================

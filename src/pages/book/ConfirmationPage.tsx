@@ -1,5 +1,5 @@
 // ==============================================================================
-// CourtBook / BookSuite — Step 7: Booking Confirmation Page
+// LockaCourt (AratReserve) — Step 7: Booking Confirmation Page
 // File: src/pages/book/ConfirmationPage.tsx
 // Route: /book/confirmation
 // ==============================================================================

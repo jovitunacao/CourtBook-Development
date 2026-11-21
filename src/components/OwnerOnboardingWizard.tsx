@@ -409,7 +409,7 @@ export const OwnerOnboardingWizard: React.FC<OwnerOnboardingWizardProps> = ({
                   </span>
                 </div>
                 <h1 className="text-xl sm:text-2xl font-black text-slate-900 tracking-tight mt-0.5">
-                  Launch Your CourtBook Business
+                  Launch Your LockaCourt Business
                 </h1>
               </div>
             </div>
@@ -543,7 +543,7 @@ export const OwnerOnboardingWizard: React.FC<OwnerOnboardingWizardProps> = ({
               <div className="space-y-1">
                 <h2 className="text-lg font-bold text-slate-900">Step 1 — Register Your Organization</h2>
                 <p className="text-xs text-slate-500">
-                  Every athletic venue on BookSuite belongs to an organization. You will be registered as the primary owner.
+                  Every athletic venue on LockaCourt belongs to an organization. You will be registered as the primary owner.
                 </p>
               </div>
 
@@ -574,7 +574,7 @@ export const OwnerOnboardingWizard: React.FC<OwnerOnboardingWizardProps> = ({
                   </div>
                   <div className="flex items-center rounded-xl border border-slate-200 bg-slate-50 focus-within:ring-2 focus-within:ring-blue-500 focus-within:border-transparent overflow-hidden">
                     <span className="px-3 text-xs text-slate-400 font-mono select-none">
-                      courtbook.app/org/
+                      lockacourt.com/org/
                     </span>
                     <input
                       type="text"
@@ -691,7 +691,7 @@ export const OwnerOnboardingWizard: React.FC<OwnerOnboardingWizardProps> = ({
                   </div>
                   <div className="flex items-center rounded-xl border border-slate-200 bg-slate-50 focus-within:ring-2 focus-within:ring-blue-500 focus-within:border-transparent overflow-hidden">
                     <span className="px-3 text-xs text-slate-400 font-mono select-none">
-                      courtbook.app/
+                      lockacourt.com/
                     </span>
                     <input
                       type="text"

@@ -1,5 +1,5 @@
 // ==============================================================================
-// CourtBook / BookSuite — Multi-Page Customer Booking Context
+// LockaCourt (AratReserve) — Multi-Page Customer Booking Context
 // File: src/context/CustomerBookingContext.tsx
 // Description:
 //   Persists customer booking draft across dedicated URLs and page refreshes.

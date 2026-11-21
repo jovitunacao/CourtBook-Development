@@ -46,7 +46,7 @@ import { GuestDetailsPage } from './pages/book/GuestDetailsPage';
 import { PaymentReviewPage } from './pages/book/PaymentReviewPage';
 import { ConfirmationPage } from './pages/book/ConfirmationPage';
 
-function CourtBookMainContent() {
+function LockaCourtMainContent() {
   const navigate = useNavigate();
   const location = useLocation();
 
@@ -83,10 +83,10 @@ function CourtBookMainContent() {
   // Header display name
   const displayFacilityName =
     user && onboardingState === 'needs_onboarding'
-      ? 'CourtBook Owner Portal'
+      ? 'LockaCourt Owner Portal'
       : location.pathname.startsWith('/admin') || location.pathname.startsWith('/settings')
       ? activeSettings.name
-      : publicActiveSettings?.name || 'CourtBook Directory';
+      : publicActiveSettings?.name || 'LockaCourt Directory';
 
   // Initialize from localStorage
   useEffect(() => {
@@ -477,7 +477,7 @@ export default function App() {
     <BrowserRouter>
       <SupabaseAuthProvider>
         <CustomerBookingProvider>
-          <CourtBookMainContent />
+          <LockaCourtMainContent />
         </CustomerBookingProvider>
       </SupabaseAuthProvider>
     </BrowserRouter>

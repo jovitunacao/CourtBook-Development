@@ -368,7 +368,7 @@ export const FacilitySettingsPage: React.FC<FacilitySettingsPageProps> = ({
                 Live Supabase Facility Settings (Read-Only)
               </span>
               <p className="text-purple-900/90 leading-relaxed">
-                You are currently managing <strong>{staffData?.activeFacility?.name}</strong> on BookSuite-Dev.
+                You are currently managing <strong>{staffData?.activeFacility?.name}</strong> on LockaCourt.
                 In accordance with database security architecture, live facility settings, operating hours,
                 and court schemas are governed through database migrations. Browser-side administrative updates
                 to live facilities are restricted.

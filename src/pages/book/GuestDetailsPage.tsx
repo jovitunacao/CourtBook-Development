@@ -1,5 +1,5 @@
 // ==============================================================================
-// CourtBook / BookSuite — Step 5: Guest Details Page
+// LockaCourt (AratReserve) — Step 5: Guest Details Page
 // File: src/pages/book/GuestDetailsPage.tsx
 // Route: /book/details
 // ==============================================================================

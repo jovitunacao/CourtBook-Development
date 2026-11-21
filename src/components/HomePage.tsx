@@ -59,7 +59,7 @@ export const HomePage: React.FC<HomePageProps> = ({
 
             {/* Short Explanation */}
             <p className="text-lg sm:text-xl text-slate-600 leading-relaxed max-w-2xl mx-auto">
-              CourtBook is the streamlined reservation system built for pickleball & sports facilities.
+              LockaCourt is the streamlined reservation system built for pickleball &amp; sports facilities.
               Check live court availability, select your hour, and reserve instantly without delays or hassle.
             </p>
 
@@ -113,7 +113,7 @@ export const HomePage: React.FC<HomePageProps> = ({
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="text-center max-w-2xl mx-auto mb-12">
             <h2 className="text-xs font-bold uppercase tracking-wider text-blue-600 mb-2">
-              Why Players & Facilities Prefer CourtBook
+              Why Players &amp; Facilities Prefer LockaCourt
             </h2>
             <p className="text-2xl sm:text-3xl font-extrabold text-slate-900 tracking-tight">
               Designed for Speed & Simplicity
@@ -298,26 +298,35 @@ export const HomePage: React.FC<HomePageProps> = ({
         </div>
       </section>
 
-      {/* BookSuite Ecosystem Banner */}
+      {/* AratReserve Platform Banner */}
       <section className="bg-slate-50 border-t border-slate-200 py-12">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex flex-col sm:flex-row items-center justify-between gap-6 p-6 rounded-2xl bg-white border border-slate-200">
             <div className="space-y-1 text-center sm:text-left">
               <div className="text-xs font-bold uppercase tracking-wider text-blue-600">
-                BookSuite Product Roadmap
+                Operated by AratReserve
               </div>
               <h3 className="text-lg font-bold text-slate-900">
-                Specialized Booking Engines for Every Venue
+                Dedicated Sports Venue Booking Powered by AratReserve
               </h3>
               <p className="text-slate-600 text-xs sm:text-sm max-w-xl">
-                CourtBook is Phase 1 of BookSuite. Future editions will deliver dedicated booking workflows for health clinics, hair & nail salons, and boutique fitness gyms.
+                LockaCourt is operated by{' '}
+                <a
+                  href="https://aratreserve.com"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="font-semibold text-blue-600 hover:text-blue-700 underline underline-offset-2"
+                >
+                  AratReserve
+                </a>{' '}
+                to power real-time court scheduling, multi-venue discovery, and verified digital booking passes for athletic facilities.
               </p>
             </div>
             <button
               onClick={() => onStartBooking()}
               className="whitespace-nowrap px-5 py-2.5 bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold rounded-xl transition-colors cursor-pointer"
             >
-              Try Customer Booking Now
+              Book a Court Now
             </button>
           </div>
         </div>

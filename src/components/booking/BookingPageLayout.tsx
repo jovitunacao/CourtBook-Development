@@ -1,5 +1,5 @@
 // ==============================================================================
-// CourtBook / BookSuite — Booking Page Layout Component
+// LockaCourt (AratReserve) — Booking Page Layout Component
 // File: src/components/booking/BookingPageLayout.tsx
 // Description:
 //   Common responsive page layout for all /book/* dedicated customer routes.

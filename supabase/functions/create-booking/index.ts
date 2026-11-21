@@ -1,5 +1,5 @@
 // ==============================================================================
-// CourtBook / BookSuite — Secure Public Booking Edge Function
+// LockaCourt (AratReserve) — Secure Public Booking Edge Function
 // Endpoint: POST /create-booking
 //
 // Description:

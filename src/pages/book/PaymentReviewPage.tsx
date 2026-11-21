@@ -1,5 +1,5 @@
 // ==============================================================================
-// CourtBook / BookSuite — Step 6: Payment Review Page
+// LockaCourt (AratReserve) — Step 6: Payment Review Page
 // File: src/pages/book/PaymentReviewPage.tsx
 // Route: /book/payment
 // ==============================================================================

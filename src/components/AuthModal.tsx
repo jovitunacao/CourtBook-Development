@@ -227,7 +227,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
             <span className="font-medium text-slate-300">
               {isConfigured ? (
                 <>
-                  Supabase Status: <strong className="text-white">Live Connection</strong> (BookSuite-Dev)
+                  Supabase Status: <strong className="text-white">Live Connection</strong> (LockaCourt)
                 </>
               ) : (
                 <>
@@ -318,7 +318,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                 <input
                   type="email"
                   required
-                  placeholder={authMode === 'register' ? 'e.g. owner@sportsclub.com' : 'e.g. staff@courtbook.facility'}
+                  placeholder={authMode === 'register' ? 'e.g. owner@sportsclub.com' : 'e.g. staff@lockacourt.com'}
                   value={email}
                   onChange={(e) => {
                     setEmail(e.target.value);
@@ -432,7 +432,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
             <div className="p-3 rounded-xl bg-slate-50 border border-slate-200/80 text-xs text-slate-600 space-y-1">
               <div className="flex items-center gap-1.5 font-bold text-slate-800">
                 <Building className="w-3.5 h-3.5 text-emerald-600" />
-                <span>Phase 3 Owner Registration:</span>
+                <span>LockaCourt Owner Registration:</span>
               </div>
               <p className="text-[11px] text-slate-500 leading-relaxed">
                 Registering creates your court owner account in Supabase Auth. Upon signing in, your account will be recognized as needing organization onboarding before managing facilities.
@@ -445,7 +445,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                 <div className="p-3 rounded-xl bg-slate-50 border border-slate-200/80 text-xs text-slate-600 space-y-1">
                   <div className="flex items-center gap-1.5 font-bold text-slate-800">
                     <Info className="w-3.5 h-3.5 text-blue-600" />
-                    <span>BookSuite-Dev Staff Credentials:</span>
+                    <span>LockaCourt Staff Credentials:</span>
                   </div>
                   <p className="text-[11px] text-slate-500 leading-relaxed">
                     Enter your assigned Supabase Auth credentials. User accounts configured in your

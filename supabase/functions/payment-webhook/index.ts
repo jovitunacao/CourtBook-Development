@@ -1,5 +1,5 @@
 // ==============================================================================
-// CourtBook / BookSuite — Payment Provider Webhook Ingestion Edge Function
+// LockaCourt (AratReserve) — Payment Provider Webhook Ingestion Edge Function
 // Endpoint: POST /payment-webhook
 //
 // Description:

@@ -1,7 +1,7 @@
 /**
- * CourtBook / BookSuite — Slug Utility
+ * LockaCourt (AratReserve) — Slug Utility
  *
- * Provides slug generation and strict validation adhering to BookSuite database schema constraints:
+ * Provides slug generation and strict validation adhering to LockaCourt database schema constraints:
  * - Length: 2 to 60 characters
  * - Format: Lowercase letters, numbers, and single hyphens: ^[a-z0-9]+(-[a-z0-9]+)*$
  * - No leading, trailing, or consecutive hyphens
@@ -35,7 +35,7 @@ export function slugify(text: string): string {
 }
 
 /**
- * Checks whether a given string strictly satisfies the BookSuite database slug constraints:
+ * Checks whether a given string strictly satisfies the LockaCourt database slug constraints:
  * - Length between 2 and 60 characters
  * - Matches regex ^[a-z0-9]+(-[a-z0-9]+)*$
  */

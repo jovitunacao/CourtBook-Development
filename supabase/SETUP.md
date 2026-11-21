@@ -1,8 +1,8 @@
-# CourtBook — Supabase Database Architecture & Security Guide
+# LockaCourt — Supabase Database Architecture & Security Guide
 
-This document details the database design, security hardening, and deployment instructions for **CourtBook** on PostgreSQL/Supabase (part of the **BookSuite** platform).
+This document details the database design, security hardening, and deployment instructions for **LockaCourt** (`https://lockacourt.com`, operated by **AratReserve** at `https://aratreserve.com`) on PostgreSQL/Supabase.
 
-> **Current Application Status:** Architectural definition only. The current React web application runs decoupled using client-side `localStorage`. Do not apply SQL or connect Supabase until you are ready for Phase 2.
+> **Internal Compatibility Note:** Existing database schema identifiers (`app_type = 'courtbook'`, RPC names, historical migrations `001`–`005g`, and `pg_cron` job names) remain intentionally unchanged so zero records, RLS guarantees, or settlement journals are disrupted during rebranding and domain integration.
 
 ---
 
@@ -70,7 +70,7 @@ supabase/migrations/001_initial_schema.sql
 ### Option A: Via the Supabase Web Dashboard (Recommended)
 
 1. Sign in to your [Supabase Dashboard](https://supabase.com/dashboard).
-2. Select your CourtBook project.
+2. Select your LockaCourt Supabase project.
 3. In the left navigation, click on **SQL Editor**.
 4. Click **New query** (the `+` icon).
 5. Copy the entire contents of `supabase/migrations/001_initial_schema.sql` and paste them into the SQL editor.

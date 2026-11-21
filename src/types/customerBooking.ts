@@ -1,5 +1,5 @@
 // ==============================================================================
-// CourtBook / BookSuite — Customer Booking Flow Types
+// LockaCourt (AratReserve) — Customer Booking Flow Types
 // File: src/types/customerBooking.ts
 // ==============================================================================
 

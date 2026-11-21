@@ -1,5 +1,5 @@
 // ==============================================================================
-// CourtBook / BookSuite — Short-Lived Guest Booking Lookup Token Helper
+// LockaCourt (AratReserve) — Short-Lived Guest Booking Lookup Token Helper
 // Pure Web Crypto implementation (compatible with Deno Edge Functions & Node 22)
 // ==============================================================================
 

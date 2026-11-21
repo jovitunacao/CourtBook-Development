@@ -1,5 +1,5 @@
 // ==============================================================================
-// CourtBook / BookSuite — Authoritative Public Booking Status Verification Handler
+// LockaCourt (AratReserve) — Authoritative Public Booking Status Verification Handler
 //
 // Security & Financial Compliance:
 //   - Requires authoritative financial capture evidence (005B / 005C):

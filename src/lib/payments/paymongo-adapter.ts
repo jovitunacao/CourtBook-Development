@@ -1,5 +1,5 @@
 // ==============================================================================
-// CourtBook / BookSuite — PayMongo Provider Adapter
+// LockaCourt (AratReserve) — PayMongo Provider Adapter
 // File: src/lib/payments/paymongo-adapter.ts
 // ==============================================================================
 
